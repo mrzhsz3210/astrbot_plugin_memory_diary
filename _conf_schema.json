@@ -1,0 +1,110 @@
+{
+  "enable_auto_inject": {
+    "description": "新会话自动读取日记",
+    "type": "bool",
+    "hint": "开启新上下文（/reset）后的第一条消息，自动把日记注入给模型",
+    "default": true
+  },
+  "enable_context_watch": {
+    "description": "启用上下文哨兵",
+    "type": "bool",
+    "hint": "每次请求前估算上下文 token 占用，快满时提醒并自动写日记",
+    "default": true
+  },
+  "context_token_limit": {
+    "description": "模型上下文窗口（tokens）",
+    "type": "int",
+    "hint": "填你使用的模型的上下文上限，例如 DeepSeek-V3 填 60000；用于估算占用比例",
+    "default": 60000
+  },
+  "remind_ratio": {
+    "description": "提醒阈值（占比）",
+    "type": "float",
+    "hint": "上下文占用达到该比例时提醒一次，默认 0.75",
+    "default": 0.75
+  },
+  "auto_ratio": {
+    "description": "自动写日记阈值（占比）",
+    "type": "float",
+    "hint": "上下文占用达到该比例时自动写好日记并提醒你 /reset，默认 0.9",
+    "default": 0.9
+  },
+  "diary_op_interval": {
+    "description": "日记操作间隔（分钟）",
+    "type": "int",
+    "hint": "每个用户两次写日记/删日记之间的最小间隔；0 为不限制，最高 60 分钟",
+    "default": 5
+  },
+  "write_min_ratio": {
+    "description": "手动写日记的最低上下文占用（占比）",
+    "type": "float",
+    "hint": "上下文占用达到该比例才允许用户手动发 /日记；0 为不限制。哨兵自动写日记不受此限",
+    "default": 0
+  },
+  "use_persona": {
+    "description": "按人设口吻写日记",
+    "type": "bool",
+    "hint": "写日记与口头告知时读取当前会话的人设（persona），用她的性格与口吻来表达",
+    "default": true
+  },
+  "empty_diary_as_life": {
+    "description": "无新素材时写拟人日常",
+    "type": "bool",
+    "hint": "开启后：用户要求写日记但距上次没有任何新对话时，她会写一段自己的拟人生活随笔（不含用户画像、不编造用户言行）；关闭后：直接提示没有新内容、不写",
+    "default": true
+  },
+  "show_diary_after_write": {
+    "description": "写完后展示日记全文",
+    "type": "bool",
+    "hint": "默认关闭：她只用正常口吻告知日记已写好；开启后会在告知后附上日记全文",
+    "default": false
+  },
+  "inject_default_days": {
+    "description": "默认注入最近几天的日记",
+    "type": "int",
+    "hint": "新上下文默认注入最近 N 天的日记，默认 7；0 表示注入全部。用户可用 /日记范围 自行覆盖",
+    "default": 7
+  },
+  "inject_max_chars": {
+    "description": "注入日记的最大字符数",
+    "type": "int",
+    "hint": "防炸上下文保险丝：注入的日记总量超过该值时优先保留最近的日记，更旧的截断并注明",
+    "default": 8000
+  },
+  "group_inject_filter": {
+    "description": "群聊注入过滤",
+    "type": "bool",
+    "hint": "开启后：在群聊的新上下文中只注入「写于群聊」的日记片段，私聊写下的片段不进群聊（反向不限：群聊片段在私聊照常注入）。无场景标记的旧日记片段视为私聊来源、不注入群聊",
+    "default": true
+  },
+  "max_history_messages": {
+    "description": "写日记时读取的最大消息条数",
+    "type": "int",
+    "hint": "从当前会话历史取最近多少条作为写作素材。条数与写日记时一次性消耗的 token 成正比，但属于一次性消耗、量不大（60 条约几千 tokens，不会每轮重复）",
+    "default": 60
+  },
+  "group_history_multiplier": {
+    "description": "群聊素材倍率",
+    "type": "int",
+    "hint": "群聊历史混有其他成员发言，写日记时读取条数 = 最大消息条数 × 该倍率，提高覆盖到画像对象本人发言的概率；1 表示不放大",
+    "default": 3
+  },
+  "bot_call_names": {
+    "description": "我的称呼（多 AI 防冲突）",
+    "type": "string",
+    "hint": "群里装了本插件的 AI 不止一个时，填这个 AI 的名字/昵称。多个名字用英文逗号或中文逗号分隔都可以，例如：小深,DeepSeek 或 小深，深深。指令里 @这些名字 时她才会响应；@别的名字她会保持沉默",
+    "default": ""
+  },
+  "group_require_at": {
+    "description": "群里只响应@我的指令",
+    "type": "bool",
+    "hint": "开启后，群聊里不带@的日记指令一律不响应，只有@我（QQ自带@功能或@我的称呼）才执行；私聊不受影响",
+    "default": false
+  },
+  "extra_instruction": {
+    "description": "写日记的附加要求",
+    "type": "string",
+    "hint": "会追加到写日记的提示词末尾，例如：语气更温柔一些 / 多用条目列出画像",
+    "default": ""
+  }
+}
