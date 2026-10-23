@@ -1,7 +1,7 @@
 name: astrbot_plugin_memory_diary
 display_name: 记忆日记
 desc: 让 AI 在收到指令时给未来的自己写日记（涵盖时间、用户画像、对用户的看法与评价、给未来自己的叮嘱），新上下文开启时自动读取日记，避免失忆。
-version: v0.1.6
+version: v0.1.7
 author: Kimi
 repo: "https://github.com/mrzhsz3210/astrbot_plugin_memory_diary"
 astrbot_version: ">=4.0.0,<5"
