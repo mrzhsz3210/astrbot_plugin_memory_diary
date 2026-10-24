@@ -124,7 +124,7 @@ def _safe_key(raw: str) -> str:
     "astrbot_plugin_memory_diary",
     "Kimi",
     "指令/自动触发写日记（用户画像 / 对用户的评价 / 给未来自己的叮嘱），新上下文自动读取日记，上下文将满时自动提醒。",
-    "v0.1.9",
+    "v0.2.0",
 )
 class MemoryDiaryPlugin(Star):
     def __init__(self, context: Context, config=None):
@@ -1103,6 +1103,17 @@ class MemoryDiaryPlugin(Star):
             logger.warning(f"[memory_diary] 生成口头通知失败: {e}")
             return ""
 
+    async def _say(self, umo: str, canned: str, situation: str) -> str:
+        """命令反馈："按人设口吻"开启时用她的话转述，关闭或生成失败时用固定文案。
+
+        canned 是兜底文案；situation 描述要传达的事实（含必须保留的数字/名称）。
+        """
+        if bool(self.config.get("use_persona", True)):
+            notice = await self._in_character_notice(umo, situation)
+            if notice:
+                return notice
+        return canned
+
     # ------------------------- 群聊多 AI 防冲突 -------------------------
 
     def _bot_names(self) -> list:
@@ -1214,12 +1225,17 @@ class MemoryDiaryPlugin(Star):
             if is_group else
             "（这条是私聊备忘，不会出现在群聊的日记里；群聊/私聊备忘各存 20 条）"
         )
-        yield event.plain_result(
+        canned = (
             f"📌 已记下：「{note}」\n"
             f"下次写日记时我会重点把它写进画像里"
             + (f"（当前这个场景还有 {total} 条备忘待写入）。" if total > 1 else "。")
             + f"\n{scene_tip}"
         )
+        yield event.plain_result(await self._say(
+            event.unified_msg_origin, canned,
+            f"用户刚让你记住一件事：「{note}」。请用你自己的口吻确认你记住了（保留原话引用），"
+            "并告诉ta下次写日记时会重点记进去。两三句话以内。",
+        ) + f"\n{scene_tip}")
 
     # ------------------------- 指令：查看 / 删除备忘 -------------------------
 
@@ -1279,7 +1295,12 @@ class MemoryDiaryPlugin(Star):
             cur = self._load_memos(sender_id)
             if text.lower() in ("全部", "all"):
                 self._clear_memos(sender_id)
-                await ev.send(ev.plain_result(f"📌 已清空全部 {len(cur)} 条备忘。"))
+                canned = f"📌 已清空全部 {len(cur)} 条备忘。"
+                await ev.send(ev.plain_result(await self._say(
+                    ev.unified_msg_origin, canned,
+                    f"用户刚刚清空了全部 {len(cur)} 条备忘。请用你自己的口吻确认备忘已清空"
+                    f"（保留 {len(cur)} 这个数字），可以轻松一点，告诉ta随时可以再来记。",
+                )))
                 controller.stop()
                 return
             if text.isdigit():
@@ -1297,7 +1318,12 @@ class MemoryDiaryPlugin(Star):
                     else:
                         data.pop("memos", None)
                     self._save_pref_data(sender_id, data)
-                    await ev.send(ev.plain_result(f"📌 已删除备忘：「{target['text']}」"))
+                    canned = f"📌 已删除备忘：「{target['text']}」"
+                    await ev.send(ev.plain_result(await self._say(
+                        ev.unified_msg_origin, canned,
+                        f"用户刚刚删掉了一条备忘，内容是「{target['text']}」。"
+                        "请用你自己的口吻确认这条备忘已经删掉了（保留原内容引用），一句话即可。",
+                    )))
                 else:
                     await ev.send(ev.plain_result(f"📌 没有这个序号（当前共 {len(cur)} 条），已取消。"))
                 controller.stop()
@@ -1325,9 +1351,13 @@ class MemoryDiaryPlugin(Star):
 
         remaining = self._op_cooldown_remaining(sender_id)
         if remaining > 0:
-            yield event.plain_result(
-                f"⏳ 日记操作太频繁啦，请 {remaining} 分钟后再让我写。"
-            )
+            canned = f"⏳ 日记操作太频繁啦，请 {remaining} 分钟后再让我写。"
+            yield event.plain_result(await self._say(
+                umo, canned,
+                f"用户又想操作日记，但距离上次操作还没过冷却期，还需要等 {remaining} 分钟。"
+                f"请用你自己的口吻婉拒ta（必须保留 {remaining} 分钟这个等待时间），"
+                "可以撒撒娇，让ta过会儿再来。",
+            ))
             return
 
         # 阈值门：上下文占用未达配置比例时不允许手动写日记（0 为不限制）
@@ -1343,17 +1373,32 @@ class MemoryDiaryPlugin(Star):
                     chars += len(str(msg))
             ratio = (chars / CHARS_PER_TOKEN) / limit if limit > 0 else 0
             if ratio < min_ratio:
-                yield event.plain_result(
+                canned = (
                     f"⏳ 上下文才用了约 {int(ratio * 100)}%，还没到该写日记的时候"
                     f"（阈值 {int(min_ratio * 100)}%）。再陪我聊聊，或者到快满时我会自动写～"
                 )
+                yield event.plain_result(await self._say(
+                    umo, canned,
+                    f"用户想让你现在写日记，但管理员设了门槛：上下文占用要达到 {int(min_ratio * 100)}%"
+                    f" 才可以，现在才约 {int(ratio * 100)}%。请用你自己的口吻告诉ta还早"
+                    "（保留两个百分比数字），邀请ta再聊聊，或者说到快满时你会自己写好。",
+                ))
                 return
 
         diary_content, err = await self._write_diary(
             umo, sender_id, sender_name, is_group=bool(event.get_group_id())
         )
         if err:
-            yield event.plain_result(f"📖 {err}")
+            # 对话式的婉拒（没新内容/今天随笔已写过）走人设口吻；技术性报错保持固定文案，保证信息准确
+            conversational = err.startswith(("距离上次", "今天的随笔"))
+            if conversational:
+                yield event.plain_result(await self._say(
+                    umo, f"📖 {err}",
+                    f"用户让你写日记，但你要婉拒：{err}。"
+                    "请用你自己的口吻把这件事自然地告诉ta，两三句话以内。",
+                ))
+            else:
+                yield event.plain_result(f"📖 {err}")
             return
         self._op_mark(sender_id)  # 写成功才计入冷却
 
@@ -1724,10 +1769,16 @@ class MemoryDiaryPlugin(Star):
             )
         else:
             desc = self._scope_desc(parsed)
-        yield event.plain_result(
+        canned = (
             f"✅ 已设置：新上下文将注入【{desc}】。"
             "下次 /reset 后生效；注入总量有上限保护，超出会优先保留最近的日记。"
         )
+        yield event.plain_result(await self._say(
+            event.unified_msg_origin, canned,
+            f"用户刚设置了新上下文要注入的日记范围：【{desc}】。"
+            f"请用你自己的口吻确认设置成功（必须原样保留范围「{desc}」），"
+            "并提醒ta下次 /reset 后生效。两三句话以内。",
+        ))
 
     @staticmethod
     def _scope_desc(scope) -> str:
@@ -1781,9 +1832,12 @@ class MemoryDiaryPlugin(Star):
         already = rec["names"] if rec and rec.get("cid") == cid else set()
         new_targets = [t for t in targets if t not in already]
         if not new_targets:
-            yield event.plain_result(
-                f"📖 【{self._scope_desc(parsed)}】的日记在本会话都已经读过了，没有新篇目需要注入。"
-            )
+            canned = f"📖 【{self._scope_desc(parsed)}】的日记在本会话都已经读过了，没有新篇目需要注入。"
+            yield event.plain_result(await self._say(
+                event.unified_msg_origin, canned,
+                f"用户想让你再读【{self._scope_desc(parsed)}】的日记，但这些你在本会话都已经读过了。"
+                "请用你自己的口吻告诉ta：这些我都记得啦，不用重复读。两三句话以内。",
+            ))
             return
 
         self._pending_inject[umo] = parsed
@@ -1792,11 +1846,19 @@ class MemoryDiaryPlugin(Star):
             f"（{len(targets) - len(new_targets)} 天本会话已读过，自动跳过）"
             if len(new_targets) < len(targets) else ""
         )
-        yield event.plain_result(
-            f"📖 好的，你下一句正常对话时，我会先读【{self._scope_desc(parsed)}】：{labels}{dup_note}。\n"
-            "注入是临时一次性的：只带入紧接着的那一轮回复，不长期占用上下文；\n"
-            "想让她在整个会话里一直记得，可在配置里开「注入持久化」。"
+        said = await self._say(
+            event.unified_msg_origin, "",
+            f"用户要求你在下一句对话前先读这些天的日记：{labels}。"
+            f"请用你自己的口吻答应下来（必须原样报出日期：{labels}），"
+            "告诉ta下一句聊天时你就会先读这些日记。两三句话以内。",
         )
+        if not said:
+            said = (
+                f"📖 好的，你下一句正常对话时，我会先读【{self._scope_desc(parsed)}】：{labels}。\n"
+                "注入是临时一次性的：只带入紧接着的那一轮回复，不长期占用上下文；\n"
+                "想让她在整个会话里一直记得，可在配置里开「注入持久化」。"
+            )
+        yield event.plain_result(said + (f"\n{dup_note}" if dup_note else ""))
 
     # ------------------------- 上下文哨兵 -------------------------
 

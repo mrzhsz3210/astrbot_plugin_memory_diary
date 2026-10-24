@@ -42,9 +42,9 @@
     "default": 0
   },
   "use_persona": {
-    "description": "按人设口吻写日记",
+    "description": "按人设口吻",
     "type": "bool",
-    "hint": "写日记与口头告知时读取当前会话的人设（persona），用她的性格与口吻来表达",
+    "hint": "开启后：写日记、写完告知、以及命令的确认/拒绝等对话式反馈都用她的口吻；日期清单、帮助菜单等列表类内容仍用固定文案以保证数字准确。关闭则全部使用固定文案",
     "default": true
   },
   "empty_diary_as_life": {
