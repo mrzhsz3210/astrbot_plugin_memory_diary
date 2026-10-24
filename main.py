@@ -124,7 +124,7 @@ def _safe_key(raw: str) -> str:
     "astrbot_plugin_memory_diary",
     "Kimi",
     "指令/自动触发写日记（用户画像 / 对用户的评价 / 给未来自己的叮嘱），新上下文自动读取日记，上下文将满时自动提醒。",
-    "v0.1.6",
+    "v0.1.7",
 )
 class MemoryDiaryPlugin(Star):
     def __init__(self, context: Context, config=None):
@@ -354,33 +354,56 @@ class MemoryDiaryPlugin(Star):
 
     # ------------------------- 用户备忘（/记一下） -------------------------
     # 用户点名要记住的事，暂存在偏好文件里，下次写日记时作为重点素材注入，
-    # 成功写入日记后清空。上限 20 条，防囤积。
+    # 成功写入日记后清除。每条备忘带场景标签（私聊/群聊）：
+    # - 私聊写日记吸收全部备忘；群聊写日记只吸收群聊备忘（私聊备忘继续等待），
+    #   与日记注入的"私聊不进群聊"方向保持一致；
+    # - 两个场景各存最多 20 条、互不占额度；无场景标记的旧备忘视为私聊来源。
 
-    _MEMO_LIMIT = 20
+    _MEMO_LIMIT = 20  # 每个场景的上限
 
-    def _load_memos(self, sender_id: str) -> list:
+    @staticmethod
+    def _memo_scene(memo: dict) -> str:
+        """备忘的场景：无标记的旧数据视为私聊（宁严勿宽）。"""
+        s = memo.get("scene")
+        return s if s in ("private", "group") else "private"
+
+    def _load_memos(self, sender_id: str, scene: str = "") -> list:
+        """读取备忘；scene 为 "private"/"group" 时按场景过滤（"" 表示全部）。"""
         memos = self._load_pref_data(sender_id).get("memos")
         if not isinstance(memos, list):
             return []
-        return [m for m in memos if isinstance(m, dict) and m.get("text")]
+        memos = [m for m in memos if isinstance(m, dict) and m.get("text")]
+        if scene in ("private", "group"):
+            memos = [m for m in memos if self._memo_scene(m) == scene]
+        return memos
 
-    def _append_memo(self, sender_id: str, text: str) -> int:
-        """追加一条备忘，返回当前待写入日记的备忘条数。"""
+    def _append_memo(self, sender_id: str, text: str, scene: str = "private") -> int:
+        """追加一条备忘，返回该场景当前待写入的备忘条数。"""
         data = self._load_pref_data(sender_id)
         memos = self._load_memos(sender_id)
         memos.append({
             "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "text": text.strip(),
+            "scene": scene if scene in ("private", "group") else "private",
         })
-        data["memos"] = memos[-self._MEMO_LIMIT:]
+        # 每个场景各保留最新 20 条，挤掉该场景最旧的，另一场景不受影响
+        capped = []
+        for sc in ("private", "group"):
+            capped += [m for m in memos if self._memo_scene(m) == sc][-self._MEMO_LIMIT:]
+        data["memos"] = capped
         self._save_pref_data(sender_id, data)
-        return len(data["memos"])
+        return len([m for m in capped if self._memo_scene(m) == self._memo_scene(memos[-1])])
 
-    def _clear_memos(self, sender_id: str):
+    def _clear_memos(self, sender_id: str, scenes: tuple = ("private", "group")):
+        """清除指定场景的备忘（默认全部）。写日记只清已吸收进日记的场景。"""
         data = self._load_pref_data(sender_id)
-        if "memos" in data:
+        memos = self._load_memos(sender_id)
+        kept = [m for m in memos if self._memo_scene(m) not in scenes]
+        if kept:
+            data["memos"] = kept
+        else:
             data.pop("memos", None)
-            self._save_pref_data(sender_id, data)
+        self._save_pref_data(sender_id, data)
 
     def _select_entries(self, entries: list, scope: str) -> list:
         """按 scope 选择要注入的日期文件。"""
@@ -810,9 +833,9 @@ class MemoryDiaryPlugin(Star):
     # 需要从写作素材中剔除的日记操作：用户侧的指令、AI 侧的插件固定通知前缀
     _OP_USER_COMMANDS = (
         "日记", "写日记", "查看日记", "删除日记", "日记状态", "日记范围", "日记帮助",
-        "记一下", "记住",
+        "记一下", "记住", "查看备忘", "删除备忘",
         "diary", "diary_view", "diary_delete", "diary_status", "diary_scope", "diary_help",
-        "memo", "reset", "重置",
+        "memo", "memo_view", "memo_delete", "reset", "重置",
     )
     _OP_ASSISTANT_PREFIXES = ("📖", "⚠️ 上下文已用", "📝 小提醒", "📌 已记下")
 
@@ -882,7 +905,9 @@ class MemoryDiaryPlugin(Star):
         today_entry = self._md_entry(datetime.now().strftime("%Y%m%d"))
         has_today = today_entry in entries
         material_hash = hashlib.md5(convo_text.encode("utf-8")).hexdigest() if convo_text else ""
-        memos = self._load_memos(sender_id)
+        # 群聊写日记只吸收群聊场景的备忘（私聊备忘继续等待下次私聊写日记），
+        # 否则私聊备忘会被写进"写于群聊"的日记片段、随群聊注入泄露
+        memos = self._load_memos(sender_id, scene="group" if is_group else "")
 
         # 没有新素材：要么内容为空，要么和上次写日记时的素材一模一样（用户一句话也没再说）。
         # 但有待写入的备忘（/记一下）时，视为有新素材——备忘本身就是要记住的内容。
@@ -987,7 +1012,8 @@ class MemoryDiaryPlugin(Star):
                              separator_note=separator_note,
                              origin="group" if is_group else "private")
             self._save_material_hash(sender_id, material_hash)
-            self._clear_memos(sender_id)  # 备忘已吸收进日记，清空待写列表
+            # 只清已吸收进日记的场景：群聊写只清群聊备忘，私聊写全清
+            self._clear_memos(sender_id, scenes=("group",) if is_group else ("private", "group"))
         except Exception as e:
             logger.error(f"[memory_diary] 日记写入文件失败: {e}")
             return None, (
@@ -1080,6 +1106,8 @@ class MemoryDiaryPlugin(Star):
             "━━━━━━━━━━━━━━\n"
             "· /写日记 —— 让我把这段时间的记忆写成日记（自动按当天情况选择正式写/简略补记）\n"
             "· /记一下 内容 —— 把重要的事存为备忘，下次写日记重点记进去（指令和内容空格分开）\n"
+            "· /查看备忘 —— 私聊专用：查看待写入的备忘（带场景标注）\n"
+            "· /删除备忘 —— 私聊专用：按序号删一条，或回复「全部」清空\n"
             "· /查看日记 —— 私聊专用：列出日期后按提示查看某天的日记\n"
             "· /删除日记 —— 私聊专用：删除全部 / 某天 / 某时间段的日记\n"
             "· /日记状态 —— 查看上下文占用、日记篇数、哨兵状态\n"
@@ -1123,12 +1151,110 @@ class MemoryDiaryPlugin(Star):
             )
             return
 
-        total = self._append_memo(sender_id, note)
+        is_group = bool(event.get_group_id())
+        total = self._append_memo(sender_id, note, scene="group" if is_group else "private")
+        scene_tip = (
+            "（这条是群聊备忘，只会在群聊写日记时吸收；群聊/私聊备忘各存 20 条）"
+            if is_group else
+            "（这条是私聊备忘，不会出现在群聊的日记里；群聊/私聊备忘各存 20 条）"
+        )
         yield event.plain_result(
             f"📌 已记下：「{note}」\n"
             f"下次写日记时我会重点把它写进画像里"
-            + (f"（当前还有 {total} 条备忘待写入）。" if total > 1 else "。")
+            + (f"（当前这个场景还有 {total} 条备忘待写入）。" if total > 1 else "。")
+            + f"\n{scene_tip}"
         )
+
+    # ------------------------- 指令：查看 / 删除备忘 -------------------------
+
+    @filter.command("查看备忘", alias={"memo_view"})
+    async def memo_view(self, event: AstrMessageEvent):
+        """查看待写入日记的备忘（仅私聊）：列出全部备忘及其场景。"""
+        if not self._should_respond(event):
+            return
+        if event.get_group_id():
+            yield event.plain_result("📌 备忘是你的小秘密哦，请私聊我查看～")
+            return
+        sender_id = event.get_sender_id()
+        memos = self._load_memos(sender_id)
+        if not memos:
+            yield event.plain_result("📌 目前没有待写入日记的备忘。用 /记一下 内容 就能存一条。")
+            return
+        lines = [
+            f"{i}. [{m['time']} · {'群聊' if self._memo_scene(m) == 'group' else '私聊'}] {m['text']}"
+            for i, m in enumerate(memos, 1)
+        ]
+        yield event.plain_result(
+            f"📌 你目前有 {len(memos)} 条备忘待写入日记：\n" + "\n".join(lines)
+            + "\n\n（私聊写日记会吸收全部备忘；群聊写日记只吸收群聊备忘。"
+            "想删的话用 /删除备忘）"
+        )
+
+    @filter.command("删除备忘", alias={"memo_delete"})
+    async def memo_delete(self, event: AstrMessageEvent):
+        """删除备忘（仅私聊）：先列出，再回复序号删一条或「全部」清空，60 秒内有效。"""
+        if not self._should_respond(event):
+            return
+        if event.get_group_id():
+            yield event.plain_result("📌 删除备忘请私聊我操作～")
+            return
+        sender_id = event.get_sender_id()
+        memos = self._load_memos(sender_id)
+        if not memos:
+            yield event.plain_result("📌 没有可删除的备忘。")
+            return
+
+        lines = [
+            f"{i}. [{m['time']} · {'群聊' if self._memo_scene(m) == 'group' else '私聊'}] {m['text']}"
+            for i, m in enumerate(memos, 1)
+        ]
+        yield event.plain_result(
+            f"📌 你目前有 {len(memos)} 条备忘：\n" + "\n".join(lines)
+            + "\n\n回复序号删除那条；回复「全部」清空所有备忘（备忘可以再记，不需要二次确认）。60 秒内有效。"
+        )
+
+        if not _SESSION_WAITER_OK:
+            yield event.plain_result("📌 当前环境不支持交互式操作，未做任何改动。")
+            return
+
+        @session_waiter(timeout=60, record_history_chains=False)
+        async def memo_delete_waiter(controller: SessionController, ev: AstrMessageEvent):
+            text = (ev.message_str or "").strip()
+            cur = self._load_memos(sender_id)
+            if text.lower() in ("全部", "all"):
+                self._clear_memos(sender_id)
+                await ev.send(ev.plain_result(f"📌 已清空全部 {len(cur)} 条备忘。"))
+                controller.stop()
+                return
+            if text.isdigit():
+                idx = int(text)
+                if 1 <= idx <= len(cur):
+                    target = cur[idx - 1]
+                    # 按内容+时间定位删除，避免序号在两次读取间漂移
+                    rest = [m for m in cur if not (
+                        m.get("text") == target.get("text") and m.get("time") == target.get("time")
+                        and self._memo_scene(m) == self._memo_scene(target)
+                    )]
+                    data = self._load_pref_data(sender_id)
+                    if rest:
+                        data["memos"] = rest
+                    else:
+                        data.pop("memos", None)
+                    self._save_pref_data(sender_id, data)
+                    await ev.send(ev.plain_result(f"📌 已删除备忘：「{target['text']}」"))
+                else:
+                    await ev.send(ev.plain_result(f"📌 没有这个序号（当前共 {len(cur)} 条），已取消。"))
+                controller.stop()
+                return
+            await ev.send(ev.plain_result("📌 没看懂，已取消，备忘原样保留。"))
+            controller.stop()
+
+        try:
+            await memo_delete_waiter(event)
+        except Exception as e:
+            logger.warning(f"[memory_diary] 删除备忘交互异常: {e}")
+        finally:
+            event.stop_event()
 
     # ------------------------- 指令：写日记 -------------------------
 
