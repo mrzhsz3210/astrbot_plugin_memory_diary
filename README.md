@@ -108,6 +108,12 @@
 - 文件名是发送者 ID（如 QQ 号）的 MD5 前 16 位，无法直接看出主人；可让对应用户发 `/日记状态` 核对，或按 zip 内 `说明.txt` 的昵称辨认。
 - v1.x 明文 `.md + .sig`、v2.0 单篇 zip、v3.0 按篇时间戳条目、v3.1~3.3 平铺按天文件，都会在首次读取时自动迁移为 `diaries/` + `sigs/` 分文件夹的按天归档（同一天的多篇合并、保留时间分隔条）。
 
+## 反馈与建议
+
+使用过程中遇到问题、发现 bug，或有新功能的想法，欢迎到
+[GitHub Issues](https://github.com/mrzhsz3210/astrbot_plugin_memory_diary/issues) 提 issue。
+提问时附上 AstrBot 版本、消息平台、模型提供商和控制台中含 `[memory_diary]` 的日志，会定位得更快。
+
 ## 安装
 
 将整个 `astrbot_plugin_memory_diary` 文件夹放入 AstrBot 的 `data/plugins/` 目录，

@@ -920,6 +920,10 @@ class MemoryDiaryPlugin(Star):
                 return None, ERR_NO_NEW_MATERIAL
             if not bool(self.config.get("empty_diary_as_life", True)):
                 return None, "距离上次写日记还没有新的聊天内容，今天没有什么可记的啦"
+            # 同一天最多写一篇"她的日常随笔"：否则素材哈希永远不变，
+            # 每 5 分钟一次的冷却一过又会写一篇，当天文件会被随笔刷屏
+            if self._load_pref_data(sender_id).get("last_life_day") == datetime.now().strftime("%Y%m%d"):
+                return None, "今天的随笔已经写过啦，等我们有新聊天时再叫我写日记吧"
             mode = "life"
         elif has_today:
             mode = "brief"
@@ -1014,6 +1018,11 @@ class MemoryDiaryPlugin(Star):
             self._save_material_hash(sender_id, material_hash)
             # 只清已吸收进日记的场景：群聊写只清群聊备忘，私聊写全清
             self._clear_memos(sender_id, scenes=("group",) if is_group else ("private", "group"))
+            if mode == "life":
+                # 记录今天已写过随笔，同日不再重复触发（防刷屏）
+                pref = self._load_pref_data(sender_id)
+                pref["last_life_day"] = datetime.now().strftime("%Y%m%d")
+                self._save_pref_data(sender_id, pref)
         except Exception as e:
             logger.error(f"[memory_diary] 日记写入文件失败: {e}")
             return None, (
@@ -1500,7 +1509,9 @@ class MemoryDiaryPlugin(Star):
                     m_day = re.match(rf"^{date_pat}$", text)
                     if m_day:
                         y, mo, dd = (int(x) for x in m_day.groups())
-                        name = f"{y:04d}{mo:02d}{dd:02d}.md"
+                        # 注意：entries 里的条目名带 diaries/ 前缀，这里必须同样带上，
+                        # 否则永远匹配不上（按日期删除会误报"那一天没有写日记"）
+                        name = self._md_entry(f"{y:04d}{mo:02d}{dd:02d}")
                         targets = [name] if name in entries else []
 
             if targets is None:
