@@ -124,7 +124,7 @@ def _safe_key(raw: str) -> str:
     "astrbot_plugin_memory_diary",
     "Kimi",
     "指令/自动触发写日记（用户画像 / 对用户的评价 / 给未来自己的叮嘱），新上下文自动读取日记，上下文将满时自动提醒。",
-    "v0.1.7",
+    "v0.1.9",
 )
 class MemoryDiaryPlugin(Star):
     def __init__(self, context: Context, config=None):
@@ -150,6 +150,10 @@ class MemoryDiaryPlugin(Star):
 
         # 记录每个会话（umo）上一次注入日记时的 conversation_id，避免重复注入
         self._injected_cid: dict = {}
+        # 每个会话已注入过的日记篇目：umo -> {"cid": str, "names": set}
+        self._injected_entries: dict = {}
+        # 用户主动要求的追加注入（/注入日记）：umo -> scope，下一次请求时生效
+        self._pending_inject: dict = {}
         # 上下文哨兵状态：umo -> {"cid": str, "reminded": bool, "auto_written": bool}
         self._watch_state: dict = {}
         # 防止同一会话并发触发自动写日记
@@ -426,6 +430,37 @@ class MemoryDiaryPlugin(Star):
             return [e for e in entries if start <= self._entry_day(e) <= end]
         return [entries[-1]]
 
+    _DATE_PAT = r"(\d{4})\s*[-/年.]\s*(\d{1,2})\s*[-/月.]\s*(\d{1,2})\s*日?"
+
+    @classmethod
+    def _parse_scope(cls, arg: str):
+        """把"最新/全部/最近N天/单日/时间段"解析成 scope 字符串；不合法返回 None。
+
+        供 /日记范围 与 /注入日记 共用。（"默认"只用于 /日记范围，不在此解析。）
+        """
+        low = arg.lower().strip()
+        if low in ("最新", "latest"):
+            return "latest"
+        if low in ("全部", "all"):
+            return "all"
+        m = re.match(r"^最近\s*(\d{1,3})\s*天$", arg.strip())
+        if m:
+            return f"days:{int(m.group(1))}"
+        m2 = re.match(rf"^{cls._DATE_PAT}\s*(?:到|至|~|--?|—)\s*{cls._DATE_PAT}$", arg.strip())
+        if m2:
+            g = [int(x) for x in m2.groups()]
+            start = f"{g[0]:04d}{g[1]:02d}{g[2]:02d}"
+            end = f"{g[3]:04d}{g[4]:02d}{g[5]:02d}"
+            if start > end:
+                start, end = end, start
+            return f"range:{start}-{end}"
+        m3 = re.match(rf"^{cls._DATE_PAT}$", arg.strip())
+        if m3:
+            y, mo, dd = (int(x) for x in m3.groups())
+            day = f"{y:04d}{mo:02d}{dd:02d}"
+            return f"range:{day}-{day}"  # 单日日期 = 起止同一天
+        return None
+
     # 日记片段分隔条（如 "—— 当天 20:30 补记 · 写于群聊 ——"、"—— 14:05 · 写于私聊 ——"）
     _SEG_HEADER_RE = re.compile(r"^—— .+ ——$")
 
@@ -451,20 +486,27 @@ class MemoryDiaryPlugin(Star):
                 kept.append(f"{header}\n\n{body}" if body.strip() else header)
         return "\n\n".join(kept)
 
-    def _assemble_inject(self, sender_id: str, in_group: bool = False):
+    def _assemble_inject(self, sender_id: str, in_group: bool = False,
+                         scope_override: str = "", only_names: set = None):
         """按用户偏好/配置组装要注入的日记文本（带总量保险丝）。
 
         in_group=True 且开启"群聊注入过滤"时，只注入群聊场景写下的片段
         （私聊写的片段不进群聊；群聊写的片段在私聊中不受限）。
-        返回 (text, tampered_any)；text 为空表示没有可注入内容。
+        scope_override：/注入日记 主动指定的范围，优先于用户偏好与默认。
+        only_names：只从这些篇目中选（用于会话内去重）。
+        返回 (text, tampered_any, used_names)；text 为空表示没有可注入内容。
         """
         entries = self._list_entries(sender_id)
         if not entries:
-            return "", False
+            return "", False, []
         default_days = int(self.config.get("inject_default_days", 7) or 0)
         default_scope = "all" if default_days <= 0 else f"days:{default_days}"
-        scope = self._load_pref(sender_id) or default_scope
+        scope = scope_override or self._load_pref(sender_id) or default_scope
         targets = self._select_entries(entries, scope) or [entries[-1]]
+        if only_names is not None:
+            targets = [t for t in targets if t in only_names]
+            if not targets:
+                return "", False, []
 
         budget = int(self.config.get("inject_max_chars", 8000) or 8000)
         if budget <= 0:
@@ -472,6 +514,7 @@ class MemoryDiaryPlugin(Star):
         filter_group = in_group and bool(self.config.get("group_inject_filter", True))
 
         parts, used, truncated, tampered_any, filtered_any = [], 0, False, False, False
+        used_names = []
         for name in reversed(targets):  # 新的优先占预算
             content, tampered = self._load_entry(sender_id, name)
             if tampered:
@@ -488,11 +531,14 @@ class MemoryDiaryPlugin(Star):
                 remain = budget - used - len(marker)
                 if remain > 200:  # 预算还够放一部分：截断这篇的头部，保住结尾的"叮嘱"
                     parts.append(marker + block[-remain:])
+                    used_names.append(name)
                 truncated = True
                 break
             parts.append(block)
+            used_names.append(name)
             used += len(block)
         parts.reverse()  # 恢复时间顺序（旧→新）
+        used_names.reverse()
 
         text = "\n\n".join(parts)
         if truncated:
@@ -501,7 +547,7 @@ class MemoryDiaryPlugin(Star):
             text += "\n\n（注：部分日期的日记验签失败，已跳过。）"
         if filtered_any:
             text += "\n\n（注：私聊场景中写下的日记片段按规则未注入本次群聊。）"
-        return text, tampered_any
+        return text, tampered_any, used_names
 
     def _save_diary(self, sender_id: str, content: str, sender_name: str = "",
                     entry_name_hint: str = "", separator_note: str = "", origin: str = ""):
@@ -832,9 +878,9 @@ class MemoryDiaryPlugin(Star):
 
     # 需要从写作素材中剔除的日记操作：用户侧的指令、AI 侧的插件固定通知前缀
     _OP_USER_COMMANDS = (
-        "日记", "写日记", "查看日记", "删除日记", "日记状态", "日记范围", "日记帮助",
+        "日记", "写日记", "查看日记", "删除日记", "日记状态", "日记范围", "日记帮助", "注入日记",
         "记一下", "记住", "查看备忘", "删除备忘",
-        "diary", "diary_view", "diary_delete", "diary_status", "diary_scope", "diary_help",
+        "diary", "diary_view", "diary_delete", "diary_status", "diary_scope", "diary_help", "diary_inject",
         "memo", "memo_view", "memo_delete", "reset", "重置",
     )
     _OP_ASSISTANT_PREFIXES = ("📖", "⚠️ 上下文已用", "📝 小提醒", "📌 已记下")
@@ -1121,6 +1167,7 @@ class MemoryDiaryPlugin(Star):
             "· /删除日记 —— 私聊专用：删除全部 / 某天 / 某时间段的日记\n"
             "· /日记状态 —— 查看上下文占用、日记篇数、哨兵状态\n"
             "· /日记范围 —— 设置新上下文注入哪些日记：最新 / 全部 / 最近N天 / 时间段 / 默认\n"
+            "· /注入日记 范围 —— 主动让她现在就读指定日记（下一句对话生效，本会话去重）\n"
             "· /日记帮助 —— 就是你现在看到的这个\n"
             "━━━━━━━━━━━━━━\n"
             "小提示：上下文快满时我会主动提醒并自动写好日记；\n"
@@ -1600,12 +1647,23 @@ class MemoryDiaryPlugin(Star):
         else:
             watch_info = "已关闭"
 
+        # 注入状态：本会话有没有实际把日记塞进她的请求里
+        if not entries:
+            inject_info = "无日记可注入"
+        elif not bool(self.config.get("enable_auto_inject", True)):
+            inject_info = "已关闭（配置面板关了自动读取）"
+        elif self._injected_cid.get(umo) == cid:
+            inject_info = "本会话已注入 ✅"
+        else:
+            inject_info = "本会话未注入（你下一句正常对话时注入；命令消息不触发）"
+
         yield event.plain_result(
             "📖 日记状态：\n"
             f"· 日记：{diary_info}\n"
             f"· 当前上下文：约 {used}/{limit} tokens（{pct}%，估算值）\n"
             f"· 阈值：提醒 {int(remind_ratio * 100)}% / 自动写日记 {int(auto_ratio * 100)}%\n"
-            f"· 本会话哨兵：{watch_info}"
+            f"· 本会话哨兵：{watch_info}\n"
+            f"· 本会话日记注入：{inject_info}"
         )
 
     # ------------------------- 指令：注入范围 -------------------------
@@ -1644,30 +1702,16 @@ class MemoryDiaryPlugin(Star):
             return
 
         parsed = "KEEP"
-        if low in ("最新", "latest"):
-            parsed = "latest"
-        elif low in ("默认", "default"):
+        if low in ("默认", "default"):
             parsed = None  # 清除偏好，回到管理员默认
-        elif low in ("全部", "all"):
-            parsed = "all"
         else:
-            m = re.match(r"^最近\s*(\d{1,3})\s*天$", arg)
-            if m:
-                parsed = f"days:{int(m.group(1))}"
-            else:
-                date_pat = r"(\d{4})\s*[-/年.]\s*(\d{1,2})\s*[-/月.]\s*(\d{1,2})\s*日?"
-                m2 = re.match(rf"^{date_pat}\s*(?:到|至|~|--?|—)\s*{date_pat}$", arg)
-                if m2:
-                    g = [int(x) for x in m2.groups()]
-                    start = f"{g[0]:04d}{g[1]:02d}{g[2]:02d}"
-                    end = f"{g[3]:04d}{g[4]:02d}{g[5]:02d}"
-                    if start > end:
-                        start, end = end, start
-                    parsed = f"range:{start}-{end}"
+            p = self._parse_scope(arg)
+            if p is not None:
+                parsed = p
 
         if parsed == "KEEP":
             yield event.plain_result(
-                "📖 没看懂～可选：最新 / 全部 / 最近N天（如 最近7天）/ 时间段（如 2026-10-01到2026-10-23）。"
+                "📖 没看懂～可选：最新 / 全部 / 最近N天（如 最近7天）/ 日期（如 2026-10-23）/ 时间段（如 2026-10-01到2026-10-23）。"
             )
             return
 
@@ -1699,6 +1743,60 @@ class MemoryDiaryPlugin(Star):
             s, e = scope[6:14], scope[15:23]
             return f"{s[:4]}-{s[4:6]}-{s[6:]} 到 {e[:4]}-{e[4:6]}-{e[6:]}"
         return "最新一天（默认）"
+
+    # ------------------------- 指令：追加注入 -------------------------
+
+    @filter.command("注入日记", alias={"diary_inject"})
+    async def diary_inject(self, event: AstrMessageEvent, scope: str = ""):
+        """主动把指定日记注入接下来的对话（本会话去重，下一句对话时一次性生效）。"""
+        if not self._should_respond(event):
+            return
+        sender_id = event.get_sender_id()
+        arg = (scope or "").strip()
+        arg = re.sub(r"@[^\s@，,]+", "", arg).strip()
+
+        entries = self._list_entries(sender_id)
+        if not entries:
+            yield event.plain_result("📖 还没有日记可以注入，先让我写一篇吧（/日记）。")
+            return
+        if not arg:
+            yield event.plain_result(
+                "📖 主动注入用法：/注入日记 最新 / 全部 / 最近7天 / 2026-10-23 / 2026-10-20到2026-10-23\n"
+                "注入会在你下一句正常对话时生效（临时一次性带入，不长期占用上下文）；\n"
+                "本会话已经注入过的篇目不会重复注入。"
+            )
+            return
+
+        parsed = self._parse_scope(arg)
+        if parsed is None:
+            yield event.plain_result(
+                "📖 没看懂～可选：最新 / 全部 / 最近N天 / 日期 / 时间段。"
+            )
+            return
+
+        targets = self._select_entries(entries, parsed) or [entries[-1]]
+        umo = event.unified_msg_origin
+        cid = await self._curr_cid(umo)
+        rec = self._injected_entries.get(umo)
+        already = rec["names"] if rec and rec.get("cid") == cid else set()
+        new_targets = [t for t in targets if t not in already]
+        if not new_targets:
+            yield event.plain_result(
+                f"📖 【{self._scope_desc(parsed)}】的日记在本会话都已经读过了，没有新篇目需要注入。"
+            )
+            return
+
+        self._pending_inject[umo] = parsed
+        labels = "、".join(self._entry_label(t) for t in new_targets)
+        dup_note = (
+            f"（{len(targets) - len(new_targets)} 天本会话已读过，自动跳过）"
+            if len(new_targets) < len(targets) else ""
+        )
+        yield event.plain_result(
+            f"📖 好的，你下一句正常对话时，我会先读【{self._scope_desc(parsed)}】：{labels}{dup_note}。\n"
+            "注入是临时一次性的：只带入紧接着的那一轮回复，不长期占用上下文；\n"
+            "想让她在整个会话里一直记得，可在配置里开「注入持久化」。"
+        )
 
     # ------------------------- 上下文哨兵 -------------------------
 
@@ -1802,53 +1900,89 @@ class MemoryDiaryPlugin(Star):
         except Exception as e:
             logger.warning(f"[memory_diary] 上下文哨兵异常: {e}")
 
-        # 2) 新会话注入日记
+        # 2) 注入日记（自动 + 手动追加）
         try:
             if not bool(self.config.get("enable_auto_inject", True)):
                 return
 
             sender_id = event.get_sender_id()
-            diary, tampered_any = self._assemble_inject(
-                sender_id, in_group=bool(event.get_group_id())
-            )
+            in_group = bool(event.get_group_id())
+            umo = event.unified_msg_origin
+            cid = await self._curr_cid(umo)
+
+            # 本会话已注入过的篇目记录（用于手动追加注入时去重）
+            rec = self._injected_entries.get(umo)
+            if not rec or rec.get("cid") != cid:
+                rec = {"cid": cid, "names": set()}
+                self._injected_entries[umo] = rec
+
+            # a) 用户用 /注入日记 主动要求的追加注入：下一轮请求一次性带入
+            pending = self._pending_inject.pop(umo, None)
+            if pending is not None:
+                scope = pending
+                new_names = {
+                    n for n in self._select_entries(self._list_entries(sender_id), scope)
+                } - rec["names"]
+                if new_names:
+                    extra, _, extra_names = self._assemble_inject(
+                        sender_id, in_group=in_group,
+                        scope_override=scope, only_names=new_names,
+                    )
+                    if extra:
+                        self._deliver_inject(req, INJECT_TEMPLATE.format(diary=extra))
+                        rec["names"].update(extra_names)
+                        logger.info(f"[memory_diary] 已按用户要求追加注入 {len(extra_names)} 天日记")
+
+            # b) 常规注入
+            persist = bool(self.config.get("persist_inject", False))
+            if persist:
+                # 持久模式：每一轮请求都把日记放进 system_prompt，全程可回忆，
+                # 代价是每轮都消耗日记的 token
+                diary, tampered_any, names = self._assemble_inject(sender_id, in_group=in_group)
+                if diary:
+                    req.system_prompt = (req.system_prompt or "") + "\n\n" + INJECT_TEMPLATE.format(diary=diary)
+                    self._injected_cid[umo] = cid
+                    rec["names"].update(names)
+                elif tampered_any:
+                    logger.warning(f"[memory_diary] 用户 {sender_id} 的日记均被篡改，跳过注入")
+                return
+
+            # 临时模式（默认）：每个新会话的第一次 LLM 请求注入一次。
+            # 不再要求 contexts 为空——/reset 后如果用户先发了 /查看日记 等命令，
+            # 历史可能已经不是空的，硬性跳过会导致本会话永远注入不上。
+            if self._injected_cid.get(umo) == cid:
+                return
+            diary, tampered_any, names = self._assemble_inject(sender_id, in_group=in_group)
             if not diary:
                 if tampered_any:
                     logger.warning(f"[memory_diary] 用户 {sender_id} 的日记均被篡改，跳过注入")
                 return
-
-            # 会话中已有历史上下文 → 不是"刚开启的新上下文"，跳过
-            contexts = getattr(req, "contexts", None) or []
-            if contexts:
-                return
-
-            # 同一会话只注入一次（/reset 后 conversation_id 会变化，从而再次触发注入）
-            umo = event.unified_msg_origin
-            cid = await self._curr_cid(umo)
-            if self._injected_cid.get(umo) == cid:
-                return
             self._injected_cid[umo] = cid
-
-            inject_text = INJECT_TEMPLATE.format(diary=diary)
-
-            # 优先走 extra_user_content_parts（不污染 system_prompt 缓存），失败则退回 system_prompt
-            try:
-                if TextPart is None:
-                    raise RuntimeError("TextPart 不可用")
-                part = TextPart(text=inject_text)
-                try:
-                    part = part.mark_as_temp()  # 不持久化进会话历史
-                except Exception:
-                    pass
-                req.extra_user_content_parts.append(part)
-            except Exception:
-                req.system_prompt = (req.system_prompt or "") + "\n\n" + inject_text
-
+            rec["names"].update(names)
+            self._deliver_inject(req, INJECT_TEMPLATE.format(diary=diary))
             logger.info(f"[memory_diary] 已在新会话为用户 {sender_id} 注入日记")
         except Exception as e:
             logger.warning(f"[memory_diary] 注入日记异常: {e}")
 
+    @staticmethod
+    def _deliver_inject(req: ProviderRequest, inject_text: str):
+        """把注入文本塞进本次请求：优先临时 extra_user_content_parts，失败退回 system_prompt。"""
+        try:
+            if TextPart is None:
+                raise RuntimeError("TextPart 不可用")
+            part = TextPart(text=inject_text)
+            try:
+                part = part.mark_as_temp()  # 不持久化进会话历史
+            except Exception:
+                pass
+            req.extra_user_content_parts.append(part)
+        except Exception:
+            req.system_prompt = (req.system_prompt or "") + "\n\n" + inject_text
+
     async def terminate(self):
         self._injected_cid.clear()
+        self._injected_entries.clear()
+        self._pending_inject.clear()
         self._watch_state.clear()
         self._writing.clear()
         self._op_last.clear()

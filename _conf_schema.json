@@ -77,6 +77,12 @@
     "hint": "开启后：在群聊的新上下文中只注入「写于群聊」的日记片段，私聊写下的片段不进群聊（反向不限：群聊片段在私聊照常注入）。无场景标记的旧日记片段视为私聊来源、不注入群聊",
     "default": true
   },
+  "persist_inject": {
+    "description": "注入持久化",
+    "type": "bool",
+    "hint": "默认关闭：日记只在每个新会话的第一轮请求注入一次（省 token，但她只在生成第一条回复时记得日记细节）。开启后：每一轮请求都把日记放进 system prompt，她在整个会话里都能随时回忆日记内容，代价是每轮都消耗日记的 token（约 字数÷1.8）",
+    "default": false
+  },
   "max_history_messages": {
     "description": "写日记时读取的最大消息条数",
     "type": "int",
