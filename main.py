@@ -122,9 +122,9 @@ def _safe_key(raw: str) -> str:
 
 @register(
     "astrbot_plugin_memory_diary",
-    "Kimi",
+    "mrzhsz3210",
     "指令/自动触发写日记（用户画像 / 对用户的评价 / 给未来自己的叮嘱），新上下文自动读取日记，上下文将满时自动提醒。",
-    "v0.2.0",
+    "v0.2.1",
 )
 class MemoryDiaryPlugin(Star):
     def __init__(self, context: Context, config=None):
