@@ -14,11 +14,13 @@ import hashlib
 import hmac
 import inspect
 import json
+import os
 import re
 import secrets
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -50,6 +52,19 @@ except ImportError:  # pragma: no cover
     _SESSION_WAITER_OK = False
 
 PLUGIN_NAME = "astrbot_plugin_memory_diary"
+
+
+class DiaryKeyUnavailable(Exception):
+    """签名密钥不可用（fail-closed）：拒绝写入与验签，绝不退回公开常量。"""
+
+
+class DiaryTamperedError(Exception):
+    """保存前验签发现既有日记被篡改/签名缺失：整次保存被拒绝。"""
+
+
+class DiaryCorruptError(Exception):
+    """日记 zip 损坏：已隔离备份，在人工处理前拒绝覆盖写入。"""
+
 
 # 写日记时使用的系统提示词：规定日记的四个固定部分
 DIARY_SYSTEM_PROMPT = """你是一位与用户长期相处的 AI。这段上下文即将结束，请你给"下一个失去这段记忆的自己"写一篇日记（也是一封信）。
@@ -114,6 +129,9 @@ INJECT_TEMPLATE = """<memory_diary>
 # 粗略 token 估算：中英混排约 1 token ≈ 1.8 字符
 CHARS_PER_TOKEN = 1.8
 
+# 内存状态上限：每个状态字典最多保留多少个会话/用户的条目（防长跑无限增长）
+_STATE_CAP = 512
+
 
 def _safe_key(raw: str) -> str:
     """把 sender_id 转成安全的文件名 key。"""
@@ -124,7 +142,7 @@ def _safe_key(raw: str) -> str:
     "astrbot_plugin_memory_diary",
     "mrzhsz3210",
     "指令/自动触发写日记（用户画像 / 对用户的评价 / 给未来自己的叮嘱），新上下文自动读取日记，上下文将满时自动提醒。",
-    "v0.2.1",
+    "v0.3.1",
 )
 class MemoryDiaryPlugin(Star):
     def __init__(self, context: Context, config=None):
@@ -160,6 +178,38 @@ class MemoryDiaryPlugin(Star):
         self._writing: set = set()
         # 日记操作冷却：sender_id -> 上次写日记/删日记的时间
         self._op_last: dict = {}
+        # 签名密钥内存缓存（None 表示尚未加载；加载失败保持 None 并拒绝签名操作）
+        self._key_cache = None
+        # reset 双保险：见到 /reset 指令文本时记入，下一次 LLM 请求按新代际处理（P0-1 补强）
+        self._reset_pending: set = set()
+        # 无效时区只警告一次
+        self._tz_warned = False
+
+    # ------------------------- 时间 -------------------------
+
+    def _now(self) -> datetime:
+        """按配置的时区取当前时间；时区未配置或无效时回退服务器本地时间。"""
+        tz_name = str(self.config.get("diary_timezone", "") or "").strip()
+        if tz_name:
+            try:
+                return datetime.now(ZoneInfo(tz_name))
+            except Exception:
+                if not self._tz_warned:
+                    self._tz_warned = True
+                    logger.warning(
+                        f"[memory_diary] 时区配置 {tz_name!r} 无效，回退服务器本地时间"
+                    )
+        return datetime.now()
+
+    @staticmethod
+    def _cap_state(d):
+        """内存状态上限（dict 或 set）：超出容量时丢弃最旧的条目。"""
+        if isinstance(d, dict):
+            while len(d) > _STATE_CAP:
+                d.pop(next(iter(d)))
+        else:
+            while len(d) > _STATE_CAP:
+                d.pop()
 
     # ------------------------- 存储 -------------------------
     #
@@ -190,43 +240,92 @@ class MemoryDiaryPlugin(Star):
         """diaries/20261023.md -> 20261023"""
         return entry_name.split("/")[-1][:8]
 
+    def _diary_file_key(self, sender_id: str) -> str:
+        """日记文件名 key：用签名密钥做 HMAC 派生，替代无盐 MD5(QQ号)——
+        防止拿到数据目录的人离线枚举 QQ 号定位某位用户的日记文件。
+
+        密钥不可用时回退旧的 MD5 命名，保证已有日记仍然可读写（不迁移）。
+        """
+        key = self._secret_key()
+        if key is None:
+            return _safe_key(sender_id)
+        return hmac.new(
+            key, f"file:{sender_id}".encode("utf-8"), hashlib.sha256
+        ).hexdigest()[:16]
+
     def _diary_path(self, sender_id: str) -> Path:
-        return self.data_dir / f"diary_{_safe_key(sender_id)}.zip"
+        new_path = self.data_dir / f"diary_{self._diary_file_key(sender_id)}.zip"
+        old_path = self.data_dir / f"diary_{_safe_key(sender_id)}.zip"
+        if new_path != old_path and old_path.exists() and not new_path.exists():
+            # 旧版（MD5 命名）文件首次访问时自动改名迁移
+            try:
+                old_path.rename(new_path)
+                logger.info(
+                    f"[memory_diary] 用户 {sender_id} 的日记文件已迁移为 HMAC 派生文件名"
+                )
+            except Exception as e:
+                logger.warning(f"[memory_diary] 日记文件名迁移失败，沿用旧文件名: {e}")
+                return old_path
+        return new_path
 
     def _legacy_diary_paths(self, sender_id: str):
         """v1.x 时代的明文存储（.md + .sig），用于自动迁移。"""
         base = self.data_dir / f"diary_{_safe_key(sender_id)}"
         return base.with_suffix(".md"), base.with_suffix(".sig")
 
-    def _secret_key(self) -> bytes:
-        """签名密钥：首次使用时随机生成，保存在插件数据目录，不落日志。"""
+    def _secret_key(self):
+        """签名密钥：首次使用时随机生成（权限 0o600），缓存在内存，不落日志。
+
+        fail-closed（P2-6 修复）：读不到/写不了密钥文件时返回 None，
+        由调用方拒绝签名与写入——绝不退回源码里写死的公开常量，
+        否则任何人都能算出"密钥"，防篡改形同虚设。
+        """
+        if self._key_cache:
+            return self._key_cache
         key_path = self.data_dir / ".diary_key"
         try:
             if key_path.exists():
                 key = key_path.read_bytes().strip()
                 if key:
+                    self._key_cache = key
                     return key
+                logger.error("[memory_diary] 签名密钥文件为空，已拒绝签名相关操作")
+                return None
             key = secrets.token_hex(32).encode("utf-8")
-            key_path.write_bytes(key)
+            # 先落盘再启用：写不进去就无法保证下次启动还能验签，宁可拒绝
+            fd = os.open(str(key_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(key)
+            try:
+                os.chmod(key_path, 0o600)  # Windows 上作用有限，POSIX 上有效
+            except Exception:
+                pass
+            self._key_cache = key
             return key
         except Exception as e:
-            logger.warning(f"[memory_diary] 读取/生成签名密钥失败: {e}")
-            return (
-                hashlib.sha256(PLUGIN_NAME.encode("utf-8")).hexdigest().encode("utf-8")
+            logger.error(
+                f"[memory_diary] 读取/生成签名密钥失败: {e}——已拒绝签名相关操作"
             )
+            return None
 
     def _signature(self, sender_id: str, content: str) -> str:
         """旧版（v1.x/v2.0 单篇）签名，仅用于迁移校验。"""
+        key = self._secret_key()
+        if key is None:
+            raise DiaryKeyUnavailable("签名密钥不可用")
         return hmac.new(
-            self._secret_key(),
+            key,
             (sender_id + "\n" + content).encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
 
     def _entry_sig(self, sender_id: str, entry_name: str, content: str) -> str:
         """条目签名：绑定用户 + 条目名（防改名）+ 内容。"""
+        key = self._secret_key()
+        if key is None:
+            raise DiaryKeyUnavailable("签名密钥不可用")
         return hmac.new(
-            self._secret_key(),
+            key,
             (sender_id + "\n" + entry_name + "\n" + content).encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
@@ -236,7 +335,7 @@ class MemoryDiaryPlugin(Star):
             "记忆日记\n"
             "========\n\n"
             f"用户昵称：{sender_name or '（未知）'}\n"
-            f"说明生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"说明生成时间：{self._now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             "【这是什么】\n"
             '这个 zip 保存着一位 AI 写给"下一个自己"的日记。日记按天归档：\n'
             "diaries/ 文件夹里每天一个 <日期>.md 文件（当天写多篇会追加在同一文件里，带时间分隔），\n"
@@ -281,9 +380,48 @@ class MemoryDiaryPlugin(Star):
                     for n in names:
                         if self.ENTRY_NAME_RE.match(n) and self._sig_entry(n) in names:
                             entries.append(n)
+            except zipfile.BadZipFile:
+                # 读路径不把损坏吞成"没有日记"：error 级日志 + 指令层用 _corrupt_notice 区分
+                logger.error(
+                    f"[memory_diary] 日记 zip 已损坏（{path}），读取按空处理；"
+                    "下次写入时会自动隔离备份"
+                )
             except Exception as e:
                 logger.warning(f"[memory_diary] 列出日记条目失败: {e}")
         return sorted(entries)
+
+    def _corrupt_notice(self, sender_id: str) -> str:
+        """日记文件损坏时给用户的提示文案；未损坏返回空串（P1-3 读路径）。
+
+        不能只看 is_zipfile：中央目录还在、但某个条目 CRC 坏掉的 zip 仍然
+        会被 is_zipfile 判为 True。必须真正 testzip() 读一遍所有条目。
+        """
+        path = self._diary_path(sender_id)
+        if not path.exists():
+            return ""
+        try:
+            with zipfile.ZipFile(path) as z:
+                bad = z.testzip()
+                if bad is not None:
+                    logger.error(
+                        f"[memory_diary] 日记 zip 条目 CRC 校验失败：{path} / {bad}"
+                    )
+                    return (
+                        "📖 你的日记文件有损坏（有一天的内容 CRC 校验失败），"
+                        "读不出来——我没有动它。\n"
+                        "请管理员到插件数据目录检查这个文件（可以尝试用压缩软件修复，"
+                        "或确认损坏后直接删掉，我下次会重新建一个）。"
+                        "处理好之前，我不会往里写新日记，避免把残存的内容冲掉。"
+                    )
+        except Exception as e:
+            logger.error(f"[memory_diary] 日记 zip 无法读取：{path} / {e}")
+            return (
+                "📖 你的日记文件已经损坏，读不出来——我没有动它。\n"
+                "请管理员到插件数据目录检查这个文件（可以尝试用压缩软件修复，"
+                "或确认损坏后直接删掉，我下次会重新建一个）。"
+                "处理好之前，我不会往里写新日记，避免把残存的内容冲掉。"
+            )
+        return ""
 
     def _load_entry(self, sender_id: str, entry_name: str):
         """读取一篇日记。返回 (content, tampered)。"""
@@ -296,11 +434,18 @@ class MemoryDiaryPlugin(Star):
                 except KeyError:
                     actual = ""  # 签名缺失视为篡改
         except Exception as e:
-            logger.warning(f"[memory_diary] 读取日记条目失败: {e}")
-            return "", False
-        if not hmac.compare_digest(
-            self._entry_sig(sender_id, entry_name, content), actual
-        ):
+            # 读取失败（CRC、缺条目、临时 IO 错误）绝不能伪装成“空日记”：返回
+            # tampered=True 让调用方跳过并提示，避免出现“0 字，校验通过”。
+            logger.error(f"[memory_diary] 读取日记条目失败: {e}")
+            return "", True
+        try:
+            expected = self._entry_sig(sender_id, entry_name, content)
+        except DiaryKeyUnavailable:
+            logger.error(
+                f"[memory_diary] 签名密钥不可用，无法验签，已拒绝读取 {entry_name}"
+            )
+            return "", True
+        if not hmac.compare_digest(expected, actual):
             logger.warning(
                 f"[memory_diary] 用户 {sender_id} 的日记 {entry_name} 验签失败，已拒绝读取"
             )
@@ -329,28 +474,38 @@ class MemoryDiaryPlugin(Star):
         except Exception:
             return {}
 
-    def _save_pref_data(self, sender_id: str, data: dict):
+    def _save_pref_data(self, sender_id: str, data: dict) -> bool:
+        """保存偏好数据；返回是否成功——失败时调用方必须告知用户，不能谎报（P2-5）。
+
+        原子写（P1-1）：先写临时文件再 os.replace，避免 write_text 原地截断
+        导致一次崩溃丢掉范围设置/备忘/素材哈希。
+        """
         try:
             p = self._pref_path(sender_id)
             if data:
-                p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                tmp = p.with_name(p.name + ".tmp")
+                tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp, p)
             else:
                 p.unlink(missing_ok=True)
+            return True
         except Exception as e:
             logger.warning(f"[memory_diary] 保存用户偏好失败: {e}")
+            return False
 
     def _load_pref(self, sender_id: str):
         """读取用户注入范围偏好；返回 scope 字符串或 None（用默认）。"""
         scope = self._load_pref_data(sender_id).get("scope")
         return scope if isinstance(scope, str) else None
 
-    def _save_pref(self, sender_id: str, scope):
+    def _save_pref(self, sender_id: str, scope) -> bool:
+        """保存注入范围偏好；返回是否成功（P2-5b：失败时指令层必须明说）。"""
         data = self._load_pref_data(sender_id)
         if scope is None:
             data.pop("scope", None)
         else:
             data["scope"] = scope
-        self._save_pref_data(sender_id, data)
+        return self._save_pref_data(sender_id, data)
 
     def _load_material_hash(self, sender_id: str) -> str:
         """上次写日记时使用的素材哈希，用于判断"有没有说过新的话"。"""
@@ -387,14 +542,21 @@ class MemoryDiaryPlugin(Star):
             memos = [m for m in memos if self._memo_scene(m) == scene]
         return memos
 
-    def _append_memo(self, sender_id: str, text: str, scene: str = "private") -> int:
-        """追加一条备忘，返回该场景当前待写入的备忘条数。"""
+    @staticmethod
+    def _sanitize_closing_tags(text: str) -> str:
+        """消毒闭合标签：防止日记/备忘文本里的 </memory_diary> 截断注入用 XML 块。"""
+        return re.sub(
+            r"</\s*memory_diary\s*>", "< /memory_diary>", text, flags=re.IGNORECASE
+        )
+
+    def _append_memo(self, sender_id: str, text: str, scene: str = "private") -> tuple:
+        """追加一条备忘，返回 (该场景当前待写入条数, 是否保存成功)。"""
         data = self._load_pref_data(sender_id)
         memos = self._load_memos(sender_id)
         memos.append(
             {
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "text": text.strip(),
+                "time": self._now().strftime("%Y-%m-%d %H:%M"),
+                "text": self._sanitize_closing_tags(text.strip()),
                 "scene": scene if scene in ("private", "group") else "private",
             }
         )
@@ -405,13 +567,16 @@ class MemoryDiaryPlugin(Star):
                 -self._MEMO_LIMIT :
             ]
         data["memos"] = capped
-        self._save_pref_data(sender_id, data)
-        return len(
+        ok = self._save_pref_data(sender_id, data)
+        total = len(
             [m for m in capped if self._memo_scene(m) == self._memo_scene(memos[-1])]
         )
+        return total, ok
 
-    def _clear_memos(self, sender_id: str, scenes: tuple = ("private", "group")):
-        """清除指定场景的备忘（默认全部）。写日记只清已吸收进日记的场景。"""
+    def _clear_memos(
+        self, sender_id: str, scenes: tuple = ("private", "group")
+    ) -> bool:
+        """清除指定场景的备忘（默认全部）。写日记只清已吸收进日记的场景。返回是否保存成功。"""
         data = self._load_pref_data(sender_id)
         memos = self._load_memos(sender_id)
         kept = [m for m in memos if self._memo_scene(m) not in scenes]
@@ -419,7 +584,7 @@ class MemoryDiaryPlugin(Star):
             data["memos"] = kept
         else:
             data.pop("memos", None)
-        self._save_pref_data(sender_id, data)
+        return self._save_pref_data(sender_id, data)
 
     def _select_entries(self, entries: list, scope: str) -> list:
         """按 scope 选择要注入的日期文件。"""
@@ -432,7 +597,7 @@ class MemoryDiaryPlugin(Star):
                 n = max(1, int(scope[5:]))
             except ValueError:
                 return [entries[-1]]
-            cutoff = (datetime.now() - timedelta(days=n - 1)).strftime("%Y%m%d")
+            cutoff = (self._now() - timedelta(days=n - 1)).strftime("%Y%m%d")
             sel = [e for e in entries if self._entry_day(e) >= cutoff]
             return sel or [entries[-1]]
         if scope.startswith("range:") and len(scope) == 6 + 8 + 1 + 8:
@@ -443,6 +608,15 @@ class MemoryDiaryPlugin(Star):
         return [entries[-1]]
 
     _DATE_PAT = r"(\d{4})\s*[-/年.]\s*(\d{1,2})\s*[-/月.]\s*(\d{1,2})\s*日?"
+
+    @staticmethod
+    def _valid_day(y: int, m: int, d: int) -> bool:
+        """真实日期校验：2026-02-31 这类不存在的日期直接判非法。"""
+        try:
+            datetime(y, m, d)
+            return True
+        except ValueError:
+            return False
 
     @classmethod
     def _parse_scope(cls, arg: str):
@@ -457,12 +631,16 @@ class MemoryDiaryPlugin(Star):
             return "all"
         m = re.match(r"^最近\s*(\d{1,3})\s*天$", arg.strip())
         if m:
-            return f"days:{int(m.group(1))}"
+            return f"days:{max(1, int(m.group(1)))}"
         m2 = re.match(
             rf"^{cls._DATE_PAT}\s*(?:到|至|~|--?|—)\s*{cls._DATE_PAT}$", arg.strip()
         )
         if m2:
             g = [int(x) for x in m2.groups()]
+            if not (
+                cls._valid_day(g[0], g[1], g[2]) and cls._valid_day(g[3], g[4], g[5])
+            ):
+                return None
             start = f"{g[0]:04d}{g[1]:02d}{g[2]:02d}"
             end = f"{g[3]:04d}{g[4]:02d}{g[5]:02d}"
             if start > end:
@@ -471,6 +649,8 @@ class MemoryDiaryPlugin(Star):
         m3 = re.match(rf"^{cls._DATE_PAT}$", arg.strip())
         if m3:
             y, mo, dd = (int(x) for x in m3.groups())
+            if not cls._valid_day(y, mo, dd):
+                return None
             day = f"{y:04d}{mo:02d}{dd:02d}"
             return f"range:{day}-{day}"  # 单日日期 = 起止同一天
         return None
@@ -506,6 +686,7 @@ class MemoryDiaryPlugin(Star):
         in_group: bool = False,
         scope_override: str = "",
         only_names: set = None,
+        exclude_names: set = None,
     ):
         """按用户偏好/配置组装要注入的日记文本（带总量保险丝）。
 
@@ -513,6 +694,7 @@ class MemoryDiaryPlugin(Star):
         （私聊写的片段不进群聊；群聊写的片段在私聊中不受限）。
         scope_override：/注入日记 主动指定的范围，优先于用户偏好与默认。
         only_names：只从这些篇目中选（用于会话内去重）。
+        exclude_names：从这些篇目中排除（持久模式下排除本轮已临时注入的篇目）。
         返回 (text, tampered_any, used_names)；text 为空表示没有可注入内容。
         """
         entries = self._list_entries(sender_id)
@@ -521,9 +703,19 @@ class MemoryDiaryPlugin(Star):
         default_days = int(self.config.get("inject_default_days", 7) or 0)
         default_scope = "all" if default_days <= 0 else f"days:{default_days}"
         scope = scope_override or self._load_pref(sender_id) or default_scope
-        targets = self._select_entries(entries, scope) or [entries[-1]]
+        targets = self._select_entries(entries, scope)
+        if not targets:
+            # P2-2：显式日期范围选不中任何篇目时严格为空、绝不回退最新；
+            # 只有 days:N（默认/偏好）找不到时才回退最新一篇（刻意设计）
+            if scope.startswith("range:"):
+                return "", False, []
+            targets = [entries[-1]]
         if only_names is not None:
             targets = [t for t in targets if t in only_names]
+            if not targets:
+                return "", False, []
+        if exclude_names:
+            targets = [t for t in targets if t not in exclude_names]
             if not targets:
                 return "", False, []
 
@@ -559,6 +751,10 @@ class MemoryDiaryPlugin(Star):
         parts.reverse()  # 恢复时间顺序（旧→新）
         used_names.reverse()
 
+        if not parts:
+            # P2-1：只有说明、没有正文时返回空串——避免占用"本会话已注入"名额，
+            # 也避免群聊里只看到一句没头没尾的附注
+            return "", tampered_any, []
         text = "\n\n".join(parts)
         if truncated:
             text += "\n\n（注：因注入长度上限，更早的日记未全部注入；可用 /日记范围 调整或 /查看日记 单独查阅。）"
@@ -567,6 +763,43 @@ class MemoryDiaryPlugin(Star):
         if filtered_any:
             text += "\n\n（注：私聊场景中写下的日记片段按规则未注入本次群聊。）"
         return text, tampered_any, used_names
+
+    def _quarantine_corrupt(self, path: Path):
+        """把损坏的日记 zip 改名隔离（不删除、不覆盖），返回备份路径或 None。"""
+        ts = self._now().strftime("%Y%m%d_%H%M%S")
+        backup = path.with_name(f"{path.stem}.corrupt-{ts}{path.suffix}")
+        try:
+            path.rename(backup)
+            logger.error(
+                f"[memory_diary] 日记文件损坏，已隔离为 {backup.name}，"
+                "请管理员人工检查后决定恢复或删除"
+            )
+            return backup
+        except Exception as e:
+            logger.error(f"[memory_diary] 日记文件损坏且隔离失败（{path}）：{e}")
+            return None
+
+    @staticmethod
+    def _write_zip_atomic(path: Path, entries: dict):
+        """原子写 zip（P1-1 修复）：先写同目录临时文件并自验，再 os.replace 落位。
+
+        "w" 模式会直接截断原文件——进程在写中央目录前被杀、磁盘满时，
+        旧日记会整个损坏。原子写保证任何时刻磁盘上要么是完整的旧文件，
+        要么是完整的新文件。
+        """
+        tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+        try:
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+                for n, b in entries.items():
+                    z.writestr(n, b)
+            # 落位前自验：读回中央目录并校验每个条目的 CRC
+            with zipfile.ZipFile(tmp) as z:
+                bad = z.testzip()
+                if bad is not None:
+                    raise zipfile.BadZipFile(f"写入后自检失败: {bad}")
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)  # 已 os.replace 则不存在；失败时清理残骸
 
     def _save_diary(
         self,
@@ -583,25 +816,60 @@ class MemoryDiaryPlugin(Star):
         供"群聊注入过滤"识别；旧格式迁移时不传，保持无标记。
         """
         path = self._diary_path(sender_id)
-        day = entry_name_hint or datetime.now().strftime("%Y%m%d")
+        day = entry_name_hint or self._now().strftime("%Y%m%d")
         entry_name = self._md_entry(day)
         scene = {"private": "私聊", "group": "群聊"}.get(origin, "")
+        # 防止日记正文闭合注入用 XML 标签
+        content = self._sanitize_closing_tags(content)
+
+        # fail-closed（P2-6）：密钥不可用就不写，不写就无法验签的日记
+        if self._secret_key() is None:
+            raise DiaryKeyUnavailable("签名密钥不可用，已拒绝写入日记")
 
         # zip 不支持原地修改，整体重写（日记体量小，开销可忽略）
         existing: dict = {}
         if path.exists():
             try:
                 with zipfile.ZipFile(path) as z:
-                    for n in z.namelist():
-                        if self.ENTRY_NAME_RE.match(n):
-                            existing[n] = z.read(n).decode("utf-8")
+                    names = set(z.namelist())
+                    invalid = []
+                    for n in sorted(names):
+                        if not self.ENTRY_NAME_RE.match(n):
+                            continue
+                        text = z.read(n).decode("utf-8")
+                        sig_name = self._sig_entry(n)
+                        actual = (
+                            z.read(sig_name).decode("utf-8", "ignore").strip()
+                            if sig_name in names
+                            else ""
+                        )
+                        # P1-2 修复：保存前逐条验签——被篡改/签名缺失的条目
+                        # 绝不重新签名，整次保存拒绝，让用户先处理（恢复或删除）
+                        if not actual or not hmac.compare_digest(
+                            self._entry_sig(sender_id, n, text), actual
+                        ):
+                            invalid.append(n)
+                        else:
+                            existing[n] = text
+                    if invalid:
+                        labels = "、".join(self._entry_label(n) for n in invalid)
+                        raise DiaryTamperedError(labels)
+            except (DiaryTamperedError, DiaryKeyUnavailable):
+                raise
             except Exception as e:
-                logger.warning(
-                    f"[memory_diary] 读取既有日记失败，将只保留本次内容: {e}"
+                # P1-3 修复：zip 损坏（含 BadZipFile/CRC 错误）绝不静默覆盖——
+                # 先改名隔离备份，再拒绝本次写入，等管理员人工确认
+                backup = self._quarantine_corrupt(path)
+                if backup:
+                    raise DiaryCorruptError(
+                        f"原文件已损坏（{e}），已隔离备份为 {backup.name}"
+                    )
+                raise DiaryCorruptError(
+                    f"原文件已损坏（{e}），且隔离备份失败，原文件仍在原位，请先手动备份"
                 )
 
         if entry_name in existing:
-            now_hm = datetime.now().strftime("%H:%M")
+            now_hm = self._now().strftime("%H:%M")
             scene_tag = f" · 写于{scene}" if scene else ""
             existing[entry_name] = (
                 existing[entry_name].rstrip()
@@ -610,18 +878,24 @@ class MemoryDiaryPlugin(Star):
             )
         else:
             if scene:
-                now_hm = datetime.now().strftime("%H:%M")
-                existing[entry_name] = f"—— {now_hm} · 写于{scene} ——\n\n{content}"
+                # P2-4：首篇也带上 separator_note（如"无新对话·她的日常随笔"），与补记格式对齐
+                now_hm = self._now().strftime("%H:%M")
+                existing[entry_name] = (
+                    f"—— {now_hm}{separator_note} · 写于{scene} ——\n\n{content}"
+                )
             else:
                 existing[entry_name] = content
 
-        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-            for n in sorted(existing):
-                z.writestr(n, existing[n])
-                z.writestr(
-                    self._sig_entry(n), self._entry_sig(sender_id, n, existing[n])
-                )
-            z.writestr(self.README_ZIP_ENTRY, self._readme_text(sender_id, sender_name))
+        out: dict = {}
+        for n in sorted(existing):
+            out[n] = existing[n].encode("utf-8")
+            out[self._sig_entry(n)] = self._entry_sig(sender_id, n, existing[n]).encode(
+                "utf-8"
+            )
+        out[self.README_ZIP_ENTRY] = self._readme_text(sender_id, sender_name).encode(
+            "utf-8"
+        )
+        self._write_zip_atomic(path, out)
         return entry_name
 
     def _migrate_legacy(self, sender_id: str):
@@ -629,6 +903,9 @@ class MemoryDiaryPlugin(Star):
 
         返回 "migrated" / "tampered" / None。
         """
+        if self._secret_key() is None:
+            logger.error("[memory_diary] 签名密钥不可用，无法验签，跳过旧格式迁移")
+            return None
         path = self._diary_path(sender_id)
 
         if path.exists():
@@ -680,31 +957,25 @@ class MemoryDiaryPlugin(Star):
                     if n2.startswith(("diaries/", "sigs/"))
                 }
                 try:
-                    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-                        for n2, b in keep.items():
-                            z.writestr(n2, b)
-                        for day in sorted(day_map):
-                            items = day_map[day]
-                            if len(items) == 1 and not items[0][0]:
-                                merged = items[0][1]
-                            else:
-                                merged = "\n\n".join(
-                                    (
-                                        f"—— 当天 {label} 记 ——\n\n{text}"
-                                        if label
-                                        else text
-                                    )
-                                    for label, text in items
-                                )
-                            md_name = self._md_entry(day)
-                            z.writestr(md_name, merged)
-                            z.writestr(
-                                self._sig_entry(md_name),
-                                self._entry_sig(sender_id, md_name, merged),
+                    out = dict(keep)
+                    for day in sorted(day_map):
+                        items = day_map[day]
+                        if len(items) == 1 and not items[0][0]:
+                            merged = items[0][1]
+                        else:
+                            merged = "\n\n".join(
+                                (f"—— 当天 {label} 记 ——\n\n{text}" if label else text)
+                                for label, text in items
                             )
-                        z.writestr(
-                            self.README_ZIP_ENTRY, self._readme_text(sender_id, "")
-                        )
+                        md_name = self._md_entry(day)
+                        out[md_name] = merged.encode("utf-8")
+                        out[self._sig_entry(md_name)] = self._entry_sig(
+                            sender_id, md_name, merged
+                        ).encode("utf-8")
+                    out[self.README_ZIP_ENTRY] = self._readme_text(
+                        sender_id, ""
+                    ).encode("utf-8")
+                    self._write_zip_atomic(path, out)
                 except Exception as e:
                     logger.warning(f"[memory_diary] 迁移写入失败: {e}")
                     return None
@@ -732,17 +1003,15 @@ class MemoryDiaryPlugin(Star):
                 day = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y%m%d")
                 entry_name = self._md_entry(day)
                 try:
-                    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-                        for n, b in keep.items():
-                            z.writestr(n, b)
-                        z.writestr(entry_name, content)
-                        z.writestr(
-                            self._sig_entry(entry_name),
-                            self._entry_sig(sender_id, entry_name, content),
-                        )
-                        z.writestr(
-                            self.README_ZIP_ENTRY, self._readme_text(sender_id, "")
-                        )
+                    out = dict(keep)
+                    out[entry_name] = content.encode("utf-8")
+                    out[self._sig_entry(entry_name)] = self._entry_sig(
+                        sender_id, entry_name, content
+                    ).encode("utf-8")
+                    out[self.README_ZIP_ENTRY] = self._readme_text(
+                        sender_id, ""
+                    ).encode("utf-8")
+                    self._write_zip_atomic(path, out)
                 except Exception as e:
                     logger.warning(f"[memory_diary] 迁移写入失败: {e}")
                     return None
@@ -824,10 +1093,8 @@ class MemoryDiaryPlugin(Star):
             if not remaining_days:
                 path.unlink(missing_ok=True)  # 一天都不剩 → 整个 zip 删掉
             else:
-                with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-                    for n, b in data.items():
-                        if n not in remove:
-                            z.writestr(n, b)
+                out = {n: b for n, b in data.items() if n not in remove}
+                self._write_zip_atomic(path, out)
         except Exception as e:
             logger.warning(f"[memory_diary] 删除日记条目失败: {e}")
             return 0
@@ -844,14 +1111,15 @@ class MemoryDiaryPlugin(Star):
         last = self._op_last.get(sender_id)
         if last is None:
             return 0
-        elapsed = (datetime.now() - last).total_seconds()
+        elapsed = (self._now() - last).total_seconds()
         remaining_sec = interval * 60 - elapsed
         if remaining_sec <= 0:
             return 0
         return int((remaining_sec + 59) // 60)  # 向上取整，提示更直观
 
     def _op_mark(self, sender_id: str):
-        self._op_last[sender_id] = datetime.now()
+        self._op_last[sender_id] = self._now()
+        self._cap_state(self._op_last)
 
     # ------------------------- 会话历史 -------------------------
 
@@ -892,26 +1160,49 @@ class MemoryDiaryPlugin(Star):
         if pm is None:
             return ""
         try:
-            # 1) 会话上指定了 persona_id 时优先用它（/persona 切换的人设）
+            # 1) 会话上指定了 persona_id 时优先用它（/persona 切换的人设）。
+            #    优先走 v3 人格库接口（不同版本方法名不同，逐个探测），再回退旧接口。
             conv_mgr = self.context.conversation_manager
             cid = await conv_mgr.get_curr_conversation_id(umo)
             conv = await conv_mgr.get_conversation(umo, cid) if cid else None
             persona_id = getattr(conv, "persona_id", "") or ""
             if persona_id and persona_id != "[%None]":
-                try:
-                    persona = await self._maybe_await(pm.get_persona(persona_id))
-                    prompt = getattr(persona, "system_prompt", "") or ""
+                for getter_name in ("get_persona_v3_by_id", "get_persona"):
+                    getter = getattr(pm, getter_name, None)
+                    if getter is None:
+                        continue
+                    try:
+                        persona = await self._maybe_await(getter(persona_id))
+                    except Exception:
+                        continue
+                    if isinstance(persona, dict):
+                        prompt = (
+                            persona.get("system_prompt") or persona.get("prompt") or ""
+                        )
+                    else:
+                        prompt = (
+                            getattr(persona, "system_prompt", "")
+                            or getattr(persona, "prompt", "")
+                            or ""
+                        )
                     if prompt.strip():
                         return prompt.strip()
+            # 2) 回退到默认人格（同样按版本探测接口名）
+            for getter_name in ("get_default_persona_v3", "get_default_persona"):
+                getter = getattr(pm, getter_name, None)
+                if getter is None:
+                    continue
+                try:
+                    personality = await self._maybe_await(getter(umo))
                 except Exception:
-                    pass
-            # 2) 回退到默认人格
-            personality = await self._maybe_await(pm.get_default_persona_v3(umo))
-            if isinstance(personality, dict):
-                prompt = personality.get("prompt", "") or ""
-            else:
-                prompt = getattr(personality, "prompt", "") or ""
-            return prompt.strip()
+                    continue
+                if isinstance(personality, dict):
+                    prompt = personality.get("prompt", "") or ""
+                else:
+                    prompt = getattr(personality, "prompt", "") or ""
+                if prompt.strip():
+                    return prompt.strip()
+            return ""
         except Exception as e:
             logger.warning(f"[memory_diary] 获取人设失败: {e}")
             return ""
@@ -1014,6 +1305,7 @@ class MemoryDiaryPlugin(Star):
         sender_name: str,
         is_group: bool = False,
         allow_life: bool = True,
+        extra_material: str = "",
     ):
         """调用 LLM 写日记并保存。返回 (diary_content, error_msg)。
 
@@ -1022,26 +1314,36 @@ class MemoryDiaryPlugin(Star):
         - brief：当天已有日记，只写 1~3 句简略补记（省 token）；
         - life：距上次写日记没有任何新对话，写一段她自己的拟人日常
           （allow_life=False 时不写，返回 ERR_NO_NEW_MATERIAL，供自动写场景静默跳过）。
+
+        extra_material：触发本轮的那条当前消息（P1-5）。自动触发时它还在
+        req.prompt 里、没进会话历史，不并入就会漏记"把上下文推满"的那句话。
         """
         history = await self._get_history(umo)
-        convo_text = self._flatten_history(history)
-        # 先剔除日记操作相关内容，再按条数截断（操作记录不占用写作素材额度）
-        if convo_text:
-            convo_text = self._filter_diary_ops(convo_text)
+        # 按消息条数截断（而不是按行）：先截 history，再转文本
         max_msgs = int(self.config.get("max_history_messages", 60) or 60)
         if is_group:
             # 群聊历史混有其他成员发言，按倍率放大窗口，提高覆盖到画像对象发言的概率
             mult = int(self.config.get("group_history_multiplier", 3) or 1)
             max_msgs *= max(1, mult)
+        if len(history) > max_msgs:
+            history = history[-max_msgs:]
+        convo_text = self._flatten_history(history)
+        # 剔除日记操作相关内容：不进入写作素材，省 token 也避免污染画像
         if convo_text:
-            lines = convo_text.split("\n")
-            if len(lines) > max_msgs:
-                lines = lines[-max_msgs:]
-            convo_text = "\n".join(lines)
+            convo_text = self._filter_diary_ops(convo_text)
+        # P1-5：并入当前消息（与 history 末条重复时不重复添加；本身是指令时不进素材）
+        extra = (extra_material or "").strip()
+        if extra and not self._is_op_command(extra):
+            extra_line = f"用户: {extra}"
+            lines = convo_text.split("\n") if convo_text else []
+            if not lines or lines[-1] != extra_line:
+                convo_text = (
+                    (convo_text + "\n" + extra_line) if convo_text else extra_line
+                )
 
         entries = self._list_entries(sender_id)
         prev_label = self._entry_label(entries[-1]) if entries else ""
-        today_entry = self._md_entry(datetime.now().strftime("%Y%m%d"))
+        today_entry = self._md_entry(self._now().strftime("%Y%m%d"))
         has_today = today_entry in entries
         material_hash = (
             hashlib.md5(convo_text.encode("utf-8")).hexdigest() if convo_text else ""
@@ -1066,7 +1368,7 @@ class MemoryDiaryPlugin(Star):
             # 每 5 分钟一次的冷却一过又会写一篇，当天文件会被随笔刷屏
             if self._load_pref_data(sender_id).get(
                 "last_life_day"
-            ) == datetime.now().strftime("%Y%m%d"):
+            ) == self._now().strftime("%Y%m%d"):
                 return None, "今天的随笔已经写过啦，等我们有新聊天时再叫我写日记吧"
             mode = "life"
         elif has_today:
@@ -1074,7 +1376,7 @@ class MemoryDiaryPlugin(Star):
         else:
             mode = "full"
 
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = self._now().strftime("%Y-%m-%d %H:%M:%S")
         extra_instruction = str(self.config.get("extra_instruction", "") or "").strip()
 
         prompt_parts = [f"当前时间：{now_str}"]
@@ -1089,6 +1391,7 @@ class MemoryDiaryPlugin(Star):
             if prev_label:
                 prompt_parts.append(
                     f"上一篇日记写于 {prev_label}。本篇请涵盖从那之后到现在这段时间的内容。"
+                    "注意：对话记录里可能仍包含上次日记已经写过的旧内容，请识别并跳过，只记录新发生的事。"
                 )
             else:
                 prompt_parts.append(
@@ -1179,8 +1482,28 @@ class MemoryDiaryPlugin(Star):
             if mode == "life":
                 # 记录今天已写过随笔，同日不再重复触发（防刷屏）
                 pref = self._load_pref_data(sender_id)
-                pref["last_life_day"] = datetime.now().strftime("%Y%m%d")
+                pref["last_life_day"] = self._now().strftime("%Y%m%d")
                 self._save_pref_data(sender_id, pref)
+        except DiaryKeyUnavailable as e:
+            logger.error(f"[memory_diary] 密钥不可用，日记未写入: {e}")
+            return None, (
+                "日记写好了但没能保存：签名密钥（.diary_key）不可读或无法生成。"
+                "为了不留下以后无法验签的日记，这次没有写入——"
+                "请检查插件数据目录的权限后让我再试一次。"
+            )
+        except DiaryTamperedError as e:
+            logger.error(f"[memory_diary] 保存前验签失败，已拒绝写入: {e}")
+            return None, (
+                f"日记写好了但没能保存：{e} 的日记验签失败（疑似被手动改过）。"
+                "我不会给被改过的内容重新签名，所以这次没有写入——"
+                "请先用 /删除日记 删掉那天的日记，或从备份恢复后再让我写。"
+            )
+        except DiaryCorruptError as e:
+            logger.error(f"[memory_diary] 日记文件损坏: {e}")
+            return None, (
+                f"日记写好了但没能保存：{e}。"
+                "我没有写入新内容；请管理员检查并处理好损坏文件（恢复或删除）后，再让我写。"
+            )
         except Exception as e:
             logger.error(f"[memory_diary] 日记写入文件失败: {e}")
             return None, (
@@ -1264,7 +1587,11 @@ class MemoryDiaryPlugin(Star):
                 pass
         if at_me:
             return True
-        m = re.search(r"@([^\s@，,]+)", event.message_str or "")
+        # 文本形式的点名只看"指令本体"（第一个空白前的 token，如 "/写日记@小深"）：
+        # 内容里出现的 @（例如 /记一下 记得@张三 他下周考试）不算点名，避免误判沉默
+        full_text = (event.message_str or "").strip()
+        cmd_token = full_text.split(None, 1)[0] if full_text else ""
+        m = re.search(r"@([^\s@，,]+)", cmd_token)
         if m:
             target = m.group(1)
             names = self._bot_names()
@@ -1273,6 +1600,20 @@ class MemoryDiaryPlugin(Star):
         if at_other:
             return False
         return not bool(self.config.get("group_require_at", False))
+
+    def _command_arg(self, event: AstrMessageEvent) -> str:
+        """从原始消息取指令后的完整参数，并剥掉 @提及。
+
+        P2-3 修复：AstrBot 的 CommandFilter 按空格拆参数，只把第一个 token 传给
+        处理函数的参数——"/日记范围 2026-10-01 到 2026-10-23" 会被截成单日。
+        这里直接解析 event.message_str，保留带空格的完整参数。
+        """
+        text = (event.message_str or "").strip()
+        parts = text.split(maxsplit=1)
+        arg = parts[1] if len(parts) > 1 else ""
+        if not arg and "　" in text:  # 兼容全角空格
+            arg = text.split("　", 1)[1]
+        return re.sub(r"@[^\s@，,]+", "", arg).strip()
 
     # ------------------------- 指令：帮助 -------------------------
 
@@ -1334,19 +1675,24 @@ class MemoryDiaryPlugin(Star):
             return
 
         is_group = bool(event.get_group_id())
-        total = self._append_memo(
+        total, saved = self._append_memo(
             sender_id, note, scene="group" if is_group else "private"
         )
+        if not saved:
+            # P2-5 修复：保存失败必须明说，不能谎报"已记下"
+            yield event.plain_result(
+                "📌 保存失败了（数据目录不可写或磁盘已满），这条备忘其实没有记下——"
+                "请让管理员检查插件数据目录的权限后再试。"
+            )
+            return
         scene_tip = (
             "（这条是群聊备忘，只会在群聊写日记时吸收；群聊/私聊备忘各存 20 条）"
             if is_group
             else "（这条是私聊备忘，不会出现在群聊的日记里；群聊/私聊备忘各存 20 条）"
         )
-        canned = (
-            f"📌 已记下：「{note}」\n"
-            f"下次写日记时我会重点把它写进画像里"
-            + (f"（当前这个场景还有 {total} 条备忘待写入）。" if total > 1 else "。")
-            + f"\n{scene_tip}"
+        # P3-1 修复：scene_tip 只在最后追加一次，canned 里不再重复包含
+        canned = f"📌 已记下：「{note}」\n下次写日记时我会重点把它写进画像里" + (
+            f"（当前这个场景还有 {total} 条备忘待写入）。" if total > 1 else "。"
         )
         yield event.plain_result(
             await self._say(
@@ -1421,7 +1767,14 @@ class MemoryDiaryPlugin(Star):
             text = (ev.message_str or "").strip()
             cur = self._load_memos(sender_id)
             if text.lower() in ("全部", "all"):
-                self._clear_memos(sender_id)
+                if not self._clear_memos(sender_id):
+                    await ev.send(
+                        ev.plain_result(
+                            "📌 保存失败（数据目录不可写或磁盘已满），备忘未改动。"
+                        )
+                    )
+                    controller.stop()
+                    return
                 canned = f"📌 已清空全部 {len(cur)} 条备忘。"
                 await ev.send(
                     ev.plain_result(
@@ -1454,7 +1807,14 @@ class MemoryDiaryPlugin(Star):
                         data["memos"] = rest
                     else:
                         data.pop("memos", None)
-                    self._save_pref_data(sender_id, data)
+                    if not self._save_pref_data(sender_id, data):
+                        await ev.send(
+                            ev.plain_result(
+                                "📌 保存失败（数据目录不可写或磁盘已满），备忘未改动。"
+                            )
+                        )
+                        controller.stop()
+                        return
                     canned = f"📌 已删除备忘：「{target['text']}」"
                     await ev.send(
                         ev.plain_result(
@@ -1594,6 +1954,19 @@ class MemoryDiaryPlugin(Star):
             return
 
         sender_id = event.get_sender_id()
+        # 复审 12：密钥不可用时不要显示成"被篡改"——验签根本做不了，先说明
+        if self._secret_key() is None:
+            yield event.plain_result(
+                "📖 签名密钥（.diary_key）不可读，我没法验签，"
+                "也就不能确定日记内容是不是真的——请管理员检查插件数据目录里的密钥文件。"
+            )
+            return
+        # 先做全量 zip 健康检查：中央目录还在、单篇 CRC 坏掉时，
+        # is_zipfile() 仍会返回 True，必须先 testzip() 拦下来。
+        corrupt = self._corrupt_notice(sender_id)
+        if corrupt:
+            yield event.plain_result(corrupt)
+            return
         latest_content, latest_tampered, latest_name = self._load_latest(sender_id)
         if latest_tampered and latest_name is None:
             yield event.plain_result(
@@ -1603,7 +1976,9 @@ class MemoryDiaryPlugin(Star):
             return
         entries = self._list_entries(sender_id)
         if not entries:
-            yield event.plain_result("📖 还没有写过日记。发送 /日记 让我现在写一篇吧。")
+            yield event.plain_result(
+                "📖 还没有写过日记。发送 /日记 让我现在写一篇吧。"
+            )
             return
 
         lines = []
@@ -1737,9 +2112,17 @@ class MemoryDiaryPlugin(Star):
             # 第二步：全部删除的确认
             if pending_all["v"]:
                 if low in ("确认", "确认删除", "是", "yes", "y"):
-                    self._delete_diary(sender_id)
-                    self._op_mark(sender_id)
-                    await ev.send(ev.plain_result("📖 全部日记已删除。"))
+                    # P3-9 修复：删除失败（权限/IO）必须明说，不能谎报"已删除"
+                    if self._delete_diary(sender_id):
+                        self._op_mark(sender_id)
+                        await ev.send(ev.plain_result("📖 全部日记已删除。"))
+                    else:
+                        await ev.send(
+                            ev.plain_result(
+                                "📖 删除失败（文件不可写或无权限），日记未改动——"
+                                "请让管理员检查数据目录后重试。"
+                            )
+                        )
                 else:
                     await ev.send(ev.plain_result("📖 已取消，日记原样保留。"))
                 controller.stop()
@@ -1821,10 +2204,20 @@ class MemoryDiaryPlugin(Star):
         sender_id = event.get_sender_id()
         umo = event.unified_msg_origin
 
-        # 日记信息
-        latest_content, latest_tampered, latest_name = self._load_latest(sender_id)
-        entries = self._list_entries(sender_id)
-        if entries:
+        # 日记信息：先做全量 zip 健康检查，损坏时不能显示“0 字，校验通过”
+        corrupt = self._corrupt_notice(sender_id)
+        if corrupt:
+            latest_content, latest_tampered, latest_name = "", False, None
+            entries = []
+        else:
+            latest_content, latest_tampered, latest_name = self._load_latest(sender_id)
+            entries = self._list_entries(sender_id)
+        if corrupt:
+            diary_info = (
+                "⚠️ 日记文件已损坏（CRC 校验失败或无法打开；"
+                "写入时会自动隔离，请管理员检查数据目录）"
+            )
+        elif entries:
             if latest_tampered:
                 diary_info = (
                     f"共 {len(entries)} 天的日记，最新 {self._entry_label(latest_name)} "
@@ -1897,9 +2290,8 @@ class MemoryDiaryPlugin(Star):
         if not self._should_respond(event):
             return
         sender_id = event.get_sender_id()
-        arg = (scope or "").strip()
-        # 群里点名写法（/日记范围 @我 全部）：剥掉 @提及再解析
-        arg = re.sub(r"@[^\s@，,]+", "", arg).strip()
+        # P2-3：不使用被空格截断的 scope 参数，直接解析原始消息（支持带空格的时间段写法）
+        arg = self._command_arg(event)
         low = arg.lower()
 
         if not arg:
@@ -1939,7 +2331,13 @@ class MemoryDiaryPlugin(Star):
             )
             return
 
-        self._save_pref(sender_id, parsed)
+        # P2-5b：保存失败必须明说，不能谎报"已设置"
+        if not self._save_pref(sender_id, parsed):
+            yield event.plain_result(
+                "📖 保存失败（数据目录不可写或磁盘已满），注入范围没有改动——"
+                "请让管理员检查插件数据目录后重试。"
+            )
+            return
         if parsed is None:
             default_days = int(self.config.get("inject_default_days", 7) or 0)
             desc = (
@@ -1986,12 +2384,18 @@ class MemoryDiaryPlugin(Star):
         if not self._should_respond(event):
             return
         sender_id = event.get_sender_id()
-        arg = (scope or "").strip()
-        arg = re.sub(r"@[^\s@，,]+", "", arg).strip()
+        # P2-3：直接解析原始消息，支持带空格的时间段写法
+        arg = self._command_arg(event)
 
+        corrupt = self._corrupt_notice(sender_id)
+        if corrupt:
+            yield event.plain_result(corrupt)
+            return
         entries = self._list_entries(sender_id)
         if not entries:
-            yield event.plain_result("📖 还没有日记可以注入，先让我写一篇吧（/日记）。")
+            yield event.plain_result(
+                "📖 还没有日记可以注入，先让我写一篇吧（/日记）。"
+            )
             return
         if not arg:
             yield event.plain_result(
@@ -2008,11 +2412,20 @@ class MemoryDiaryPlugin(Star):
             )
             return
 
-        targets = self._select_entries(entries, parsed) or [entries[-1]]
+        targets = self._select_entries(entries, parsed)
+        if not targets:
+            # P2-2：显式日期范围没有日记时明说，不静默替换成最新一篇
+            yield event.plain_result(
+                f"📖 【{self._scope_desc(parsed)}】里没有日记哦，换个范围试试。"
+            )
+            return
         umo = event.unified_msg_origin
         cid = await self._curr_cid(umo)
         rec = self._injected_entries.get(umo)
-        already = rec["names"] if rec and rec.get("cid") == cid else set()
+        if not rec or rec.get("cid") != cid:
+            rec = {"cid": cid, "names": set()}
+            self._injected_entries[umo] = rec
+        already = rec["names"]
         new_targets = [t for t in targets if t not in already]
         if not new_targets:
             canned = f"📖 【{self._scope_desc(parsed)}】的日记在本会话都已经读过了，没有新篇目需要注入。"
@@ -2027,6 +2440,7 @@ class MemoryDiaryPlugin(Star):
             return
 
         self._pending_inject[umo] = parsed
+        self._cap_state(self._pending_inject)
         labels = "、".join(self._entry_label(t) for t in new_targets)
         dup_note = (
             f"（{len(targets) - len(new_targets)} 天本会话已读过，自动跳过）"
@@ -2066,6 +2480,7 @@ class MemoryDiaryPlugin(Star):
         if state is None or state.get("cid") != cid:
             state = {"cid": cid, "reminded": False, "auto_written": False}
             self._watch_state[umo] = state
+            self._cap_state(self._watch_state)
         return state
 
     async def _watch_context(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -2101,7 +2516,9 @@ class MemoryDiaryPlugin(Star):
                     sender_id,
                     sender_name,
                     is_group=bool(event.get_group_id()),
-                    allow_life=False,  # 自动写不编造"她的日常"，没有新素材就静默跳过
+                    allow_life=False,  # 自动写不编造"她的日常"
+                    extra_material=req.prompt
+                    or "",  # P1-5：当前消息还没进 history，手动并入
                 )
             finally:
                 self._writing.discard(umo)
@@ -2109,7 +2526,15 @@ class MemoryDiaryPlugin(Star):
             state["auto_written"] = True
             state["reminded"] = True
             if err == ERR_NO_NEW_MATERIAL:
-                return  # 没有新内容可记：不打扰用户，也不再重试
+                # P1-6：不能静默——上下文还在继续涨，用户需要知道现在该 /reset 了
+                await event.send(
+                    event.plain_result(
+                        f"⚠️ 上下文已用约 {pct}%（估算 {used}/{limit} tokens），"
+                        "不过这轮没有新的聊天内容可写进日记，所以这次没写。\n"
+                        "建议现在发送 /reset 开启新上下文，我会先读之前的日记再继续陪你。"
+                    )
+                )
+                return
             if diary:
                 notice = await self._in_character_notice(
                     umo,
@@ -2153,9 +2578,57 @@ class MemoryDiaryPlugin(Star):
 
     # ------------------------- 新会话注入日记 + 哨兵 -------------------------
 
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_any_message(self, event: AstrMessageEvent):
+        """reset 双保险（P0-1 补强）：监听到 /reset 指令文本就置标记。
+
+        只置标记、不拦截、不影响 AstrBot 内置 reset 的本身逻辑；
+        标记在下一次 LLM 请求（on_llm_request）时消费，按新代际重置状态。
+        """
+        try:
+            if str(event.get_sender_id()) == str(event.get_self_id()):
+                return  # 自己发的消息不算
+        except Exception:
+            pass
+        text = (event.message_str or "").strip().lower()
+        if text in ("/reset", "reset", "/重置", "重置"):
+            self._reset_pending.add(event.unified_msg_origin)
+            self._cap_state(self._reset_pending)
+
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         """每次 LLM 请求前：新会话注入日记；同时执行上下文哨兵。"""
+        # 0) /reset 代际识别（P0-1 修复 + 双保险）：
+        # AstrBot 4.x 的 /reset 只清空 history、不换 conversation_id，
+        # 所以"新会话"不能只认 cid。两条识别路径，任一命中即视为新的一代：
+        #   a) on_any_message 监听到 /reset 指令文本，置了 _reset_pending 标记；
+        #   b) cid 没变但 req.contexts 已为空（上下文被清空）。
+        # 命中后重置注入/去重/哨兵/待注入全部状态，让日记在本轮重新注入。
+        try:
+            umo0 = event.unified_msg_origin
+            reset_flagged = umo0 in self._reset_pending
+            self._reset_pending.discard(umo0)
+            if reset_flagged or not req.contexts:
+                cid0 = await self._curr_cid(umo0)
+                prev_watch = self._watch_state.get(umo0)
+                if reset_flagged or (
+                    cid0
+                    and (
+                        self._injected_cid.get(umo0) == cid0
+                        or (prev_watch and prev_watch.get("cid") == cid0)
+                    )
+                ):
+                    self._injected_cid.pop(umo0, None)
+                    self._injected_entries.pop(umo0, None)
+                    self._pending_inject.pop(umo0, None)
+                    self._watch_state.pop(umo0, None)
+                    logger.info(
+                        "[memory_diary] 检测到 /reset（指令标记或上下文已清空），"
+                        "会话代际状态已重置，本轮将重新注入日记"
+                    )
+        except Exception as e:
+            logger.warning(f"[memory_diary] reset 代际识别异常: {e}")
+
         # 1) 上下文哨兵
         try:
             await self._watch_context(event, req)
@@ -2164,9 +2637,6 @@ class MemoryDiaryPlugin(Star):
 
         # 2) 注入日记（自动 + 手动追加）
         try:
-            if not bool(self.config.get("enable_auto_inject", True)):
-                return
-
             sender_id = event.get_sender_id()
             in_group = bool(event.get_group_id())
             umo = event.unified_msg_origin
@@ -2177,9 +2647,12 @@ class MemoryDiaryPlugin(Star):
             if not rec or rec.get("cid") != cid:
                 rec = {"cid": cid, "names": set()}
                 self._injected_entries[umo] = rec
+                self._cap_state(self._injected_entries)
 
-            # a) 用户用 /注入日记 主动要求的追加注入：下一轮请求一次性带入
+            # a) 用户用 /注入日记 主动要求的追加注入：下一轮请求一次性带入。
+            #    P2-12：手动注入是用户明确指令，不受"新会话自动读取"开关影响。
             pending = self._pending_inject.pop(umo, None)
+            pending_names: set = set()
             if pending is not None:
                 scope = pending
                 new_names = {
@@ -2196,17 +2669,22 @@ class MemoryDiaryPlugin(Star):
                     if extra:
                         self._deliver_inject(req, INJECT_TEMPLATE.format(diary=extra))
                         rec["names"].update(extra_names)
+                        pending_names = set(extra_names)
                         logger.info(
                             f"[memory_diary] 已按用户要求追加注入 {len(extra_names)} 天日记"
                         )
+
+            if not bool(self.config.get("enable_auto_inject", True)):
+                return
 
             # b) 常规注入
             persist = bool(self.config.get("persist_inject", False))
             if persist:
                 # 持久模式：每一轮请求都把日记放进 system_prompt，全程可回忆，
-                # 代价是每轮都消耗日记的 token
+                # 代价是每轮都消耗日记的 token。
+                # P2-12：本轮已被手动追加注入过的篇目不再重复塞进 system_prompt。
                 diary, tampered_any, names = self._assemble_inject(
-                    sender_id, in_group=in_group
+                    sender_id, in_group=in_group, exclude_names=pending_names
                 )
                 if diary:
                     req.system_prompt = (
@@ -2215,6 +2693,7 @@ class MemoryDiaryPlugin(Star):
                         + INJECT_TEMPLATE.format(diary=diary)
                     )
                     self._injected_cid[umo] = cid
+                    self._cap_state(self._injected_cid)
                     rec["names"].update(names)
                 elif tampered_any:
                     logger.warning(
@@ -2237,6 +2716,7 @@ class MemoryDiaryPlugin(Star):
                     )
                 return
             self._injected_cid[umo] = cid
+            self._cap_state(self._injected_cid)
             rec["names"].update(names)
             self._deliver_inject(req, INJECT_TEMPLATE.format(diary=diary))
             logger.info(f"[memory_diary] 已在新会话为用户 {sender_id} 注入日记")
@@ -2265,3 +2745,4 @@ class MemoryDiaryPlugin(Star):
         self._watch_state.clear()
         self._writing.clear()
         self._op_last.clear()
+        self._reset_pending.clear()

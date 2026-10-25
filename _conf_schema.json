@@ -112,5 +112,11 @@
     "type": "string",
     "hint": "会追加到写日记的提示词末尾，例如：语气更温柔一些 / 多用条目列出画像",
     "default": ""
+  },
+  "diary_timezone": {
+    "description": "日记时区",
+    "type": "string",
+    "hint": "写日记的时间戳、按天归档、'最近N天'都用这个时区，填 IANA 时区名，例如 Asia/Shanghai；留空则跟随服务器本地时间；填错会回退本地时间并记日志",
+    "default": "Asia/Shanghai"
   }
 }
