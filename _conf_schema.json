@@ -113,6 +113,12 @@
     "hint": "会追加到写日记的提示词末尾，例如：语气更温柔一些 / 多用条目列出画像",
     "default": ""
   },
+  "max_full_diaries_per_day": {
+    "description": "每个场景每天最多几篇完整日记",
+    "type": "int",
+    "hint": "默认 1；0 表示不限制（适合 token 充足、希望多写完整篇的用户）。按场景计算：私聊和群聊各自独立（群与群目前不隔离），简记不占额度",
+    "default": 1
+  },
   "diary_timezone": {
     "description": "日记时区",
     "type": "string",
