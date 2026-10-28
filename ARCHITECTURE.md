@@ -47,10 +47,16 @@ main.py                         AstrBot 适配层（约 2200 行）
 ## 回归验证
 
 重构没有改业务方法体：除 `__init__`、`_now`、`_scope_desc`、`terminate` 的
-位置/装配调整外，其余方法体均由原文件原样切分。`tests/` 下提供差分回归
-测试，把同一组场景分别跑在原版与重构版上，比较磁盘状态与指令输出。
+位置/装配调整外，其余方法体均由原文件原样切分。仓库的 `tests/` 下提供
+**差分回归测试**：`baseline/`（重构前的原版）与当前实现同时加载，同一组
+场景各跑一遍，比较磁盘状态与指令输出。不需要 pytest，在仓库根目录执行：
 
-```bash
-# 见 tests/README.md；核心是：
-python -m pytest tests -q
+```powershell
+# 需要一个能 import astrbot 的 Python 环境（Windows + Launcher 示例）
+& "$env:USERPROFILE\.astrbot_launcher\instances\<实例UUID>\venv\Scripts\python.exe" tests\run.py
+
+# 其他环境：用 ASTRBOT_CORE 指向 AstrBot 源码目录
+$env:ASTRBOT_CORE = "D:\path\to\astrbot\core"; python tests\run.py
 ```
+
+详见 `tests/README.md`（含覆盖清单与测试边界说明）。

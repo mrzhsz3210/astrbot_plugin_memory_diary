@@ -1,0 +1,148 @@
+{
+  "enable_auto_inject": {
+    "description": "新会话自动读取日记",
+    "type": "bool",
+    "hint": "开启新上下文（/reset）后的第一条消息，自动把日记注入给模型",
+    "default": true
+  },
+  "enable_context_watch": {
+    "description": "启用上下文哨兵",
+    "type": "bool",
+    "hint": "每次请求前估算上下文 token 占用，快满时提醒并自动写日记。关闭后，下面的上下文窗口、提醒阈值、自动写日记阈值三项均不生效",
+    "default": true
+  },
+  "context_token_limit": {
+    "description": "模型上下文窗口（tokens）",
+    "type": "int",
+    "hint": "填你使用的模型的上下文上限，例如 DeepSeek-V3 填 60000；用于估算占用比例。仅在启用上下文哨兵后生效",
+    "default": 60000
+  },
+  "remind_ratio": {
+    "description": "提醒阈值（占比）",
+    "type": "float",
+    "hint": "上下文占用达到该比例时提醒一次，默认 0.75。必须小于等于自动写日记阈值，配置颠倒时插件会自动截断并记日志。仅在启用上下文哨兵后生效",
+    "default": 0.75,
+    "slider": {"min": 0.1, "max": 1, "step": 0.05}
+  },
+  "auto_ratio": {
+    "description": "自动写日记阈值（占比）",
+    "type": "float",
+    "hint": "上下文占用达到该比例时自动写好日记并提醒你 /reset，默认 0.9。仅在启用上下文哨兵后生效",
+    "default": 0.9,
+    "slider": {"min": 0.1, "max": 1, "step": 0.05}
+  },
+  "diary_op_interval": {
+    "description": "日记操作间隔（分钟）",
+    "type": "int",
+    "hint": "每个用户两次写日记/删日记之间的最小间隔；0 为不限制，最高 60 分钟",
+    "default": 5
+  },
+  "write_min_ratio": {
+    "description": "手动写日记的最低上下文占用（占比）",
+    "type": "float",
+    "hint": "上下文占用达到该比例才允许用户手动发 /日记；0 为不限制。哨兵自动写日记不受此限",
+    "default": 0
+  },
+  "use_persona": {
+    "description": "按人设口吻",
+    "type": "bool",
+    "hint": "默认开启：写日记与写完告知、备忘/查看/删除/导出/导入日记、日记密码、日记范围设置与注入确认、上下文哨兵提醒、每天定时自动写日记的写完告知等对话式反馈都用当前会话人设的口吻；日期清单、帮助菜单、日记正文以及保存失败/验签/密钥等技术报错保持固定文案，保证数字与指引准确。关闭后全部使用固定文案，不额外调用模型",
+    "default": true
+  },
+  "enable_auto_diary": {
+    "description": "每天定时自动写完整日记",
+    "type": "bool",
+    "hint": "开启后：每天到「自动写日记时间」，给有过私聊会话的用户自动写一篇完整日记（等同 /写日记 完整）。当天已经写过完整日记（私聊或群聊）的用户会跳过；没有新素材也不写；每个用户每天只尝试一次，失败不重试。写完后会按人设口吻私聊告知",
+    "default": false
+  },
+  "auto_diary_time": {
+    "description": "自动写日记时间",
+    "type": "string",
+    "hint": "24 小时制 HH:MM（例如 22:30），按「日记时区」计算；仅在开启上一项后生效。留空按默认 22:00；格式不对时不会自动写，并记一条日志。启动/重启晚于该时间超过 2 分钟不补写，等第二天",
+    "default": "22:00"
+  },
+  "empty_diary_as_life": {
+    "description": "无新素材时写拟人日常",
+    "type": "bool",
+    "hint": "开启后：用户要求写日记但距上次没有任何新对话时，她会写一段自己的拟人生活随笔（不含用户画像、不编造用户言行）；关闭后：直接提示没有新内容、不写",
+    "default": true
+  },
+  "show_diary_after_write": {
+    "description": "写完后展示日记全文",
+    "type": "bool",
+    "hint": "默认关闭：她只用正常口吻告知日记已写好；开启后会在告知后附上日记全文",
+    "default": false
+  },
+  "inject_default_days": {
+    "description": "默认注入最近几天的日记",
+    "type": "int",
+    "hint": "新上下文默认注入最近 N 天的日记，默认 7；0 表示注入全部。用户可用 /日记范围 自行覆盖",
+    "default": 7
+  },
+  "inject_max_chars": {
+    "description": "注入日记的最大字符数",
+    "type": "int",
+    "hint": "防炸上下文保险丝：注入的日记总量超过该值时优先保留最近的日记，更旧的截断并注明",
+    "default": 8000
+  },
+  "group_inject_filter": {
+    "description": "群聊注入过滤",
+    "type": "bool",
+    "hint": "开启后：在群聊的新上下文中只注入「写于群聊」的日记片段，私聊写下的片段不进群聊（反向不限：群聊片段在私聊照常注入）。无场景标记的旧日记片段视为私聊来源、不注入群聊",
+    "default": true
+  },
+  "persist_inject": {
+    "description": "注入持久化",
+    "type": "bool",
+    "hint": "默认关闭：日记只在每个新会话的第一轮请求注入一次（省 token，但她只在生成第一条回复时记得日记细节）。开启后：每一轮请求都把日记放进 system prompt，她在整个会话里都能随时回忆日记内容，代价是每轮都消耗日记的 token（约 字数÷1.8）",
+    "default": false
+  },
+  "max_history_messages": {
+    "description": "写日记时读取的最大消息条数",
+    "type": "int",
+    "hint": "从当前会话历史取最近多少条作为写作素材。条数与写日记时一次性消耗的 token 成正比，但属于一次性消耗、量不大（60 条约几千 tokens，不会每轮重复）",
+    "default": 60
+  },
+  "group_history_multiplier": {
+    "description": "群聊素材倍率",
+    "type": "int",
+    "hint": "群聊历史混有其他成员发言，写日记时读取条数 = 最大消息条数 × 该倍率，提高覆盖到画像对象本人发言的概率；1 表示不放大",
+    "default": 3
+  },
+  "bot_call_names": {
+    "description": "我的称呼（多 AI 防冲突）",
+    "type": "string",
+    "hint": "群里装了本插件的 AI 不止一个时，填这个 AI 的名字/昵称。多个名字用英文逗号或中文逗号分隔都可以，例如：小深,DeepSeek 或 小深，深深。指令里 @这些名字 时她才会响应；@别的名字她会保持沉默",
+    "default": ""
+  },
+  "group_require_at": {
+    "description": "群里只响应@我的指令",
+    "type": "bool",
+    "hint": "开启后，群聊里不带@的日记指令一律不响应，只有@我（QQ自带@功能或@我的称呼）才执行；私聊不受影响",
+    "default": false
+  },
+  "extra_instruction": {
+    "description": "写日记的附加要求",
+    "type": "string",
+    "hint": "会追加到写日记的提示词末尾，例如：语气更温柔一些 / 多用条目列出画像",
+    "default": ""
+  },
+  "max_full_diaries_per_day": {
+    "description": "每个场景每天最多几篇完整日记",
+    "type": "int",
+    "hint": "默认 1；0 表示不限制（适合 token 充足、希望多写完整篇的用户）。按场景计算：私聊和群聊各自独立（群与群目前不隔离），简记不占额度",
+    "default": 1
+  },
+  "web_diary_brand": {
+    "description": "日记本页面的称呼",
+    "type": "string",
+    "hint": "管理面板「日记本」视图左上角的标题，显示为「XX的日记本」，默认 TA；留空也用 TA，最长 12 个字符",
+    "default": "TA"
+  },
+  "diary_timezone": {
+    "description": "日记时区",
+    "type": "string",
+    "hint": "写日记的时间戳、按天归档、'最近N天'都用这个时区，填 IANA 时区名，例如 Asia/Shanghai；留空则跟随服务器本地时间；填错会回退本地时间并记日志",
+    "default": "Asia/Shanghai"
+  }
+}
