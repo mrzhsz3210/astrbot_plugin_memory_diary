@@ -312,9 +312,9 @@ async function onLockClick() {
     const pw = await askDialog({
       title: "输入查看密码",
       message:
-        error ||
         "这份日记设了查看密码（主人在 QQ 里用 /日记密码 设置）。\n" +
-          "输入正确后，就能在面板里翻阅和导出这份日记。",
+        "输入正确后，就能在面板里翻阅和导出这份日记。",
+      error,
       password: true,
       placeholder: "4~32 位、不含空格",
       okText: "解锁",
@@ -457,9 +457,9 @@ async function fetchDayWithGates(dayStr) {
       const qq = await askDialog({
         title: "确认日记主人",
         message:
-          error ||
           "这份旧日记的说明里没有主人 QQ（文件名是加密的、反推不出）。\n" +
-            "请输入日记主人的 QQ 号：会用它全量验签，通过才会显示。",
+          "请输入日记主人的 QQ 号：会用它全量验签，通过才会显示。",
+        error,
         inputMode: "numeric",
         placeholder: "日记主人的 QQ 号",
         okText: "验签并打开",
@@ -492,7 +492,8 @@ async function fetchDayWithGates(dayStr) {
     for (;;) {
       const pw = await askDialog({
         title: "这份日记已上锁",
-        message: error || "这份日记设了查看密码，请输入后翻阅。",
+        message: "这份日记设了查看密码，请输入后翻阅。",
+        error,
         password: true,
         placeholder: "4~32 位、不含空格",
         okText: "解锁",
@@ -569,10 +570,11 @@ async function doExport(mode) {
   const params = {};
   if (sessionPw[currentKey]) params.pw = sessionPw[currentKey];
 
-  async function askOwner(message) {
+  async function askOwner(message, error = "") {
     return askDialog({
       title: "确认日记主人",
       message,
+      error,
       inputMode: "numeric",
       placeholder: "日记主人的 QQ 号",
       okText: "继续",
@@ -626,9 +628,8 @@ async function doExport(mode) {
         updateLockUI();
         const pw = await askDialog({
           title: "这份日记已上锁",
-          message: msg.includes("PASSWORD_REQUIRED")
-            ? "导出迁移包需要查看密码，请输入。"
-            : "密码不对，请重新输入。",
+          message: "导出迁移包需要查看密码，请输入。",
+          error: msg.includes("PASSWORD_WRONG") ? "密码不对，请重新输入。" : "",
           password: true,
           placeholder: "4~32 位、不含空格",
           okText: "解锁并导出",
@@ -642,7 +643,8 @@ async function doExport(mode) {
       }
       if (msg.includes("OWNER_UNKNOWN") || msg.includes("QQ 号与日记签名")) {
         const qq = await askOwner(
-          "QQ 号与日记签名对不上，请重新输入日记主人的 QQ："
+          "导出迁移包需要日记主人的 QQ 号（写入清单并用于验签）。",
+          "QQ 号与日记签名对不上，请重新输入。"
         );
         if (qq === null) {
           toast("已取消导出");
