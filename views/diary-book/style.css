@@ -321,6 +321,77 @@ body.custom-backdrop {
   background: var(--d-backdrop-image) center / cover no-repeat fixed;
 }
 
+/* ---------- 页面内输入对话框（密码 / 主人 QQ） ----------
+ * 插件视图 iframe 的 sandbox 没有 allow-modals，原生 prompt() 会被浏览器忽略，
+ * 所以密码输入必须由页面自己提供。 */
+.dialog-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(20, 16, 11, 0.5);
+}
+.dialog-mask[hidden] { display: none; }
+.dialog {
+  width: min(430px, 100%);
+  padding: 20px 22px 16px;
+  border-radius: 12px;
+  background: var(--paper);
+  color: var(--ink);
+  box-shadow: 0 18px 48px var(--shadow);
+}
+.dialog-title {
+  margin: 0 0 10px;
+  font-size: 18px;
+  letter-spacing: 1px;
+  color: var(--accent);
+}
+.dialog-msg {
+  margin-bottom: 12px;
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--ink-soft);
+  white-space: pre-wrap;
+}
+.dialog-msg[hidden] { display: none; }
+.dialog-input {
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 15px;
+  outline: none;
+}
+.dialog-input:focus { border-color: var(--accent); }
+.dialog-error {
+  min-height: 18px;
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--accent);
+}
+.dialog-error[hidden] { display: none; }
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 4px;
+}
+.dialog-btn-ghost {
+  background: transparent;
+  color: var(--ink-soft);
+  border: 1px solid var(--line);
+}
+.ctl.unlocked {
+  background: var(--accent);
+  color: var(--btn-text);
+}
+
 /* ---------- 窄屏：单页模式 ---------- */
 @media (max-width: 760px) {
   .page-left { display: none; }

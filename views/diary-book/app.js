@@ -206,6 +206,148 @@ function toast(msg, ms = 3000) {
   toast._timer = setTimeout(() => (t.hidden = true), ms);
 }
 
+/* ---------- 页面内输入对话框 ----------
+ * 插件视图 iframe 的 sandbox 是 "allow-scripts allow-forms allow-downloads"，
+ * 没有 allow-modals：原生 window.prompt / confirm / alert 会被浏览器直接忽略
+ * （返回 null，控制台报 Ignored call to prompt），所以查看密码和
+ * 主人 QQ 都必须用页面里的输入框，不能依赖原生弹窗。
+ */
+let dialogResolve = null;
+
+function setDialogError(msg) {
+  const el = $("dialogError");
+  el.textContent = msg || "";
+  el.hidden = !msg;
+}
+
+function closeDialog(value) {
+  $("dialogMask").hidden = true;
+  const resolve = dialogResolve;
+  dialogResolve = null;
+  if (resolve) resolve(value);
+}
+
+function confirmDialog() {
+  const input = $("dialogInput");
+  const value = input.value.trim();
+  if (!value) {
+    setDialogError("请输入内容后再点确定");
+    input.focus();
+    return;
+  }
+  closeDialog(value);
+}
+
+function askDialog({
+  title,
+  message = "",
+  password = false,
+  placeholder = "",
+  okText = "确定",
+  error = "",
+  inputMode = "",
+}) {
+  // 同时只允许一个对话框；新请求先把旧的按“取消”结束
+  if (dialogResolve) closeDialog(null);
+  return new Promise((resolve) => {
+    dialogResolve = resolve;
+    $("dialogTitle").textContent = title;
+    $("dialogMsg").textContent = message;
+    $("dialogMsg").hidden = !message;
+    const input = $("dialogInput");
+    input.type = password ? "password" : "text";
+    input.inputMode = inputMode;
+    input.autocomplete = password ? "current-password" : "off";
+    input.maxLength = password ? 32 : 20;
+    input.placeholder = placeholder;
+    input.value = "";
+    $("dialogOk").textContent = okText;
+    setDialogError(error);
+    $("dialogMask").hidden = false;
+    setTimeout(() => input.focus(), 30);
+  });
+}
+
+$("dialogOk").addEventListener("click", confirmDialog);
+$("dialogCancel").addEventListener("click", () => closeDialog(null));
+$("dialogMask").addEventListener("mousedown", (e) => {
+  if (e.target === $("dialogMask")) closeDialog(null);
+});
+$("dialogInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    confirmDialog();
+  }
+});
+$("dialogInput").addEventListener("input", () => setDialogError(""));
+
+/* ---------- 查看密码：顶栏的锁按钮 ---------- */
+function updateLockUI() {
+  const btn = $("btnLock");
+  const u = users.find((x) => x.file_key === currentKey);
+  if (!u || !u.protected) {
+    btn.hidden = true;
+    return;
+  }
+  const unlocked = !!sessionPw[currentKey];
+  btn.hidden = false;
+  btn.textContent = unlocked ? "🔓 已解锁" : "🔒 密码";
+  btn.title = unlocked
+    ? "这份日记已解锁（点击可重新上锁）"
+    : "这份日记设了查看密码，点击输入";
+  btn.classList.toggle("unlocked", unlocked);
+}
+
+async function onLockClick() {
+  const u = users.find((x) => x.file_key === currentKey);
+  if (!u || !u.protected) return;
+  if (sessionPw[currentKey]) {
+    delete sessionPw[currentKey];
+    updateLockUI();
+    toast("已重新上锁，下次翻阅需要密码");
+    return;
+  }
+  let error = "";
+  for (;;) {
+    const pw = await askDialog({
+      title: "输入查看密码",
+      message:
+        error ||
+        "这份日记设了查看密码（主人在 QQ 里用 /日记密码 设置）。\n" +
+          "输入正确后，就能在面板里翻阅和导出这份日记。",
+      password: true,
+      placeholder: "4~32 位、不含空格",
+      okText: "解锁",
+    });
+    if (pw === null) return;
+    if (days.length === 0) {
+      // 还没有日记可验证；先记住密码，导出时后端还会再校验一次
+      sessionPw[currentKey] = pw;
+      updateLockUI();
+      toast("已记住密码");
+      return;
+    }
+    try {
+      await bridge.apiGet(`day/${currentKey}/${days[days.length - 1].day}`, {
+        pw,
+      });
+    } catch (e) {
+      const msg = e.message || "";
+      if (msg.includes("PASSWORD_WRONG")) {
+        error = "密码不对，请重新输入。";
+        continue;
+      }
+      toast(msg || "密码校验失败");
+      return;
+    }
+    sessionPw[currentKey] = pw;
+    updateLockUI();
+    toast("已解锁");
+    if (dayIdx >= 0) await showDay(dayIdx, false);
+    return;
+  }
+}
+
 function escapeHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
@@ -243,15 +385,18 @@ async function loadUsers() {
   $("btnExport").disabled = !has;
   if (!has) {
     currentKey = "";
+    updateLockUI();
     return;
   }
   if (!users.some((u) => u.file_key === currentKey)) {
     currentKey = users[0].file_key;
   }
   sel.value = currentKey;
+  updateLockUI();
 }
 
 async function loadDays() {
+  updateLockUI();
   const u = users.find((x) => x.file_key === currentKey);
   $("ownerHint").hidden = !u || u.owner_known;
   $("ownerHint").textContent = u && !u.owner_known
@@ -289,48 +434,90 @@ function renderDayList() {
 async function fetchDayWithGates(dayStr) {
   const params = {};
   if (sessionPw[currentKey]) params.pw = sessionPw[currentKey];
-  let r = await bridge.apiGet(`day/${currentKey}/${dayStr}`, params);
+
+  let r;
+  try {
+    r = await bridge.apiGet(`day/${currentKey}/${dayStr}`, params);
+  } catch (e) {
+    const msg = e.message || "";
+    if (!msg.includes("PASSWORD_WRONG")) {
+      toast(msg || "读取失败");
+      return null;
+    }
+    // 主人改过密码：缓存作废，下面重新询问
+    delete sessionPw[currentKey];
+    delete params.pw;
+    updateLockUI();
+    r = { need_password: true };
+  }
 
   if (r.need_owner) {
-    const qq = prompt(
-      "这份旧日记的说明里没有主人 QQ（文件名是加密的、反推不出）。\n" +
-        "请输入日记主人的 QQ 号：会用它全量验签，通过才会显示。"
-    );
-    if (!qq) {
-      toast("已取消");
-      return null;
+    let error = "";
+    for (;;) {
+      const qq = await askDialog({
+        title: "确认日记主人",
+        message:
+          error ||
+          "这份旧日记的说明里没有主人 QQ（文件名是加密的、反推不出）。\n" +
+            "请输入日记主人的 QQ 号：会用它全量验签，通过才会显示。",
+        inputMode: "numeric",
+        placeholder: "日记主人的 QQ 号",
+        okText: "验签并打开",
+      });
+      if (qq === null) {
+        toast("已取消");
+        return null;
+      }
+      params.qq = qq;
+      try {
+        r = await bridge.apiGet(`day/${currentKey}/${dayStr}`, params);
+      } catch (e) {
+        delete params.qq;
+        error =
+          (e.message || "").replace(/^.*无法确认日记主人：/, "验签未通过：") ||
+          "验签未通过，请重新输入 QQ 号";
+        continue;
+      }
+      delete params.qq;
+      const u = users.find((x) => x.file_key === currentKey);
+      if (u) u.owner_known = true;
+      $("ownerHint").hidden = true;
+      toast("QQ 验签通过，已记住这份日记的主人");
+      break;
     }
-    params.qq = qq.trim();
-    try {
-      r = await bridge.apiGet(`day/${currentKey}/${dayStr}`, params);
-    } catch (e) {
-      toast(e.message || "读取失败");
-      return null;
-    }
-    const u = users.find((x) => x.file_key === currentKey);
-    if (u) u.owner_known = true;
-    $("ownerHint").hidden = true;
-    toast("QQ 验签通过，已记住这份日记的主人");
-    delete params.qq;
   }
 
   if (r.need_password) {
-    const pw = prompt("这份日记设了查看密码，请输入：");
-    if (!pw) {
-      toast("已取消");
-      return null;
-    }
-    params.pw = pw;
-    try {
-      r = await bridge.apiGet(`day/${currentKey}/${dayStr}`, params);
-      sessionPw[currentKey] = pw;
-    } catch (e) {
-      if ((e.message || "").includes("PASSWORD_WRONG")) {
-        toast("密码不对");
-      } else {
-        toast(e.message || "读取失败");
+    let error = "";
+    for (;;) {
+      const pw = await askDialog({
+        title: "这份日记已上锁",
+        message: error || "这份日记设了查看密码，请输入后翻阅。",
+        password: true,
+        placeholder: "4~32 位、不含空格",
+        okText: "解锁",
+      });
+      if (pw === null) {
+        toast("已取消");
+        return null;
       }
-      return null;
+      try {
+        r = await bridge.apiGet(`day/${currentKey}/${dayStr}`, {
+          ...params,
+          pw,
+        });
+      } catch (e) {
+        const msg = e.message || "";
+        if (msg.includes("PASSWORD_WRONG")) {
+          error = "密码不对，请重新输入。";
+          continue;
+        }
+        toast(msg || "读取失败");
+        return null;
+      }
+      sessionPw[currentKey] = pw;
+      updateLockUI();
+      break;
     }
   }
   return r;
@@ -378,18 +565,30 @@ function renderDayListActive() {
 async function doExport(mode) {
   const u = users.find((x) => x.file_key === currentKey);
   if (!u) return;
-  let params = {};
+
+  const params = {};
+  if (sessionPw[currentKey]) params.pw = sessionPw[currentKey];
+
+  async function askOwner(message) {
+    return askDialog({
+      title: "确认日记主人",
+      message,
+      inputMode: "numeric",
+      placeholder: "日记主人的 QQ 号",
+      okText: "继续",
+    });
+  }
+
   if (!u.owner_known) {
-    const qq = prompt(
+    const qq = await askOwner(
       "导出迁移包需要日记主人的 QQ 号（写入清单并用于验签）。\n请输入："
     );
-    if (!qq) {
+    if (qq === null) {
       toast("已取消导出");
       return;
     }
-    params.qq = qq.trim();
+    params.qq = qq;
   }
-  if (sessionPw[currentKey]) params.pw = sessionPw[currentKey];
 
   const run = async () => {
     if (mode === "local") {
@@ -411,35 +610,53 @@ async function doExport(mode) {
       4500
     );
 
-  try {
-    const r = await run();
-    okToast(r);
-    if (!u.owner_known) u.owner_known = true;
-  } catch (e) {
-    const msg = e.message || "";
-    if (msg.includes("PASSWORD_REQUIRED")) {
-      const pw = prompt("这份日记设了查看密码，导出前请输入：");
-      if (!pw) {
-        toast("已取消导出");
+  for (;;) {
+    try {
+      const r = await run();
+      if (params.pw) sessionPw[currentKey] = params.pw;
+      if (params.qq) u.owner_known = true;
+      updateLockUI();
+      okToast(r);
+      return;
+    } catch (e) {
+      const msg = e.message || "";
+      if (msg.includes("PASSWORD_REQUIRED") || msg.includes("PASSWORD_WRONG")) {
+        delete sessionPw[currentKey];
+        delete params.pw;
+        updateLockUI();
+        const pw = await askDialog({
+          title: "这份日记已上锁",
+          message: msg.includes("PASSWORD_REQUIRED")
+            ? "导出迁移包需要查看密码，请输入。"
+            : "密码不对，请重新输入。",
+          password: true,
+          placeholder: "4~32 位、不含空格",
+          okText: "解锁并导出",
+        });
+        if (pw === null) {
+          toast("已取消导出");
+          return;
+        }
+        params.pw = pw;
+        continue;
+      }
+      if (msg.includes("OWNER_UNKNOWN") || msg.includes("QQ 号与日记签名")) {
+        const qq = await askOwner(
+          "QQ 号与日记签名对不上，请重新输入日记主人的 QQ："
+        );
+        if (qq === null) {
+          toast("已取消导出");
+          return;
+        }
+        params.qq = qq;
+        continue;
+      }
+      if (msg.includes("REMOTE_PANEL")) {
+        toast("管理面板不在服务器本机，请改用「下载到浏览器」", 4500);
         return;
       }
-      params.pw = pw;
-      try {
-        const r2 = await run();
-        sessionPw[currentKey] = pw;
-        okToast(r2);
-      } catch (e2) {
-        toast((e2.message || "").includes("PASSWORD_WRONG") ? "密码不对" : e2.message || "导出失败");
-      }
-    } else if (msg.includes("PASSWORD_WRONG")) {
-      delete sessionPw[currentKey];
-      toast("密码不对");
-    } else if (msg.includes("OWNER_UNKNOWN")) {
-      toast("QQ 号与日记签名对不上，导出被拒绝");
-    } else if (msg.includes("REMOTE_PANEL")) {
-      toast("管理面板不在服务器本机，请改用「下载到浏览器」", 4500);
-    } else {
       toast(msg || "导出失败");
+      return;
     }
   }
 }
@@ -533,9 +750,18 @@ $("fileInput").addEventListener("change", async (e) => {
 $("btnPrev").addEventListener("click", () => showDay(dayIdx - 1, true));
 $("btnNext").addEventListener("click", () => showDay(dayIdx + 1, true));
 document.addEventListener("keydown", (e) => {
+  if (!document.getElementById("dialogMask").hidden) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeDialog(null);
+    }
+    return; // 对话框打开时不响应翻页快捷键
+  }
   if (e.key === "ArrowLeft") showDay(dayIdx - 1, true);
   if (e.key === "ArrowRight") showDay(dayIdx + 1, true);
 });
+$("btnLock").addEventListener("click", onLockClick);
 
 await loadUsers();
 if (currentKey) await loadDays();
+updateLockUI();

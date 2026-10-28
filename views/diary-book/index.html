@@ -10,6 +10,7 @@
     <header id="topbar">
       <div class="brand" id="brand">📖 TA的日记本</div>
       <select id="userSelect" class="ctl" title="选择用户"></select>
+      <button id="btnLock" class="ctl" title="给这份日记输入查看密码" hidden>🔒 密码</button>
       <div class="spacer"></div>
       <button id="btnFontSmaller" class="ctl" title="减小字号">A−</button>
       <button id="btnFontLarger" class="ctl" title="增大字号">A+</button>
@@ -80,6 +81,32 @@
     <input type="file" id="fileInput" accept=".zip,application/zip" hidden />
     <input type="file" id="paperInput" accept="image/png,image/jpeg,image/webp" hidden />
     <input type="file" id="backdropInput" accept="image/png,image/jpeg,image/webp" hidden />
+
+    <!--
+      页面内输入框（查看密码 / 主人 QQ）。
+      插件视图跑在 sandbox="allow-scripts allow-forms allow-downloads" 的 iframe 里，
+      没有 allow-modals，window.prompt()/confirm()/alert() 会被浏览器直接忽略并返回 null，
+      所以这里必须用页面内对话框，不能依赖原生 prompt。
+    -->
+    <div id="dialogMask" class="dialog-mask" hidden>
+      <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialogTitle">
+        <div id="dialogTitle" class="dialog-title">输入查看密码</div>
+        <div id="dialogMsg" class="dialog-msg"></div>
+        <input
+          id="dialogInput"
+          class="dialog-input"
+          type="password"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <div id="dialogError" class="dialog-error" hidden></div>
+        <div class="dialog-actions">
+          <button id="dialogCancel" class="ctl dialog-btn-ghost" type="button">取消</button>
+          <button id="dialogOk" class="ctl" type="button">确定</button>
+        </div>
+      </div>
+    </div>
+
     <div id="toast" class="toast" hidden></div>
 
     <script type="module" src="./app.js"></script>
