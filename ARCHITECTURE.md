@@ -10,7 +10,7 @@ main.py                         AstrBot 适配层（约 2200 行）
     ├── constants.py            提示词、注入模板、默认值
     ├── errors.py               DiaryKeyUnavailable / DiaryTamperedError / DiaryCorruptError
     ├── common.py               文件名 key 等无状态工具
-    ├── log.py                  日志兼容层（有 AstrBot 用其 logger，无则用标准库）
+    ├── log.py                  日志兼容层（有 AstrBot 用其 logger，无则静默丢弃）
     ├── storage.py              文件布局、HMAC 验签、偏好/备忘、旧格式迁移、
     │                           迁移包导入导出、Web 数据
     ├── service.py              会话历史 → 写作素材 → LLM 写作 → 保存、
@@ -41,8 +41,8 @@ main.py                         AstrBot 适配层（约 2200 行）
    `python main.py`。
 3. **热重载**：AstrBot 重载插件时会清理 `data.plugins.<dir>.` 前缀的模块，
    新增的 `memory_diary.*` 子模块都在该前缀下，会被一并清理。
-4. **无 AstrBot 环境**：`import memory_diary.core` 仍可成功（日志退回标准库），
-   方便单元测试和复用。
+4. **无 AstrBot 环境**：`import memory_diary.core` 仍可成功（日志静默丢弃，
+   不依赖标准库 logging），方便单元测试和复用。
 
 ## 回归验证
 
