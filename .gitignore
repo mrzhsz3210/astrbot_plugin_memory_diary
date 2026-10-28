@@ -15,3 +15,6 @@ desktop.ini
 .diary_key
 diary_*
 pref_*
+
+# 测试运行时 AstrBot 导入生成的默认数据目录（默认配置、t2i 模板）
+/data/

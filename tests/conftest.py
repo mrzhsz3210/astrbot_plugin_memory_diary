@@ -20,4 +20,5 @@ if str(TESTS_DIR) not in sys.path:
 
 from harness import env  # noqa: E402
 
+env.isolate_astrbot_root()
 env.ensure_astrbot_importable()

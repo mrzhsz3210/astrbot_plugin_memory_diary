@@ -41,6 +41,9 @@ $env:ASTRBOT_CORE = "D:\path\to\astrbot\core"   # Windows
 export ASTRBOT_CORE=/path/to/astrbot/core       # Linux / macOS
 ```
 
+测试会把 `ASTRBOT_ROOT` 指向临时目录，所以 `astrbot` 导入时自动生成的 `data/`
+（默认 `cmd_config.json` 与 `t2i_templates`）不会落在仓库里。
+
 常用参数：
 
 ```powershell

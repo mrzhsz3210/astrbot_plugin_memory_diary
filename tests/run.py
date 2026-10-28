@@ -96,6 +96,7 @@ def main(argv=None) -> int:
 
     if args.baseline_only:
         os.environ["DIARY_HARNESS_BASELINE_ONLY"] = "1"
+    env.isolate_astrbot_root()
     env.ensure_astrbot_importable()
     tests = discover()
     if args.filter:

@@ -18,9 +18,12 @@ provided with real AstrBot decorator/registration behaviour independently.
 
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 # <repo>/tests/harness/env.py -> parents[0]=harness [1]=tests [2]=<repo>
@@ -109,6 +112,22 @@ def astrbot_core_path() -> Path | None:
         "(a directory containing the astrbot/ package), or install AstrBot into "
         "this Python environment. See tests/README.md."
     )
+
+
+def isolate_astrbot_root() -> None:
+    """Keep AstrBot's import-time scaffolding out of the repository checkout.
+
+    Importing ``astrbot`` initialises a default data directory
+    (``cmd_config.json`` + ``t2i_templates``) under ``ASTRBOT_ROOT`` or, when
+    that variable is unset, the current working directory.  Point it at a
+    throw-away directory; every test instance further overrides
+    ``ASTRBOT_ROOT`` with its own temporary root.
+    """
+    if os.environ.get("ASTRBOT_ROOT"):
+        return
+    tmp = tempfile.mkdtemp(prefix="diary_harness_astrbot_root_")
+    os.environ["ASTRBOT_ROOT"] = tmp
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
 
 
 def ensure_astrbot_importable() -> None:
