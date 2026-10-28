@@ -45,7 +45,9 @@ def test_both_packages_load_in_separate_namespaces():
         assert meta is not None, f"{side}: @register did not populate star_map"
         assert meta.name == "astrbot_plugin_memory_diary"
         assert meta.author == "mrzhsz3210"
-        assert meta.version == "v0.5.0"
+        # baseline 是重构前的 v0.5.0 快照，refactor 的版本号随 metadata.yaml 升级；
+        # 两边各自与自己的 metadata.yaml 一致由 test_metadata_yaml_matches_registration 保证
+        assert meta.version.startswith("v0."), f"{side}: {meta.version}"
         assert meta.module_path == module.__name__
         assert issubclass(module.MemoryDiaryPlugin, Star)
         assert module.MemoryDiaryPlugin.__module__ == module.__name__

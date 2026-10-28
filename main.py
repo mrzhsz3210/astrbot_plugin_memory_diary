@@ -91,7 +91,7 @@ def resolve_data_dir() -> Path:
     "astrbot_plugin_memory_diary",
     "mrzhsz3210",
     "指令/定时自动触发写日记（用户画像 / 对用户的评价 / 给未来自己的叮嘱），新上下文自动读取日记，上下文将满时自动提醒，支持每天定时自动写完整日记。",
-    "v0.5.0",
+    "v0.5.1",
 )
 
 class MemoryDiaryPlugin(MemoryDiaryCore, Star):
