@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>记忆日记 · 日记本</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header id="topbar">
+      <div class="brand" id="brand">📖 TA的日记本</div>
+      <select id="userSelect" class="ctl" title="选择用户"></select>
+      <div class="spacer"></div>
+      <button id="btnFontSmaller" class="ctl" title="减小字号">A−</button>
+      <button id="btnFontLarger" class="ctl" title="增大字号">A+</button>
+      <button id="btnFontFamily" class="ctl" title="切换字体">楷体</button>
+      <div class="paper-ctl">
+        <button id="btnPaper" class="ctl" title="更换书页纸纹">纸张</button>
+        <div id="paperMenu" class="paper-menu" hidden>
+          <button data-kind="paper" data-paper="default" class="paper-item">默认纸纹</button>
+          <button data-kind="paper" data-paper="upload" class="paper-item">上传图片…</button>
+          <button data-kind="paper" data-paper="custom" class="paper-item" id="paperUseCustom" disabled>使用自定义图片</button>
+        </div>
+      </div>
+      <div class="paper-ctl">
+        <button id="btnBackdrop" class="ctl" title="更换背景板">背景板</button>
+        <div id="backdropMenu" class="paper-menu" hidden>
+          <button data-kind="backdrop" data-paper="default" class="paper-item">默认背景板</button>
+          <button data-kind="backdrop" data-paper="upload" class="paper-item">上传图片…</button>
+          <button data-kind="backdrop" data-paper="custom" class="paper-item" id="backdropUseCustom" disabled>使用自定义图片</button>
+        </div>
+      </div>
+      <button id="btnImport" class="ctl">⬆ 导入日记</button>
+      <div class="paper-ctl">
+        <button id="btnExport" class="ctl">⬇ 导出日记</button>
+        <div id="exportMenu" class="paper-menu" hidden>
+          <button data-export="browser" class="paper-item">下载到浏览器</button>
+          <button data-export="local" class="paper-item">存到本机并打开位置</button>
+        </div>
+      </div>
+      <button id="btnRefresh" class="ctl">⟳ 刷新</button>
+    </header>
+
+    <main id="stage">
+      <div id="empty" class="empty" hidden>
+        <div class="empty-icon">📖</div>
+        <p id="emptyText">还没有人写过日记</p>
+      </div>
+
+      <div id="book" class="book" hidden>
+        <div class="page page-left">
+          <div class="page-inner">
+            <h3 class="index-title">目 录</h3>
+            <div id="ownerHint" class="owner-hint" hidden></div>
+            <ul id="dayList" class="day-list"></ul>
+          </div>
+        </div>
+
+        <div class="spine" aria-hidden="true">
+          <span class="ring"></span><span class="ring"></span><span class="ring"></span>
+          <span class="ring"></span><span class="ring"></span><span class="ring"></span>
+          <span class="ring"></span><span class="ring"></span>
+        </div>
+
+        <div class="page page-right" id="pageRight">
+          <div class="page-inner" id="pageInner">
+            <div id="diaryHeader" class="diary-header"></div>
+            <div id="diaryBody" class="diary-body"></div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <footer id="navbar">
+      <button id="btnPrev" class="ctl">‹ 前一天</button>
+      <span id="pageInfo"></span>
+      <button id="btnNext" class="ctl">后一天 ›</button>
+    </footer>
+
+    <input type="file" id="fileInput" accept=".zip,application/zip" hidden />
+    <input type="file" id="paperInput" accept="image/png,image/jpeg,image/webp" hidden />
+    <input type="file" id="backdropInput" accept="image/png,image/jpeg,image/webp" hidden />
+    <div id="toast" class="toast" hidden></div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,330 @@
+/* 活页日记本 · 记忆日记插件可视化视图 */
+/* 主题变量：bridge SDK 会维护 <html data-theme="light|dark"> */
+:root {
+  --bg: #e8e0d0;
+  --topbar: #3d3225;
+  --topbar-text: #f3ead8;
+  --paper: #fbf6e9;
+  --paper-edge: #e6dcc4;
+  --ink: #4a3f2f;
+  --ink-soft: #8a7a5f;
+  --accent: #a8523f;
+  --line: rgba(122, 100, 63, 0.18);
+  --ring: #b9a77e;
+  --ring-hole: #d8cdb2;
+  --shadow: rgba(61, 50, 37, 0.35);
+  --btn: #6b5a41;
+  --btn-text: #f8f2e3;
+}
+
+[data-theme="dark"] {
+  --bg: #201c17;
+  --topbar: #161310;
+  --topbar-text: #e3d9c4;
+  --paper: #2e2a23;
+  --paper-edge: #241f19;
+  --ink: #ddd2ba;
+  --ink-soft: #9c8f74;
+  --accent: #cf7a63;
+  --line: rgba(221, 210, 186, 0.14);
+  --ring: #6f6350;
+  --ring-hole: #17140f;
+  --shadow: rgba(0, 0, 0, 0.6);
+  --btn: #55483a;
+  --btn-text: #e8dfc9;
+}
+
+* { box-sizing: border-box; }
+
+/* 界面偏好（A+/A- 与字体按钮通过 JS 改这两个变量） */
+:root {
+  --d-font-size: 16px;
+  --d-font-family: "STKaiti", "KaiTi", "楷体", "Noto Serif SC", serif;
+}
+
+body {
+  margin: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  font-family: var(--d-font-family);
+  background: var(--bg);
+  color: var(--ink);
+  overflow: hidden;
+}
+
+/* ---------- 顶栏 ---------- */
+#topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 18px;
+  background: var(--topbar);
+  color: var(--topbar-text);
+  box-shadow: 0 2px 8px var(--shadow);
+  z-index: 10;
+}
+.brand { font-size: 18px; letter-spacing: 2px; }
+.spacer { flex: 1; }
+
+.ctl {
+  font-family: inherit;
+  font-size: 14px;
+  padding: 6px 14px;
+  border: none;
+  border-radius: 6px;
+  background: var(--btn);
+  color: var(--btn-text);
+  cursor: pointer;
+  transition: transform 0.12s ease, opacity 0.12s ease;
+}
+.ctl:hover { transform: translateY(-1px); opacity: 0.92; }
+.ctl:disabled { opacity: 0.4; cursor: default; transform: none; }
+
+select.ctl { max-width: 220px; }
+
+/* ---------- 舞台与书 ---------- */
+#stage {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 22px;
+  min-height: 0;
+}
+
+.book {
+  display: flex;
+  width: min(1060px, 96%);
+  height: 100%;
+  max-height: 720px;
+  filter: drop-shadow(0 14px 22px var(--shadow));
+}
+
+.page {
+  flex: 1;
+  min-width: 0;
+  background: var(--paper);
+  position: relative;
+  overflow: hidden;
+}
+.page-left {
+  border-radius: 14px 3px 3px 14px;
+  background:
+    linear-gradient(to right, var(--paper-edge), transparent 8%),
+    var(--paper);
+}
+.page-right {
+  border-radius: 3px 14px 14px 3px;
+  background:
+    linear-gradient(to left, var(--paper-edge), transparent 8%),
+    var(--paper);
+}
+
+.page-inner {
+  position: absolute;
+  inset: 0;
+  padding: 30px 34px;
+  overflow-y: auto;
+}
+
+/* 翻页动画：右页整体绕左缘掀起 */
+.page-right { transform-origin: left center; }
+.page-right.turn {
+  animation: pageTurn 0.45s ease;
+}
+@keyframes pageTurn {
+  0%   { transform: perspective(1600px) rotateY(0deg); }
+  45%  { transform: perspective(1600px) rotateY(-72deg); opacity: 0.55; }
+  100% { transform: perspective(1600px) rotateY(0deg); opacity: 1; }
+}
+
+/* ---------- 活页环 ---------- */
+.spine {
+  width: 34px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-evenly;
+  align-items: center;
+  background: linear-gradient(to right, var(--paper-edge), var(--paper), var(--paper-edge));
+  z-index: 2;
+}
+.ring {
+  width: 22px;
+  height: 12px;
+  border: 3px solid var(--ring);
+  border-bottom: none;
+  border-radius: 11px 11px 0 0;
+  background: transparent;
+  box-shadow: inset 0 -2px 0 var(--ring-hole);
+}
+
+/* ---------- 目录页 ---------- */
+.index-title {
+  text-align: center;
+  letter-spacing: 10px;
+  color: var(--ink-soft);
+  font-weight: normal;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 12px;
+}
+.owner-hint {
+  font-size: 13px;
+  color: var(--accent);
+  text-align: center;
+  margin: 8px 0;
+}
+.day-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.day-list li {
+  padding: 10px 14px;
+  border-bottom: 1px dashed var(--line);
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  border-radius: 6px;
+  transition: background 0.12s ease;
+  font-size: calc(var(--d-font-size) - 2px);
+}
+.day-list li:hover { background: var(--line); }
+.day-list li.active {
+  background: var(--line);
+  color: var(--accent);
+  font-weight: bold;
+}
+.day-list .idx { color: var(--ink-soft); font-size: 12px; align-self: center; }
+
+/* ---------- 日记页 ---------- */
+.diary-header {
+  font-size: 20px;
+  letter-spacing: 3px;
+  color: var(--accent);
+  border-bottom: 2px solid var(--accent);
+  padding-bottom: 10px;
+  margin-bottom: 18px;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.diary-header .stamp { font-size: 12px; color: var(--ink-soft); letter-spacing: 1px; }
+
+.diary-body {
+  font-size: var(--d-font-size);
+  line-height: calc(var(--d-font-size) * 2);
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent calc(var(--d-font-size) * 2 - 1px),
+    var(--line) calc(var(--d-font-size) * 2 - 1px),
+    var(--line) calc(var(--d-font-size) * 2)
+  );
+}
+.diary-body .seg-header {
+  color: var(--ink-soft);
+  font-size: 13px;
+  letter-spacing: 2px;
+}
+.diary-body .tampered {
+  color: var(--accent);
+}
+
+/* ---------- 底栏 ---------- */
+#navbar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  padding: 12px;
+}
+#pageInfo { color: var(--ink-soft); font-size: 14px; min-width: 90px; text-align: center; }
+
+/* ---------- 空状态 / 提示 ---------- */
+.empty {
+  text-align: center;
+  color: var(--ink-soft);
+  font-size: 17px;
+}
+.empty-icon { font-size: 56px; margin-bottom: 12px; }
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 64px;
+  transform: translateX(-50%);
+  background: var(--topbar);
+  color: var(--topbar-text);
+  padding: 10px 22px;
+  border-radius: 8px;
+  box-shadow: 0 6px 18px var(--shadow);
+  font-size: 14px;
+  z-index: 99;
+  max-width: 80%;
+}
+
+/* ---------- 纸张菜单 ---------- */
+.paper-ctl { position: relative; }
+.paper-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 150px;
+  background: var(--paper);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px var(--shadow);
+  padding: 6px;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* display:flex 会顶掉 hidden 属性的默认样式，必须显式补上 */
+.paper-menu[hidden] { display: none; }
+.paper-item {
+  font-family: inherit;
+  font-size: 14px;
+  text-align: left;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+}
+.paper-item:hover:not(:disabled) { background: var(--line); }
+.paper-item:disabled { opacity: 0.45; cursor: default; }
+.paper-item.active { color: var(--accent); font-weight: bold; }
+
+/* ---------- 自定义纸张 ---------- */
+/* JS 设置 --d-paper-image（data URL）并给 book 加 custom-paper 类 */
+.book.custom-paper .page-left {
+  background:
+    linear-gradient(var(--paper-wash), var(--paper-wash)),
+    var(--d-paper-image) center / cover no-repeat;
+}
+.book.custom-paper .page-right {
+  background:
+    linear-gradient(var(--paper-wash), var(--paper-wash)),
+    var(--d-paper-image) center / cover no-repeat;
+}
+:root { --paper-wash: rgba(251, 246, 233, 0.82); }
+[data-theme="dark"] { --paper-wash: rgba(46, 42, 35, 0.86); }
+
+/* ---------- 自定义背景板（书本背后的整张底衬） ---------- */
+/* JS 设置 --d-backdrop-image（data URL）并给 body 加 custom-backdrop 类 */
+body.custom-backdrop {
+  background: var(--d-backdrop-image) center / cover no-repeat fixed;
+}
+
+/* ---------- 窄屏：单页模式 ---------- */
+@media (max-width: 760px) {
+  .page-left { display: none; }
+  .spine { display: none; }
+  .page-right { border-radius: 14px; }
+  .page-inner { padding: 22px; }
+}

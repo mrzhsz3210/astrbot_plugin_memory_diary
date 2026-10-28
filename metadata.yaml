@@ -1,8 +1,8 @@
 name: astrbot_plugin_memory_diary
 display_name: 记忆日记
 short_desc: 让她给未来的自己写日记，上下文重置不失忆
-desc: 让 AI 在收到指令（或上下文将满）时给未来的自己写日记：涵盖时间、用户画像、对用户的看法与评价、给未来自己的叮嘱。新上下文开启时自动注入最近日记，支持按天查阅、备忘速记、主动注入、多用户隔离、群聊/私聊场景过滤、防篡改签名与多 AI 防冲突。
-version: v0.3.2
+desc: 让 AI 在收到指令（或上下文将满）时给未来的自己写日记：涵盖时间、用户画像、对用户的看法与评价、给未来自己的叮嘱。新上下文开启时自动注入最近日记，支持按天查阅、备忘速记、主动注入、多用户隔离、群聊/私聊场景过滤、防篡改签名与多 AI 防冲突，支持 /导出日记 生成跨设备迁移包，支持每天定时自动写完整日记。
+version: v0.5.0
 author: mrzhsz3210
 repo: "https://github.com/mrzhsz3210/astrbot_plugin_memory_diary"
 astrbot_version: ">=4.0.0,<5"
