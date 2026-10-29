@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 插件文档（README）
+    url: https://github.com/mrzhsz3210/astrbot_plugin_memory_diary
+    about: 提问前请先查阅 README，安装、指令列表与常见问题都在这里

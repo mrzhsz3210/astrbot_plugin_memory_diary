@@ -1,0 +1,41 @@
+name: 💡 功能建议
+description: 希望插件增加或调整某个功能
+title: "【建议】"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢为「记忆日记」插件提出建议！请描述清楚你的使用场景和期望效果，方便评估与实现。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题 / 场景描述
+      description: 你在什么情况下需要这个功能？现在的插件为什么满足不了？
+      placeholder: 例：我想把群友的聊天自动整理成周报，但现在的日记只能按天生成……
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: 期望方案
+      description: 你希望插件具体怎么做？可以描述交互方式（如新增指令 /WebUI 入口 / 配置项）
+      placeholder: 例：新增 /写周报 指令，汇总最近 7 天聊天记录生成一篇日记……
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 替代方案（可选）
+      description: 你还考虑过哪些替代做法？目前是怎么临时解决的？
+      placeholder: 例：目前手动复制聊天记录让 AI 总结……
+    validations:
+      required: false
+  - type: textarea
+    id: additional
+    attributes:
+      label: 补充说明（可选）
+      description: 设计思路、参考的其他插件、截图等任何有助于理解的补充
+      placeholder: 可留空
+    validations:
+      required: false
