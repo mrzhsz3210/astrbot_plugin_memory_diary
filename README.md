@@ -309,6 +309,12 @@ find /root /opt /home /AstrBot /app -type d -name astrbot_plugin_memory_diary 2>
 [GitHub Issues](https://github.com/mrzhsz3210/astrbot_plugin_memory_diary/issues) 提 issue。
 提问时附上 AstrBot 版本、消息平台、模型提供商和控制台中含 `[memory_diary]` 的日志，会定位得更快。
 
+也可以直接联系作者：
+
+- **B 站**：[CELE杨](https://space.bilibili.com/416107527)（UID：416107527）
+- **邮箱**：`kidmoop@qq.com`
+- **明日方舟官服 UID**：`43794126`（欢迎加好友）
+
 ## 安装
 
 - **源码 / Docker 部署**：将整个 `astrbot_plugin_memory_diary` 文件夹放入 AstrBot 的 `data/plugins/` 目录；
