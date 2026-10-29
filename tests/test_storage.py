@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import zipfile
@@ -779,3 +781,36 @@ async def test_material_cursor_only_reads_new_history():
         assert "第一条旧消息" not in value["third_prompt"]
         assert value["cursor_third"]["count"] == 4
         assert value["last_life_day"] == "20261023"
+
+
+async def test_legacy_migration_accepts_pre_v040_master_key_signatures():
+    """v0.4.0 之前的按篇/按天条目用主密钥直签，迁移时必须走回退验签。
+
+    否则旧日记在第一次读取触发迁移时会被误判成“篡改”并跳过，数据永久丢失。
+    """
+    async with World(config={"use_persona": False}) as world:
+        plugin = world.refactor.plugin
+        path = world.refactor.diary_path("10001")
+        name = "20261020.md"
+        content = "v3.1 主密钥直签的旧日记"
+        master_key = plugin._secret_key()
+        assert master_key
+        legacy_sig = hmac.new(
+            master_key,
+            ("10001\n" + name + "\n" + content).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        plugin._write_zip_atomic(
+            path,
+            {
+                name: content.encode("utf-8"),
+                name[:-3] + ".sig": legacy_sig.encode("utf-8"),
+            },
+        )
+        result = plugin._migrate_legacy("10001")
+        entries = plugin._list_entries("10001")
+        loaded, tampered = plugin._load_entry("10001", entries[0]) if entries else ("", True)
+        assert result == "migrated"
+        assert entries == ["diaries/20261020.md"]
+        assert loaded == content
+        assert tampered is False

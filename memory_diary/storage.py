@@ -959,9 +959,9 @@ class StorageMixin:
                     actual = (
                         data.get(n[:-3] + ".sig", b"").decode("utf-8", "ignore").strip()
                     )
-                    if not actual or not hmac.compare_digest(
-                        self._entry_sig(sender_id, n, text), actual
-                    ):
+                    # 与读取路径一致：v0.4.0 之前的条目是主密钥直签，
+                    # 验签必须走带回退的 _entry_sig_matches，否则旧日记会被误判成篡改
+                    if not self._entry_sig_matches(sender_id, n, text, actual):
                         logger.warning(f"[memory_diary] 篇目 {n} 验签失败，迁移时跳过")
                         continue
                     day_map.setdefault(n[:8], []).append(
@@ -972,9 +972,7 @@ class StorageMixin:
                     actual = (
                         data.get(n[:-3] + ".sig", b"").decode("utf-8", "ignore").strip()
                     )
-                    if not actual or not hmac.compare_digest(
-                        self._entry_sig(sender_id, n, text), actual
-                    ):
+                    if not self._entry_sig_matches(sender_id, n, text, actual):
                         logger.warning(f"[memory_diary] 日记 {n} 验签失败，迁移时跳过")
                         continue
                     day_map.setdefault(n[:8], []).append(("", text))

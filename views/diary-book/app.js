@@ -565,6 +565,7 @@ async function fetchDayWithGates(dayStr) {
 
 async function showDay(i, animate = true) {
   if (loading || i < 0 || i >= days.length) return;
+  const day = days[i];
   loading = true;
   const page = $("pageRight");
   try {
@@ -573,11 +574,14 @@ async function showDay(i, animate = true) {
       void page.offsetWidth; // 重启动画
       page.classList.add("turn");
     }
-    const r = await fetchDayWithGates(days[i].day);
+    const r = await fetchDayWithGates(day.day);
     if (!r) return; // 用户取消或校验失败，提示已在函数内给出
+    // 等待（含密码/QQ 对话框）期间用户可能已切换用户或刷新目录：
+    // days 已整体更换时放弃本次展示，避免旧内容配上新目录的标题
+    if (!days.includes(day)) return;
     dayIdx = i;
     $("diaryHeader").innerHTML =
-      `<span>${escapeHtml(days[i].label)}</span>` +
+      `<span>${escapeHtml(day.label)}</span>` +
       `<span class="stamp">第 ${i + 1} / ${days.length} 页</span>`;
     if (r.tampered) {
       $("diaryBody").innerHTML =
