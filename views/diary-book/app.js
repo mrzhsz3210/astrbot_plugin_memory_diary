@@ -28,9 +28,41 @@ let prefs = { font_size: 16, font_family: "kai", paper: "default", backdrop: "de
 
 /* 查看密码只在本页面会话内缓存（不写磁盘、不进 localStorage） */
 const sessionPw = {};
-/* 自定义纸张 / 背景板 data URL 缓存 */
+/* 自定义纸张 / 背景板图片缓存。这里存的是 blob: URL，不是 base64 data URL：
+ * Chromium/Edge 会把 CSS 自定义属性值截断到 1,000,000 字符，而一张 2MB 图片的
+ * base64 约 3MB，直接塞进 --d-paper-image 会被截断成非法 URL，背景画不出来，
+ * 页面看起来就只是“纸的边框消失了”。blob: URL 很短，不受这个限制。 */
 let paperDataUrl = "";
 let backdropDataUrl = "";
+
+function dataUrlToObjectUrl(dataUrl) {
+  try {
+    if (typeof URL.createObjectURL !== "function") return dataUrl;
+    const comma = dataUrl.indexOf(",");
+    if (comma < 0) return "";
+    const meta = dataUrl.slice(0, comma);
+    const binary = atob(dataUrl.slice(comma + 1));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    const mime = (meta.match(/^data:([^;]+)/) || [])[1] || "image/png";
+    return URL.createObjectURL(new Blob([bytes], { type: mime }));
+  } catch (e) {
+    console.warn("自定义图片转换成 Blob 失败", e);
+    return "";
+  }
+}
+
+function setImageUrl(kind, url) {
+  const old = kind === "paper" ? paperDataUrl : backdropDataUrl;
+  if (old && old.startsWith("blob:")) {
+    try {
+      URL.revokeObjectURL(old);
+    } catch (e) {
+      /* 忽略释放失败 */
+    }
+  }
+  if (kind === "paper") paperDataUrl = url; else backdropDataUrl = url;
+}
 
 function applyPrefs() {
   const root = document.documentElement.style;
@@ -145,17 +177,21 @@ async function loadImageData(kind) {
     // （PluginViewPage.vue: response.data?.data ?? response.data），那样这里只拿到
     // base64 字符串，r.found / r.mime 全没了，上传成功也不换图。
     if (r.found && r.image) {
-      const url = "data:" + (r.mime || "image/png") + ";base64," + r.image;
-      if (kind === "paper") paperDataUrl = url; else backdropDataUrl = url;
-      useBtn.disabled = false;
+      const dataUrl = "data:" + (r.mime || "image/png") + ";base64," + r.image;
+      const url = dataUrlToObjectUrl(dataUrl);
+      setImageUrl(kind, url);
+      useBtn.disabled = !url;
+      if (!url && prefs[kind] === "custom") prefs[kind] = "default";
     } else {
-      if (kind === "paper") paperDataUrl = ""; else backdropDataUrl = "";
+      setImageUrl(kind, "");
       useBtn.disabled = true;
       if (prefs[kind] === "custom") prefs[kind] = "default";
     }
   } catch (e) {
     console.warn(kind + " 图片读取失败", e);
-    if (kind === "paper") paperDataUrl = ""; else backdropDataUrl = "";
+    setImageUrl(kind, "");
+    useBtn.disabled = true;
+    if (prefs[kind] === "custom") prefs[kind] = "default";
   }
   if (kind === "paper") applyPaper(); else applyBackdrop();
 }

@@ -67,3 +67,17 @@ def test_diary_book_view_reads_image_from_non_envelope_key():
         "不能读 r.data：顶层 data 会被 bridge 当信封解包，上传成功后也拿不到图片"
     )
 
+
+def test_diary_book_view_uses_blob_url_for_large_custom_images():
+    """大尺寸自定义图片必须先转成 blob: URL，不能直接放进 CSS 自定义属性。
+
+    Chromium/Edge 会把 CSS 自定义属性值截断到 1,000,000 字符；一张 2MB 图片的
+    base64 约 3MB，直接塞进 ``--d-paper-image`` 会被截断成非法 URL，背景画不出来，
+    表现成「上传成功、纸的边框消失，但图片没出现」。blob URL 很短，不受此限制。
+    """
+    js = _read("app.js")
+    assert "dataUrlToObjectUrl" in js
+    assert "createObjectURL" in js
+    assert "revokeObjectURL" in js
+
+
