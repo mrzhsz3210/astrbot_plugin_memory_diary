@@ -50,3 +50,20 @@ def test_diary_book_view_handles_both_password_gates():
     assert "PASSWORD_REQUIRED" in js
     assert "PASSWORD_WRONG" in js
     assert "btnLock" in js
+
+
+def test_diary_book_view_reads_image_from_non_envelope_key():
+    """自定义纸张/背景板的 base64 必须从 r.image 读，不能读 r.data。
+
+    AstrBot 插件视图 bridge 的响应解包规则是
+    ``response.data?.data ?? response.data``：插件 JSON 里顶层出现 data 键时，
+    bridge 只把 data 的值交给页面，``{found, mime, ...}`` 全部丢失。
+    前端若写 ``r.data``，就会拿到一个字符串、``r.found`` 为 undefined，
+    表现成「图片上传成功、后台也存下来了，但页面永远不换」。
+    """
+    js = _read("app.js")
+    assert "r.image" in js, "自定义图片应读取后端字段 image"
+    assert "r.data" not in js, (
+        "不能读 r.data：顶层 data 会被 bridge 当信封解包，上传成功后也拿不到图片"
+    )
+

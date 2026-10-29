@@ -354,7 +354,8 @@ class FakeWebRequest:
         payload=None,
         uploads: dict | None = None,
         username: str | None = None,
-        remote_addr: str = "127.0.0.1",
+        client_host: str | None = "127.0.0.1",
+        forwarded_for: str = "",
         method: str = "GET",
         path: str = "/",
     ):
@@ -362,10 +363,14 @@ class FakeWebRequest:
         self.payload = payload if payload is not None else {}
         self.uploads = dict(uploads or {})
         self.username = username
-        self.remote_addr = remote_addr
+        # 与 astrbot.api.web.PluginRequest 保持一致：对外暴露 client_host，
+        # 不再有 remote_addr（旧实现误用 remote_addr 的坑见 test_web）。
+        self.client_host = client_host
         self.method = method
         self.path = path
         self.headers = {}
+        if forwarded_for:
+            self.headers["x-forwarded-for"] = forwarded_for
 
     async def json(self, default=None):
         if self.payload is None:

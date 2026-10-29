@@ -91,7 +91,7 @@ def resolve_data_dir() -> Path:
     "astrbot_plugin_memory_diary",
     "mrzhsz3210",
     "指令/定时自动触发写日记（用户画像 / 对用户的评价 / 给未来自己的叮嘱），新上下文自动读取日记，上下文将满时自动提醒，支持每天定时自动写完整日记。",
-    "v0.5.1",
+    "v0.5.2",
 )
 
 class MemoryDiaryPlugin(MemoryDiaryCore, Star):
@@ -1448,14 +1448,43 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         return _web_file(bundle, filename=bundle.name,
                          content_type="application/zip")
 
+    # 回环地址集合（AstrBot 4.x 的插件 Web 请求暴露的是 ``client_host``，
+    # 不是 ``remote_addr``；见 astrbot.api.web.PluginRequest）。
+    _WEB_LOOPBACKS = ("127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1")
+
+    def _web_is_local_panel(self) -> bool:
+        """面板请求是否真的来自服务器本机。
+
+        「存到本机并打开位置」会写管理员主目录并启动文件管理器，必须只在
+        本机操作时可用。这里用 ``client_host`` 判断回环地址，并对反向代理
+        转发头做二次校验：只要第一跳不是回环地址，就按远程处理。
+        """
+        try:
+            host = str(getattr(_web_request, "client_host", "") or "").strip().lower()
+        except Exception:
+            return False
+        if host not in self._WEB_LOOPBACKS:
+            return False
+        try:
+            headers = getattr(_web_request, "headers", None)
+            forwarded = ""
+            if headers is not None:
+                forwarded = str(
+                    headers.get("x-forwarded-for") or headers.get("x-real-ip") or ""
+                ).strip()
+        except Exception:
+            forwarded = ""
+        first = forwarded.split(",")[0].strip().lower()
+        return not first or first in self._WEB_LOOPBACKS
+
     async def web_export_local(self, file_key: str):
         """存到本机「下载」文件夹并打开文件位置。
 
         浏览器没有权限打开用户的文件管理器，但面板就开在服务器本机
-        （localhost）时，后端可以代劳。远程访问面板时拒绝并提示改用浏览器下载。
+        （localhost、且没有反向代理转发）时，后端可以代劳。远程访问面板时
+        拒绝并提示改用「下载到浏览器」。
         """
-        remote = (getattr(_web_request, "remote_addr", "") or "").strip()
-        if remote and remote not in ("127.0.0.1", "::1", "localhost"):
+        if not self._web_is_local_panel():
             return _web_error(
                 "REMOTE_PANEL：管理面板不在服务器本机，请改用「下载到浏览器」",
                 status_code=400,
@@ -1603,7 +1632,11 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                 if meta.get("mime") in self._PAPER_MIMES:
                     mime = meta["mime"]
             data = base64.b64encode(img_path.read_bytes()).decode("ascii")
-            return _web_json({"found": True, "mime": mime, "data": data})
+            # 字段名不能叫 data：AstrBot 插件视图的 bridge 会把响应体顶层的 data
+            # 当成信封解包（PluginViewPage.vue: response.data?.data ?? response.data），
+            # 一旦撞名，前端只拿到 base64 字符串，r.found / r.mime 全丢了，
+            # 表现就是「上传成功但页面永远不换图」（同款坑见 tests/test_web.py）。
+            return _web_json({"found": True, "mime": mime, "image": data})
         except Exception as e:
             logger.warning(f"[memory_diary] 读取自定义{kind}图片失败: {e}")
             return _web_error("读取图片失败，详见后台日志", status_code=500)

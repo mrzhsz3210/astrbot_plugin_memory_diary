@@ -14,7 +14,7 @@ import zipfile
 
 from astrbot.api.web import bind_request_context
 
-from harness import compare
+from harness import compare, env
 from harness.fakes import FakeWebRequest, make_upload
 from harness.world import DIARY_TEXT, World
 
@@ -48,6 +48,22 @@ def _file(resp) -> dict:
 
 def _bind(request):
     return bind_request_context(request)
+
+
+def _bridge_unwrap(body):
+    """复刻 AstrBot 插件视图 bridge 的响应解包规则。
+
+    ``dashboard/src/views/PluginViewPage.vue`` 里：
+
+        sendBridgeResponse(requestId, true, response.data?.data ?? response.data)
+
+    也就是说响应体顶层只要出现 ``data`` 键，bridge 就把它当成信封，只把 ``data``
+    交给 iframe 里的页面。插件自己的 JSON 字段叫 ``data`` 会被这层吞掉，
+    页面拿到的就不是 ``{found, mime, ...}`` 而是字段值本身。
+    """
+    if isinstance(body, dict) and "data" in body:
+        return body["data"]
+    return body
 
 
 def _seed_diary(inst, sender: str = SENDER, name: str = SENDER_NAME):
@@ -278,11 +294,6 @@ async def test_web_export_bundle_and_local_export():
             # test never touches the real Downloads folder; Popen is stubbed.
             home = inst.root / "home"
             home.mkdir(parents=True, exist_ok=True)
-            remote = await _call(
-                plugin.web_export_local,
-                FakeWebRequest(remote_addr="10.0.0.5"),
-                file_key,
-            )
             with mock.patch.object(Path, "home", classmethod(lambda cls: home)):
                 with mock.patch.object(subprocess, "Popen", lambda *a, **k: None):
                     local = await _call(
@@ -303,7 +314,6 @@ async def test_web_export_bundle_and_local_export():
             )
             return {
                 "export": export,
-                "remote": remote,
                 "local": local_info,
                 "leftovers": leftovers,
             }
@@ -316,10 +326,28 @@ async def test_web_export_bundle_and_local_export():
         value = pair.value
         assert value["export"]["kind"] == "FileResponse"
         assert "memory_diary_export_" in value["export"]["filename"]
-        assert value["remote"]["status"] == 400
-        assert "REMOTE_PANEL" in value["remote"]["body"]["message"]
         assert value["local"]["status"] == 200
         assert value["local"]["saved_exists"] is True
+        if not env.is_baseline_only():
+            # 远程 / 反向代理转发必须被拒绝（baseline 老实现误读 remote_addr，
+            # 这里只对 refactor 侧断言；见 _web_is_local_panel）。
+            refactor = world.refactor.plugin
+            refactor_key = refactor._diary_file_key(SENDER)
+            remote = await _call(
+                refactor.web_export_local,
+                FakeWebRequest(client_host="10.0.0.5"),
+                refactor_key,
+            )
+            proxied = await _call(
+                refactor.web_export_local,
+                FakeWebRequest(
+                    client_host="127.0.0.1", forwarded_for="203.0.113.9"
+                ),
+                refactor_key,
+            )
+            for resp in (remote, proxied):
+                assert resp["status"] == 400
+                assert "REMOTE_PANEL" in resp["body"]["message"]
 
 
 async def test_web_import_round_trip_and_errors():
@@ -445,6 +473,17 @@ async def test_web_view_prefs_and_images():
                 ),
             )
             no_file = await _call(plugin.web_upload_backdrop, FakeWebRequest())
+            paper_body = paper["body"]
+            # 新实现把字段叫 image（避开 bridge 信封），baseline 老实现叫 data。
+            # 差分对比用归一化后的值，新字段约定在 refactor 分支单独断言。
+            paper_image = paper_body.get("image")
+            if paper_image is None:
+                paper_image = paper_body.get("data")
+            if inst.side == env.SIDE_REFACTOR and not env.is_baseline_only():
+                assert "data" not in paper_body, (
+                    "响应顶层不能出现 data：AstrBot 视图 bridge 会把它当信封解包"
+                )
+                assert "image" in paper_body, "自定义图片字段应为 image"
             return {
                 "defaults": defaults,
                 "saved": saved,
@@ -452,7 +491,12 @@ async def test_web_view_prefs_and_images():
                 "invalid": invalid,
                 "no_paper": no_paper,
                 "up": up,
-                "paper": paper,
+                "paper": {
+                    "status": paper["status"],
+                    "found": paper_body.get("found"),
+                    "mime": paper_body.get("mime"),
+                    "image": paper_image,
+                },
                 "wrong_mime": wrong_mime,
                 "too_big": too_big,
                 "no_file": no_file,
@@ -470,9 +514,47 @@ async def test_web_view_prefs_and_images():
         assert value["after"]["body"]["prefs"]["font_family"] == "kai"
         assert value["invalid"]["status"] == 400
         assert value["no_paper"]["body"] == {"found": False}
-        assert value["paper"]["body"]["found"] is True
-        assert base64.b64decode(value["paper"]["body"]["data"]) == b"\x89PNG\r\n\x1a\n" + b"0" * 32
+        assert value["paper"] == {
+            "status": 200,
+            "found": True,
+            "mime": "image/png",
+            "image": base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 32).decode("ascii"),
+        }
         assert value["wrong_mime"]["status"] == 400
         assert value["too_big"]["status"] == 400
         assert value["no_file"]["status"] == 400
         assert value["paper_files"] == ["web_paper.img", "web_paper.json"]
+
+
+async def test_web_image_payload_survives_bridge_unwrap():
+    """图片接口的响应经 bridge 解包后仍带着 found/mime/image。
+
+    AstrBot 的 ``PluginViewPage.vue`` 用 ``response.data?.data ?? response.data``
+    解包插件响应：顶层一旦有 ``data``，iframe 里拿到的就只是 ``data`` 的值。
+    纸张/背景板接口的 base64 字段若叫 data，前端就变成 ``r = "<base64>"``，
+    ``r.found`` 为 undefined → 页面按「没有自定义图片」处理（上传看似没反应）。
+    """
+    if env.is_baseline_only():
+        return  # 新字段约定只存在于 refactor 侧
+    async with World(config={"use_persona": False}) as world:
+        png = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+
+        async def scenario(inst):
+            plugin = inst.plugin
+            await _call(
+                plugin.web_upload_paper,
+                FakeWebRequest(
+                    uploads={"file": make_upload(png, "paper.png", "image/png")}
+                ),
+            )
+            return await _call(plugin.web_get_paper, FakeWebRequest())
+
+        pair = await world.run_pair(
+            scenario, compare_value=False, label="image bridge contract"
+        )
+        body = pair.refactor["body"]
+        assert "data" not in body
+        payload = _bridge_unwrap(body)
+        assert payload["found"] is True
+        assert payload["mime"] == "image/png"
+        assert base64.b64decode(payload["image"]) == png

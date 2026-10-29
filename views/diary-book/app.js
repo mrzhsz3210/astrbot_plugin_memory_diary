@@ -141,8 +141,11 @@ async function loadImageData(kind) {
   const useBtn = $(kind === "paper" ? "paperUseCustom" : "backdropUseCustom");
   try {
     const r = await bridge.apiGet(kind);
-    if (r.found && r.data) {
-      const url = "data:" + (r.mime || "image/png") + ";base64," + r.data;
+    // 后端字段必须叫 image、不能叫 data：bridge 会把响应顶层的 data 当信封解包
+    // （PluginViewPage.vue: response.data?.data ?? response.data），那样这里只拿到
+    // base64 字符串，r.found / r.mime 全没了，上传成功也不换图。
+    if (r.found && r.image) {
+      const url = "data:" + (r.mime || "image/png") + ";base64," + r.image;
       if (kind === "paper") paperDataUrl = url; else backdropDataUrl = url;
       useBtn.disabled = false;
     } else {

@@ -2,11 +2,19 @@
 
 本项目所有重要变更都会记录在此文件。
 
-## [未发布]
+## [v0.5.2] - 2026-10-29
+
+### 修复
+- **WebUI「纸张 / 背景板」上传图片后页面不换**：AstrBot 插件视图的 bridge 用 `response.data?.data ?? response.data` 解包插件响应，**响应顶层的 `data` 字段会被当成信封**；自定义图片接口原本把 base64 放在 `data` 里，iframe 里只拿到一个字符串，`r.found` / `r.mime` 全是 undefined，页面于是按「没有自定义图片」处理——图片其实已经存进服务器数据目录，但纸纹/背景板永远不生效，菜单项「使用自定义图片」也一直灰着。现已把字段改名为 `image`，并新增 `test_web::test_web_image_payload_survives_bridge_unwrap`（按 bridge 规则解包后仍拿得到图片）与 `test_view_assets` 的静态回归，固定「视图里不许读 `r.data`」这一约定。
+- **「存到本机并打开位置」的本机判断失效**：原实现读 `_web_request.remote_addr`，但 AstrBot 4.x 的插件 Web 请求（`astrbot.api.web.PluginRequest`）只暴露 `client_host`，读错属性在真机上永远是空字符串，导致远程访问面板也能把**含签名钥匙的迁移包**写进服务器主目录并拉起文件管理器。现在改用 `client_host` 判断回环地址，并对 `X-Forwarded-For` / `X-Real-IP` 做二次校验：反向代理转发来的请求一律按远程拒绝。新增 `test_plugin_rules` 静态检查与 `test_web` 行为回归，防止再退回 `remote_addr`。
 
 ### 变更
-- **合规调整（根据平台审核建议，不改变任何功能）**：移除 `memory_diary/log.py` 对标准库 `logging` 的回退——插件规范要求统一使用 `astrbot.api.logger`；脱离 AstrBot 独立导入核心包时改为静默 logger（AstrBot 运行时不走该分支）。新增 `tests/test_plugin_rules.py` 静态检查，确保插件源码不再出现标准库 logging。
-- **文档**：明确「存到本机并打开位置」是管理员在面板上主动点击触发的一次性文件投递，不是插件的持久化数据，也不会自动上传或外发；同步更新 `ARCHITECTURE.md` 的日志兼容说明。
+- **插件市场合规调整（根据平台审核建议，不改变任何功能）**：
+  - 移除 `memory_diary/log.py` 对标准库 `logging` 的回退——插件规范要求统一使用 `astrbot.api.logger`；脱离 AstrBot 独立导入核心包时改为静默 logger（AstrBot 运行时不走该分支）。新增 `tests/test_plugin_rules.py` 静态检查，确保插件源码不再出现标准库 logging。
+  - **文档**：明确「存到本机并打开位置」是管理员在面板上主动点击触发的一次性文件投递，不是插件的持久化数据，也不会自动上传或外发；同步更新 `ARCHITECTURE.md` 的日志兼容说明。
+- **新增插件 Logo**：仓库根目录加入 `logo.png`（1:1、256×256，符合 AstrBot 插件 Logo 规范），
+  AstrBot 4.5.0+ 会在插件列表 / 插件市场卡片中显示；安装包同步带上该文件。
+- 插件版本号更新为 v0.5.2；配置项、指令、数据格式、页面样式均不变，可直接覆盖升级。
 
 ## [v0.5.1] - 2026-10-28
 

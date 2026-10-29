@@ -59,3 +59,18 @@ def test_log_compat_layer_falls_back_without_astrbot_and_without_logging():
     logger = namespace["logger"]
     for method in ("debug", "info", "warning", "error", "exception"):
         getattr(logger, method)("compliance probe")
+
+
+def test_plugin_web_local_export_uses_real_astrbot_client_host():
+    """「存到本机并打开位置」的本机判断必须用 AstrBot 真实暴露的 client_host。
+
+    ``astrbot.api.web.PluginRequest`` 只有 ``client_host``（来自
+    ``request.client.host``），没有 ``remote_addr``。读错属性在真机上永远得到
+    空字符串，会让「只有本机面板可用」的防护形同虚设，远程面板也能把迁移包
+    （含签名钥匙）写进服务器主目录并拉起文件管理器。
+    """
+    source = (PLUGIN_ROOT / "main.py").read_text(encoding="utf-8")
+    assert 'getattr(_web_request, "remote_addr"' not in source, (
+        "AstrBot 插件 Web 请求没有 remote_addr，请改用 request.client_host"
+    )
+    assert "client_host" in source
