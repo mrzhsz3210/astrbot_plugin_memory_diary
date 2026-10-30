@@ -164,11 +164,11 @@ async def test_run_auto_skips_full_no_material_and_missing_umo():
             await plugin._run_auto_diaries("20261023")
             sent = list(inst.ctx.sent_messages)
 
-            # A user already in _writing is skipped as well.
-            plugin._writing.add("aiocqhttp:FriendMessage:10003")
+            # A user already in _writing is skipped as well. 锁的粒度是 sender_id。
+            plugin._writing.add("10003")
             await plugin._run_auto_diaries("20261023")
             after_writing = list(inst.ctx.sent_messages)
-            plugin._writing.discard("aiocqhttp:FriendMessage:10003")
+            plugin._writing.discard("10003")
 
             return {
                 "sent": sent,

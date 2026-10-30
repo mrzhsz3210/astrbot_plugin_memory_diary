@@ -14,7 +14,8 @@ main.py                         AstrBot 适配层（约 2200 行）
     ├── storage.py              文件布局、HMAC 验签、偏好/备忘、旧格式迁移、
     │                           迁移包导入导出、Web 数据
     ├── service.py              会话历史 → 写作素材 → LLM 写作 → 保存、
-    │                           上下文哨兵、每天定时自动写日记
+    │                           上下文哨兵、token 校准（EWMA）、每天定时自动写日记
+    ├── token_estimator.py      纯函数 token 估算：分类加权 + 消息/工具/多模态开销（v0.5.5）
     └── core.py                 MemoryDiaryCore：组合上述 mixin，管理内存状态/生命周期
 ```
 

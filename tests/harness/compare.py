@@ -11,9 +11,38 @@ from pathlib import Path
 DATA_DIR_PLACEHOLDER = b"<DATA_DIR>"
 TMP_ROOT_PLACEHOLDER = b"<TMP_ROOT>"
 
+# v0.5.5 P3-1 差分豁免：日记 zip 里的「说明.txt」不再写死旧四固定标题，改为
+# 功能描述（小标题由 AI 按人设自由起名）。baseline 仍是旧句、refactor 是新句，
+# 两边 snapshot 逐字节比较前把这一句统一成同一串——与 world.py 的
+# ``_INJECT_TEMPLATE_V055_SENTENCE`` 同类处理，只豁免这一句文案本身。
+README_V055_OLD_HEADINGS = (
+    "1. 涵盖时间  2. 用户画像  3. AI 对用户的看法与评价  4. 给未来的 AI 的叮嘱"
+).encode("utf-8")
+README_V055_NEW_HEADINGS = (
+    "功能上依次覆盖：时间范围 / 用户画像 / 对用户的评价与感受 / "
+    "给未来的 AI 的叮嘱（小标题由 AI 按人设自由起名）。"
+).encode("utf-8")
+# 无句号变体同样归一：句号是否落在这一句末尾取决于实现的换行位置，
+# 两种形式都统一到带句号的规范串，避免实现微调换行时又差一个字符。
+README_V055_NEW_HEADINGS_NO_PERIOD = README_V055_NEW_HEADINGS[
+    : -len("。".encode("utf-8"))
+]
+
 
 class DiffError(AssertionError):
     pass
+
+
+def _drop_json_field(raw: bytes, field: str) -> bytes:
+    """从 JSON 对象字节里删掉一个字段（差分豁免用）；非 JSON 原样返回。"""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return raw
+    if isinstance(data, dict) and field in data:
+        data.pop(field)
+        return json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return raw
 
 
 def stable_repr(value, _depth: int = 0) -> str:
@@ -74,6 +103,17 @@ def normalise_bytes(raw: bytes, data_dir: Path, tmp_root: Path | None = None) ->
             escaped = str(path).replace("\\", "\\\\").encode("utf-8")
             if escaped != needle:
                 text = text.replace(escaped, marker)
+    # v0.5.5 P3-1 差分豁免（见模块顶部常量注释）：说明.txt 旧四固定标题 → 功能描述。
+    # 普通文件与 zip 条目都走本函数，一处替换即覆盖全部 snapshot 差异。
+    text = text.replace(README_V055_OLD_HEADINGS, README_V055_NEW_HEADINGS)
+    text = text.replace(
+        README_V055_NEW_HEADINGS_NO_PERIOD, README_V055_NEW_HEADINGS
+    )
+    # v0.5.5 低危清理差分豁免：`last_material_hash` 已被素材游标取代。baseline
+    # 仍会把它写进 pref_*.json；refactor 不再写、并在偏好重写时清掉旧字段。
+    # 两边比较前统一删掉该键（只在 JSON 里命中，zip 条目不受影响）。
+    if b'"last_material_hash"' in text:
+        text = _drop_json_field(text, "last_material_hash")
     return text
 
 

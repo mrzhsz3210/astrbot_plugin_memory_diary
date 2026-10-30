@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from .common import safe_key
+from .constants import TOKEN_CALIBRATION_FILE
 from .errors import (
     DiaryCorruptError,
     DiaryKeyUnavailable,
@@ -311,7 +312,8 @@ class StorageMixin:
             '这个 zip 保存着一位 AI 写给"下一个自己"的日记。日记按天归档：\n'
             "diaries/ 文件夹里每天一个 <日期>.md 文件（当天写多篇会追加在同一文件里，带时间分隔），\n"
             "sigs/ 文件夹里是对应的防篡改签名（仅供插件验签，可忽略）。完整日记包含四个部分：\n"
-            "1. 涵盖时间  2. 用户画像  3. AI 对用户的看法与评价  4. 给未来的 AI 的叮嘱\n"
+            "功能上依次覆盖：时间范围 / 用户画像 / 对用户的评价与感受 / 给未来的 AI 的叮嘱"
+            "（小标题由 AI 按人设自由起名）。\n"
             '“完整”是四段式质量锚点；“简记”是对新增内容的 1~3 句概括；\n'
             '“简记（已吸收）”表示它已经被后面的完整篇合并，插件注入时会跳过；\n'
             '标注“无新对话·她的日常随笔”的是没有新聊天时 AI 写的自己的拟人日常，不含用户画像。\n'
@@ -396,11 +398,18 @@ class StorageMixin:
         return ""
 
     def _load_entry(self, sender_id: str, entry_name: str):
-        """读取一篇日记。返回 (content, tampered)。"""
+        """读取一篇日记。返回 (content, tampered)。
+
+        验签必须用 zip 里的**原文**：签名是在保存时对落盘原文算的
+        （_save_diary 保存前逐条验签也传原文），strip 只是展示需要。
+        若先 strip 再验签，将来任何写入路径引入行尾空白，读路径就会把全部
+        合法日记误判成「被篡改」（fail-closed 误伤）——所以这里先验原文、
+        返回前再 strip。
+        """
         path = self._diary_path(sender_id)
         try:
             with zipfile.ZipFile(path) as z:
-                content = z.read(entry_name).decode("utf-8").strip()
+                raw = z.read(entry_name).decode("utf-8")
                 try:
                     actual = z.read(self._sig_entry(entry_name)).decode("utf-8").strip()
                 except KeyError:
@@ -415,12 +424,12 @@ class StorageMixin:
                 f"[memory_diary] 签名密钥不可用，无法验签，已拒绝读取 {entry_name}"
             )
             return "", True
-        if not self._entry_sig_matches(sender_id, entry_name, content, actual):
+        if not self._entry_sig_matches(sender_id, entry_name, raw, actual):
             logger.warning(
                 f"[memory_diary] 用户 {sender_id} 的日记 {entry_name} 验签失败，已拒绝读取"
             )
             return "", True
-        return content, False
+        return raw.strip(), False
 
     def _load_latest(self, sender_id: str):
         """读取最新一篇日记。返回 (content, tampered, entry_name 或 None)。"""
@@ -437,7 +446,7 @@ class StorageMixin:
         return self.data_dir / f"pref_{safe_key(sender_id)}.json"
 
     def _load_pref_data(self, sender_id: str) -> dict:
-        """读取用户偏好文件（含注入范围、上次写作素材哈希等）。"""
+        """读取用户偏好文件（含注入范围、素材游标、备忘等）。"""
         try:
             data = json.loads(self._pref_path(sender_id).read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}
@@ -448,12 +457,17 @@ class StorageMixin:
         """保存偏好数据；返回是否成功——失败时调用方必须告知用户，不能谎报（P2-5）。
 
         原子写（P1-1）：先写临时文件再 os.replace，避免 write_text 原地截断
-        导致一次崩溃丢掉范围设置/备忘/素材哈希。
+        导致一次崩溃丢掉范围设置/备忘/素材游标。
+        注意：会**就地**删除传入 dict 里的废弃字段（last_material_hash），
+        调用方传入的都应是本函数域内新建/新加载的 dict，不要复用它。
         """
         try:
             p = self._pref_path(sender_id)
+            # 已废弃字段（素材哈希机制已被素材游标取代）：旧 pref 文件里可能还留着，
+            # 在这里统一清掉——否则每次「读-改-写」都会把它原样带回，永远删不掉。
+            data.pop("last_material_hash", None)
             if data:
-                tmp = p.with_name(p.name + ".tmp")
+                tmp = p.with_name(f"{p.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
                 tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
                 os.replace(tmp, p)
             else:
@@ -477,15 +491,9 @@ class StorageMixin:
             data["scope"] = scope
         return self._save_pref_data(sender_id, data)
 
-    def _load_material_hash(self, sender_id: str) -> str:
-        """上次写日记时使用的素材哈希，用于判断"有没有说过新的话"。"""
-        h = self._load_pref_data(sender_id).get("last_material_hash")
-        return h if isinstance(h, str) else ""
-
-    def _save_material_hash(self, sender_id: str, h: str):
-        data = self._load_pref_data(sender_id)
-        data["last_material_hash"] = h
-        self._save_pref_data(sender_id, data)
+    # 素材哈希（last_material_hash）已随「素材游标」上线废弃：游标记录上次读到
+    # 历史第几条/最后一条哈希，判断“有没有新内容”不再读整段素材哈希。旧数据里的
+    # 该字段随偏好文件自然重写消失，这里不再读写。
 
     # ------------------------- 素材游标（避免多篇日记重复读同一段） -------------------------
     # 每个 umo（私聊/每个群）一个游标：记录上次写日记时读到了历史中的第几条、
@@ -776,7 +784,11 @@ class StorageMixin:
         return text, tampered_any, used_names
 
     def _quarantine_corrupt(self, path: Path):
-        """把损坏的日记 zip 改名隔离（不删除、不覆盖），返回备份路径或 None。"""
+        """把损坏的日记 zip 改名隔离（不删除、不覆盖），返回备份路径或 None。
+
+        隔离副本名形如 diary_<hash>.corrupt-<ts>.zip，不匹配 diary_*.zip 的
+        有效 key 规则，因此不会进入 Web 一键备份（P3-17，可接受）。
+        """
         ts = self._now().strftime("%Y%m%d_%H%M%S")
         backup = path.with_name(f"{path.stem}.corrupt-{ts}{path.suffix}")
         try:
@@ -798,7 +810,9 @@ class StorageMixin:
         旧日记会整个损坏。原子写保证任何时刻磁盘上要么是完整的旧文件，
         要么是完整的新文件。
         """
-        tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+        # 临时名带 pid + 随机后缀：同进程两个协程并发写同一 zip 时，
+        # 固定 tmp 名会互相截断/覆盖（os.replace 后内容来源不定），导致日记丢失
+        tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
         try:
             with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
                 for n, b in entries.items():
@@ -1131,7 +1145,14 @@ class StorageMixin:
     # ------------------------- 操作冷却 -------------------------
 
     def _op_cooldown_remaining(self, sender_id: str) -> int:
-        """返回还需等待的分钟数；0 表示可以操作。间隔为 0 时不限制。"""
+        """返回还需等待的分钟数；0 表示可以操作。间隔为 0 时不限制。
+
+        ``_op_last`` 里存的是 ``_now()`` 的结果：配置了合法时区时是 tz-aware，
+        未配置/非法时回退 naive。AstrBot 改配置会重载插件、实例重建，正常路径
+        不会混存；但万一同一实例内动态改了 diary_timezone，aware 与 naive 相减
+        会抛 TypeError，表现为日记指令整个报错。这里按“无冷却”兜底（宁可放行
+        一次，也不让指令崩掉）。
+        """
         interval = int(self.config.get("diary_op_interval", 5) or 0)
         if interval <= 0:
             return 0
@@ -1139,7 +1160,13 @@ class StorageMixin:
         last = self._op_last.get(sender_id)
         if last is None:
             return 0
-        elapsed = (self._now() - last).total_seconds()
+        try:
+            elapsed = (self._now() - last).total_seconds()
+        except (TypeError, ValueError):
+            logger.warning(
+                "[memory_diary] 操作冷却时间类型不一致（aware/naive 混存），本次按无冷却处理"
+            )
+            return 0
         remaining_sec = interval * 60 - elapsed
         if remaining_sec <= 0:
             return 0
@@ -1148,8 +1175,39 @@ class StorageMixin:
     def _op_mark(self, sender_id: str):
         self._op_last[sender_id] = self._now()
         self._cap_state(self._op_last)
-    def _import_readme_text(self, diary_name: str) -> str:
+    def _backup_readme_text(self, user_count: int) -> str:
+        """Web 一键备份包内的说明（只含日记 zip，绝不含签名钥匙）。
+
+        P3-17：备份只收集 `diary_*.zip`（调用方用 `_valid_file_key` 过滤
+        16 位十六进制文件名），因此 `_quarantine_corrupt` 产生的
+        `*.corrupt-<ts>.zip` 隔离副本不会入包——这是可接受行为：那些是损坏
+        文件的残骸，迁移时不带走；管理员按需自行拷贝到新机人工修复。
+        """
         return (
+            "记忆日记 · 全部用户日记备份\n"
+            "============================\n\n"
+            f"备份时间：{self._now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"用户份数：{user_count} 份（每份一个 diary_*.zip，"
+            "含该用户全部日记与防篡改签名）\n\n"
+            "【这是什么】\n"
+            "这是管理员从 Web 日记本页面一键导出的整机备份，"
+            "包含服务器上所有用户的日记。\n"
+            "包里【不含】任何签名钥匙——这是安全设计：主密钥能签发所有人的日记，"
+            "泄露面远大于日记内容，浏览器下载的包比服务器目录更易外泄。\n\n"
+            "【如何恢复】\n"
+            "· 整机迁移：把本包里的 diary_*.zip 全部放进新机的插件数据目录，"
+            "并且必须把旧机数据目录里的主密钥 .diary_key 一起拷过去。\n"
+            "  每个用户的签名钥匙由主密钥按 QQ 号确定性派生（HMAC-SHA256）——"
+            "主密钥在，所有派生钥匙自动重算，旧日记验签照常通过。\n"
+            "· 没有主密钥的兜底：备份包里的日记在新机上会全部验签失败，"
+            "此时让各用户走单用户 /导出日记 迁移包导入，"
+            "导入逻辑会自动用本机钥匙重签安放，验签恢复。\n"
+            "两条通道的分工：一键备份 = 管理员整机迁移（必须配 .diary_key 一起迁移）；\n"
+            "单用户迁移包 = 用户级自助迁移（自动重签）。\n"
+            "详见 README 第 11 节「日记存储位置与提取」。\n"
+        )
+
+    def _import_readme_text(self, diary_name: str) -> str:        return (
             "记忆日记 · 迁移包导入说明\n"
             "========================\n\n"
             "【包里有什么】\n"
@@ -1231,7 +1289,10 @@ class StorageMixin:
                 sig_name = self._sig_entry(n)
                 if sig_name not in dnames:
                     raise ValueError(f"日记 {self._entry_label(n)} 缺少签名，迁移包可能被改动过")
-                content = dz.read(n).decode("utf-8").strip()
+                # 验签用 zip 内原文：迁移包里的日记 zip 是逐字节副本，签名也是
+                # 对落盘原文算的（与 _load_entry / _save_diary 同口径）。strip 只
+                # 用于展示；若这里先 strip 再验签，带行尾空白的日记会"能读不能迁"。
+                content = dz.read(n).decode("utf-8")
                 actual = dz.read(sig_name).decode("utf-8").strip()
                 expected = hmac.new(
                     sign_key,
@@ -1319,7 +1380,7 @@ class StorageMixin:
             d = self._load_owner_map()
             d[file_key] = owner_id
             p = self._owner_map_path()
-            tmp = p.with_name(p.name + ".tmp")
+            tmp = p.with_name(f"{p.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
             tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, p)
         except Exception as e:
@@ -1349,14 +1410,83 @@ class StorageMixin:
                 for n in entries:
                     if self._sig_entry(n) not in names:
                         return "", f"日记 {self._entry_label(n)} 缺少签名"
-                    content = z.read(n).decode("utf-8").strip()
+                    # 与读取/保存/迁移包校验同口径：用原文验签，strip 不参与验签
+                    raw = z.read(n).decode("utf-8")
                     actual = z.read(self._sig_entry(n)).decode("utf-8").strip()
-                    if not self._entry_sig_matches(qq_hint, n, content, actual):
+                    if not self._entry_sig_matches(qq_hint, n, raw, actual):
                         return "", "QQ 号与日记签名对不上，请确认是日记主人的 QQ"
         except Exception as e:
             return "", f"校验失败：{e}"
         self._remember_owner(file_key, qq_hint)
         return qq_hint, ""
+
+    # ------------------------- token 估算校准（EWMA 系数持久化） -------------------------
+    # 文件：数据目录下 token_calibration.json
+    # 键：provider::model；值：{"factor", "samples", "last_actual", "updated"}
+    # 只存数字系数，不存任何聊天内容（隐私）。
+    # P3-18：key 数量上限 64——正常最多几十个 provider::model，超出说明文件被
+    # 污染或长期异常膨胀；加载/写回时按 updated 只保留最近 64 条
+    #（缺少 updated 的视为最旧，优先丢弃），避免内存与 /日记状态 被撑爆。
+    _TOKEN_CALIB_MAX_KEYS = 64
+
+    def _token_calibration_path(self) -> Path:
+        return self.data_dir / TOKEN_CALIBRATION_FILE
+
+    @classmethod
+    def _trim_token_calibration(cls, data: dict) -> dict:
+        """按 updated 降序保留最近 _TOKEN_CALIB_MAX_KEYS 个 key；未超限原样返回。
+
+        updated 是 "%Y-%m-%d %H:%M:%S" 字符串，字典序即时间序；空串/缺失排最旧。
+        隔离成纯函数，加载与写回共用同一规则（_save_token_calibration 的签名不变）。
+        """
+        if not isinstance(data, dict) or len(data) <= cls._TOKEN_CALIB_MAX_KEYS:
+            return data
+
+        def _updated(item) -> str:
+            rec = item[1]
+            return str(rec.get("updated", "") or "") if isinstance(rec, dict) else ""
+
+        try:
+            ordered = sorted(data.items(), key=_updated)
+        except Exception:  # noqa: BLE001 - 排序异常时退化为截断，绝不抛给调用方
+            ordered = list(data.items())
+        return dict(ordered[-cls._TOKEN_CALIB_MAX_KEYS:])
+
+    def _load_token_calibration(self) -> dict:
+        try:
+            data = json.loads(
+                self._token_calibration_path().read_text(encoding="utf-8")
+            )
+            if not isinstance(data, dict):
+                return {}
+            out = {}
+            for k, v in data.items():
+                if isinstance(v, dict) and isinstance(v.get("factor"), (int, float)):
+                    out[str(k)] = {
+                        "factor": float(v["factor"]),
+                        "samples": int(v.get("samples", 0) or 0),
+                        "last_actual": int(v.get("last_actual", 0) or 0),
+                        "updated": str(v.get("updated", "") or ""),
+                    }
+            return self._trim_token_calibration(out)
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            # 坏文件静默重置为 {}（P3-18 保持现状，只留 warning），下次写入会覆盖
+            logger.warning(f"[memory_diary] 读取 token 校准系数失败: {e}")
+            return {}
+
+    def _save_token_calibration(self, data: dict) -> bool:
+        try:
+            p = self._token_calibration_path()
+            tmp = p.with_name(f"{p.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
+            data = self._trim_token_calibration(data)
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, p)
+            return True
+        except Exception as e:
+            logger.warning(f"[memory_diary] 保存 token 校准系数失败: {e}")
+            return False
 
     # ---- 查看密码（仅挡 Web 日记本页面；服务器文件权限不在保护范围内） ----
     # 主人在 QQ 私聊 /日记密码 设置；哈希存进本人 pref 文件，明文不落盘。

@@ -9,6 +9,8 @@ iframe 里，没有 ``allow-modals``，原生 ``window.prompt`` / ``confirm`` / 
 
 from __future__ import annotations
 
+import re
+
 from harness import env
 
 VIEW_DIR = env.REFACTOR_DIR / "views" / "diary-book"
@@ -79,5 +81,30 @@ def test_diary_book_view_uses_blob_url_for_large_custom_images():
     assert "dataUrlToObjectUrl" in js
     assert "createObjectURL" in js
     assert "revokeObjectURL" in js
+
+
+def test_diary_book_view_ships_backup_all_entry():
+    """P2-2 第 5 点：一键备份全部日记的前端入口必须存在。
+
+    后端路由 ``/export_all`` 有了、前端没有按钮（或按钮没有接到 bridge 调用）
+    时，这个功能对用户等于不存在；只断言 refactor 资产。
+    """
+    html = _read("index.html")
+    assert 'data-export="backup_all"' in html, "缺少「备份全部日记」按钮"
+    js = _read("app.js")
+    assert re.search(r'bridge\.download\(\s*"export_all"', js), (
+        "缺少 bridge.download(\"export_all\", ...) 调用"
+    )
+    # 按钮值必须真的被派发到备份分支（不能只留一个孤立按钮）
+    assert '"backup_all"' in js and "doBackupAll" in js
+
+    # 复查补丁：再提供一个「备份全部日记并打开位置」入口（仅本机面板可用）
+    assert 'data-export="backup_all_local"' in html, (
+        "缺少「备份全部日记并打开位置」按钮"
+    )
+    assert re.search(r'bridge\.apiGet\(\s*"export_all_local"', js), (
+        "缺少 bridge.apiGet(\"export_all_local\") 调用"
+    )
+    assert "doBackupAllLocal" in js
 
 

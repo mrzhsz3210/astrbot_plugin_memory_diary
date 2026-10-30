@@ -1,53 +1,65 @@
 {
+  "context_token_limit": {
+    "description": "模型上下文窗口（tokens）",
+    "type": "int",
+    "hint": "填你使用的模型的上下文上限，例如 DeepSeek-V3 填 60000；用于估算占用比例。填 0 或负数 = 停用上下文哨兵（提醒/自动写日记/手动写日记的比例门槛一并停用）；两档阈值都设为 0 也会停用哨兵",
+    "default": 60000
+  },
+  "remind_ratio": {
+    "description": "提醒阈值（占比，0=不提醒）",
+    "type": "float",
+    "hint": "上下文占用达到该比例时提醒一次，默认 0.75；设为 0 表示不提醒。必须小于等于自动写日记阈值，配置颠倒时插件会自动截断并记日志",
+    "default": 0.75,
+    "slider": {"min": 0, "max": 1, "step": 0.05}
+  },
+  "auto_ratio": {
+    "description": "自动写日记阈值（占比，0=不自动写）",
+    "type": "float",
+    "hint": "上下文占用达到该比例时自动写好日记并提醒你 /reset，默认 0.9；设为 0 表示不自动写。两档都为 0 时上下文哨兵整体停用",
+    "default": 0.9,
+    "slider": {"min": 0, "max": 1, "step": 0.05}
+  },
+  "token_estimation_v2": {
+    "description": "改进版token估算（实验性功能，默认关闭）",
+    "type": "bool",
+    "hint": "实验性功能，默认关闭。开启后按中文/英文/代码分类估算上下文占用，并计入图片、工具等开销；关闭回退旧公式（字符数÷1.8）。注意：自动校准依赖本项，本项关闭时校准不会生效；关闭本项不会删除已有的 token_calibration.json，只是不再读取/更新它。",
+    "default": false
+  },
+  "token_calibration_enabled": {
+    "description": "token估算自动校准（实验性功能，默认关闭）",
+    "type": "bool",
+    "hint": "实验性功能，默认关闭。开启后按模型用服务提供商返回的真实 token 用量自动修正估算系数（EWMA），仅当上一项「改进版token估算」也开启时生效。关闭后：估算仍按静态公式（系数恒 1.0），不会采样、不写 token_calibration.json；已有校准文件不会被删除，重新开启会继续沿用其中系数（想从 1.0 重学请删除该文件并重载插件）。",
+    "default": false
+  },
   "enable_auto_inject": {
     "description": "新会话自动读取日记",
     "type": "bool",
     "hint": "开启新上下文（/reset）后的第一条消息，自动把日记注入给模型",
     "default": true
   },
-  "enable_context_watch": {
-    "description": "启用上下文哨兵",
+  "inject_default_days": {
+    "description": "默认注入最近几天的日记",
+    "type": "int",
+    "hint": "新上下文默认注入最近 N 天的日记，默认 7；0 表示注入全部。用户可用 /日记范围 自行覆盖",
+    "default": 7
+  },
+  "inject_max_chars": {
+    "description": "注入日记的最大字符数",
+    "type": "int",
+    "hint": "防炸上下文保险丝：注入的日记总量超过该值时优先保留最近的日记，更旧的截断并注明。估算（改进版）：中文为主时 8000 字约 6400 tokens（旧公式约 4400），占 60000 窗口约 11%（旧公式约 7%）；默认注入 7 天约 3500~6300 字，8000 一般够用，模型窗口较小时可降到 5000~6000",
+    "default": 8000
+  },
+  "group_inject_filter": {
+    "description": "群聊注入过滤",
     "type": "bool",
-    "hint": "每次请求前估算上下文 token 占用，快满时提醒并自动写日记。关闭后，下面的上下文窗口、提醒阈值、自动写日记阈值三项均不生效",
+    "hint": "开启后：在群聊的新上下文中只注入「写于群聊」的日记片段，私聊写下的片段不进群聊（反向不限：群聊片段在私聊照常注入）。无场景标记的旧日记片段视为私聊来源、不注入群聊",
     "default": true
   },
-  "context_token_limit": {
-    "description": "模型上下文窗口（tokens）",
-    "type": "int",
-    "hint": "填你使用的模型的上下文上限，例如 DeepSeek-V3 填 60000；用于估算占用比例。仅在启用上下文哨兵后生效",
-    "default": 60000
-  },
-  "remind_ratio": {
-    "description": "提醒阈值（占比）",
-    "type": "float",
-    "hint": "上下文占用达到该比例时提醒一次，默认 0.75。必须小于等于自动写日记阈值，配置颠倒时插件会自动截断并记日志。仅在启用上下文哨兵后生效",
-    "default": 0.75,
-    "slider": {"min": 0.1, "max": 1, "step": 0.05}
-  },
-  "auto_ratio": {
-    "description": "自动写日记阈值（占比）",
-    "type": "float",
-    "hint": "上下文占用达到该比例时自动写好日记并提醒你 /reset，默认 0.9。仅在启用上下文哨兵后生效",
-    "default": 0.9,
-    "slider": {"min": 0.1, "max": 1, "step": 0.05}
-  },
-  "diary_op_interval": {
-    "description": "日记操作间隔（分钟）",
-    "type": "int",
-    "hint": "每个用户两次写日记/删日记之间的最小间隔；0 为不限制，最高 60 分钟",
-    "default": 5
-  },
-  "write_min_ratio": {
-    "description": "手动写日记的最低上下文占用（占比）",
-    "type": "float",
-    "hint": "上下文占用达到该比例才允许用户手动发 /日记；0 为不限制。哨兵自动写日记不受此限",
-    "default": 0
-  },
-  "use_persona": {
-    "description": "按人设口吻",
+  "persist_inject": {
+    "description": "注入持久化",
     "type": "bool",
-    "hint": "默认开启：写日记与写完告知、备忘/查看/删除/导出/导入日记、日记密码、日记范围设置与注入确认、上下文哨兵提醒、每天定时自动写日记的写完告知等对话式反馈都用当前会话人设的口吻；日期清单、帮助菜单、日记正文以及保存失败/验签/密钥等技术报错保持固定文案，保证数字与指引准确。关闭后全部使用固定文案，不额外调用模型",
-    "default": true
+    "hint": "默认关闭：日记只在每个新会话的第一轮请求注入一次（省 token，但她只在生成第一条回复时记得日记细节）。开启后：每一轮请求都把日记放进 system prompt，她在整个会话里都能随时回忆日记内容，代价是每轮都消耗日记的 token",
+    "default": false
   },
   "enable_auto_diary": {
     "description": "每天定时自动写完整日记",
@@ -67,35 +79,12 @@
     "hint": "开启后：用户要求写日记但距上次没有任何新对话时，她会写一段自己的拟人生活随笔（不含用户画像、不编造用户言行）；关闭后：直接提示没有新内容、不写",
     "default": true
   },
-  "show_diary_after_write": {
-    "description": "写完后展示日记全文",
-    "type": "bool",
-    "hint": "默认关闭：她只用正常口吻告知日记已写好；开启后会在告知后附上日记全文",
-    "default": false
-  },
-  "inject_default_days": {
-    "description": "默认注入最近几天的日记",
+  "max_full_diaries_per_day": {
+    "description": "每个场景每天最多几篇完整日记（质量锚点，建议保持 1）",
     "type": "int",
-    "hint": "新上下文默认注入最近 N 天的日记，默认 7；0 表示注入全部。用户可用 /日记范围 自行覆盖",
-    "default": 7
-  },
-  "inject_max_chars": {
-    "description": "注入日记的最大字符数",
-    "type": "int",
-    "hint": "防炸上下文保险丝：注入的日记总量超过该值时优先保留最近的日记，更旧的截断并注明",
-    "default": 8000
-  },
-  "group_inject_filter": {
-    "description": "群聊注入过滤",
-    "type": "bool",
-    "hint": "开启后：在群聊的新上下文中只注入「写于群聊」的日记片段，私聊写下的片段不进群聊（反向不限：群聊片段在私聊照常注入）。无场景标记的旧日记片段视为私聊来源、不注入群聊",
-    "default": true
-  },
-  "persist_inject": {
-    "description": "注入持久化",
-    "type": "bool",
-    "hint": "默认关闭：日记只在每个新会话的第一轮请求注入一次（省 token，但她只在生成第一条回复时记得日记细节）。开启后：每一轮请求都把日记放进 system prompt，她在整个会话里都能随时回忆日记内容，代价是每轮都消耗日记的 token（约 字数÷1.8）",
-    "default": false
+    "hint": "默认 1；0 表示不限制（适合 token 充足、希望多写完整篇的用户）。按场景计算：私聊和群聊各自独立（群与群目前不隔离），简记不占额度。所有写完整日记的路径都会占用名额：手动 /日记 完整、哨兵自动写、每天定时自动写；哨兵撞上限会自动降级为简记，手动撞上限会被拒绝；简记/随笔不占。每天次日 00:00（日记时区）重置。⚠ 完整日记是“质量锚点”，强烈建议保持默认的每场景每天 1 篇，不要设置过多：有效完整篇 500~900 字，用于沉淀用户画像与评价，写多了会稀释质量、增加 token 与阅读负担；日常小更新用默认的简记更合适。仅在 token 非常充足且确有需要时才调大，0（不限）请谨慎使用",
+    "default": 1,
+    "obvious_hint": true
   },
   "max_history_messages": {
     "description": "写日记时读取的最大消息条数",
@@ -109,29 +98,53 @@
     "hint": "群聊历史混有其他成员发言，写日记时读取条数 = 最大消息条数 × 该倍率，提高覆盖到画像对象本人发言的概率；1 表示不放大",
     "default": 3
   },
-  "bot_call_names": {
-    "description": "我的称呼（多 AI 防冲突）",
-    "type": "string",
-    "hint": "群里装了本插件的 AI 不止一个时，填这个 AI 的名字/昵称。多个名字用英文逗号或中文逗号分隔都可以，例如：小深,DeepSeek 或 小深，深深。指令里 @这些名字 时她才会响应；@别的名字她会保持沉默",
-    "default": ""
-  },
-  "group_require_at": {
-    "description": "群里只响应@我的指令",
-    "type": "bool",
-    "hint": "开启后，群聊里不带@的日记指令一律不响应，只有@我（QQ自带@功能或@我的称呼）才执行；私聊不受影响",
-    "default": false
+  "write_min_ratio": {
+    "description": "手动写日记的最低上下文占用（占比）",
+    "type": "float",
+    "hint": "上下文占用达到该比例才允许用户手动发 /日记；0 为不限制。哨兵自动写日记不受此限",
+    "default": 0
   },
   "extra_instruction": {
     "description": "写日记的附加要求",
     "type": "string",
-    "hint": "会追加到写日记的提示词末尾，例如：语气更温柔一些 / 多用条目列出画像",
+    "hint": "会追加到写日记的提示词末尾，例如：语气更温柔一些 / 多写一点她的日常小事",
     "default": ""
   },
-  "max_full_diaries_per_day": {
-    "description": "每个场景每天最多几篇完整日记",
+  "allowed_users": {
+    "description": "允许使用插件的用户（白名单）",
+    "type": "string",
+    "hint": "填 sender_id（QQ号等），用逗号、空格或换行分隔；留空表示所有人都能用（默认）。填了之后：名单外的人发日记指令会被静默忽略，也不会被注入日记、不会被哨兵自动写日记、不会出现在每天定时自动写日记的名单里。私聊和群聊统一按这份名单过滤，Web 日记本页面不受影响（本来就只有管理员能看）",
+    "default": ""
+  },
+  "show_diary_after_write": {
+    "description": "写完后展示日记全文",
+    "type": "bool",
+    "hint": "默认关闭：她只用正常口吻告知日记已写好；开启后会在告知后附上日记全文（仅私聊展示，群聊不展示）",
+    "default": false
+  },
+  "use_persona": {
+    "description": "人设口吻",
+    "type": "bool",
+    "hint": "默认开启：写日记与写完告知、备忘/查看/删除/导出/导入日记、日记密码、日记范围设置与注入确认、上下文哨兵提醒、每天定时自动写日记的写完告知等对话式反馈都用当前会话人设的口吻；日期清单、帮助菜单、日记正文以及保存失败/验签/密钥等技术报错保持固定文案，保证数字与指引准确。关闭后全部使用固定文案，不额外调用模型",
+    "default": true
+  },
+  "group_require_at": {
+    "description": "群里只响应@我的指令",
+    "type": "bool",
+    "hint": "开启后，群聊里不带@的日记指令一律不响应，只有@我（QQ自带@功能）才执行；私聊不受影响",
+    "default": false
+  },
+  "diary_op_interval": {
+    "description": "日记操作间隔（分钟）",
     "type": "int",
-    "hint": "默认 1；0 表示不限制（适合 token 充足、希望多写完整篇的用户）。按场景计算：私聊和群聊各自独立（群与群目前不隔离），简记不占额度",
-    "default": 1
+    "hint": "每个用户两次写日记/删日记之间的最小间隔；0 为不限制，最高 60 分钟",
+    "default": 5
+  },
+  "enable_context_watch": {
+    "description": "启用上下文哨兵（已废弃，仅兼容旧配置）",
+    "type": "bool",
+    "hint": "v0.5.5 起请改用上方「提醒阈值 / 自动写日记阈值」：某档设为 0 即关闭该档，两档都 0 等于哨兵停用。本项只为兼容 v0.5.4 及更早的旧配置而保留：旧配置里为 false 时会被视为两档阈值都 0（不会提醒/不会自动写）；想让哨兵重新工作，请把本项改为 true 后去上方调整阈值。AstrBot 会在加载配置时保留本项，所以旧用户的 false 不会丢。",
+    "default": true
   },
   "web_diary_brand": {
     "description": "日记本页面的称呼",

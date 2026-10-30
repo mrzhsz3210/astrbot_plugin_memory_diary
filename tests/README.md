@@ -51,12 +51,15 @@ export ASTRBOT_CORE=/path/to/astrbot/core       # Linux / macOS
 ... tests\run.py -k storage             # 只跑 id 含 storage 的测试
 ... tests\run.py -v                     # 失败时打印完整 traceback
 ... tests\run.py --fail-fast            # 第一个失败就停
-... tests\run.py --baseline-only        # 只跑 baseline 的健全性检查（不导入 refactor）
+... tests\run.py --baseline-only        # 只做 baseline 的健全性检查（差分场景不比较 refactor）
 ```
 
-`--baseline-only` 模式用于**重构进行中**：此时只实例化原始插件，场景断言照常执行，
-但跳过“需要 baseline + refactor 双方”的 5 个加载测试和 1 个交叉迁移包测试，并跳过双方文件比较。
-这样即使当前实现正在编辑、甚至暂时无法 import，也能确认原始行为基线。
+`--baseline-only` 模式用于**重构进行中**：差分场景只实例化原始插件、跳过双方比较，
+并跳过“需要 baseline + refactor 双方”的 5 个 `test_load` + 1 个 `test_bundle` 交叉迁移包
++ 2 个 `test_compat_v054_v055` 用例（共 8 条）。
+**注意**：`test_v055_features.py`、`test_v055_lowfix.py` 等只驱动 refactor 的用例仍会
+实例化 refactor，所以“refactor 完全不导入”只在纯差分场景范围内成立；当前结果约为
+`141 passed / 8 skipped`（正式全量是 149 passed）。
 
 退出码：0 = 全部通过 / 跳过；1 = 有失败。
 
@@ -75,10 +78,9 @@ export ASTRBOT_CORE=/path/to/astrbot/core       # Linux / macOS
 
 ## 本次运行结果（harness 自检）
 
-2026-10-28 时点、v0.5.0 / `main`：
+2026-10-30 时点、v0.5.5 / `main`（含第二轮低危清理）：
 
-* 差分模式：`71 passed, 0 failed, 0 skipped`（约 6 秒，Windows + Python 3.12.15）
-* baseline-only：`65 passed, 0 failed, 6 skipped`（6 个 skip 均为“需要双方”的显式跳过）
+* 差分模式：`149 passed, 0 failed, 0 skipped`（约 7 秒，Windows + Python 3.12）
 
 ---
 
@@ -104,7 +106,9 @@ tests/
 ├── test_web.py            # 日记本 Web API（列表/读取/导出/导入/偏好/图片/密码闸）
 ├── test_llm_request.py    # on_llm_request 注入、reset 代际、群聊过滤、哨兵阈值
 ├── test_auto_diary.py     # 每天定时自动写日记 tick、用户登记、失败通知、生命周期
-└── test_bundle.py         # 迁移包校验/安装、换钥匙重签名、跨实现互导
+├── test_bundle.py         # 迁移包校验/安装、换钥匙重签名、跨实现互导
+├── test_v055_features.py  # v0.5.5 新功能：白名单/零宽字符/一键备份/token 估算与校准（只驱动 refactor）
+└── test_v055_lowfix.py    # v0.5.5 低危清理：原文验签（读/迁移包/主人解析）/素材哈希清理/冷却兜底/stat 竞态/双向互斥与锁粒度/全角参数（只驱动 refactor）
 ```
 
 ## 差分机制
@@ -135,7 +139,7 @@ tests/
   篡改条目“读取拒绝 + 整次保存拒绝”；损坏 zip 的 CRC 检测与 `.corrupt-<时间>.zip` 隔离；
   删除单天/区间/全部；注入范围前缀 `latest/all/days:N/range:` 解析与选择；
   备忘每场景 20 条上限、场景过滤、写日记后按场景吸收、闭合标签消毒；
-  素材游标只读取新增历史、`last_extra_hash` 去重、偏好/游标/素材哈希落盘；
+  素材游标只读取新增历史、`last_extra_hash` 去重、偏好/游标落盘（第二轮起不再写 `last_material_hash`）；
   v1 明文 `.md+.sig`、v2 单篇 zip、v3 平铺按天、v3 按篇命名四种迁移，含验签失败跳过。
 * **指令**（直接调用 handler，消费 async generator；yield 与 `event.send` 的消息都收集）：
   帮助、群聊 @ 防冲突/`group_require_at`；备忘增/查/删（序号、全部、取消、非交互降级）；
@@ -163,6 +167,36 @@ tests/
   内层验签失败、缺签名、空日记全部拒绝；`_install_bundle` 的 same_key / resign 两种模式、
   错主人拒绝且不落盘；baseline 导出的包含已用 baseline 自己的密钥签名，refactor 能原样导入
   （反向亦然），两边最终数据目录摘要一致。
+* **v0.5.5 新功能**（`test_v055_features.py`；行为与 baseline 有意不同，故**只驱动 refactor 侧**）：
+  白名单解析与空名单全放行、名单外指令静默/注入与哨兵被挡/定时任务登记与触发过滤；
+  零宽与方向控制字符在 `_command_arg`/`memo_cmd` 被剥离；指令 token 内文本 @ 一律沉默
+  （旧配置 `bot_call_names` 残留失效）；Web `export_all` 一键备份（含全部用户、不含 `.diary_key`、
+  附 `备份说明.txt`）；token 估算器纯函数（分类加权/消息与多模态开销/两入口一致）；
+  EWMA 校准更新、钳制与异常跳过、`token_calibration.json` 持久化往返、
+  请求→响应全链路；v2 关闭时状态行与旧格式逐字一致；v2 下 `/日记状态`、手动写日记门槛
+  与哨兵复用同一个估算数；日记注入后校准样本 E 会按最终请求重算；`/日记密码` 参数零宽剥离；
+  旧配置 `enable_context_watch` 键保留在 schema 中（AstrBot 不会清洗掉，迁移能命中）；
+  校准 key 用 `provider_config["id"]` 拼 `provider::model`。
+
+* **v0.5.5 低危清理**（`test_v055_lowfix.py`；行为与 baseline 有意不同，故**只驱动 refactor 侧**）：
+  读路径/迁移包校验/Web 主人解析都用 zip 原文验签（带行尾空白的合法日记可读、可导出导入、
+  改内容仍判篡改）；`last_material_hash` 不再写入且旧字段被清理；`_op_cooldown_remaining`
+  在 aware/naive 混存时按无冷却兜底；`web_list_users` 的 stat 竞态失败只降级 size=0；
+  手动写与自动写双向互斥、锁粒度是 sender_id（同群不同用户不互拒、同用户跨场景互斥）、
+  占位前复查（门槛 await 期间被插队也不写盘）、哨兵/每天定时两处锁键护栏（锁被占时不调 LLM
+  不写盘）；全角空格分隔的指令参数解析不变。
+
+## 差分与 v0.5.5 的相处方式
+
+* `tests/harness/world.py` 的 `DEFAULT_CONFIG` 固定 `token_estimation_v2=False`、
+  `token_calibration_enabled=False`、`allowed_users=""`——差分套件默认走旧公式路径，
+  保证与 v0.5.4 baseline 逐字节可比；新行为由 `test_v055_features.py` 单独验证。
+* 有意改文案的差分豁免集中在 `World.normalise_text`：v0.5.5 注入模板新增的小标题说明句
+  在两边比较前统一归一掉（见 `_INJECT_TEMPLATE_V055_SENTENCE`），语义断言不受影响。
+* 第二轮低危清理的差分豁免在 `harness/compare.py::normalise_bytes`：`last_material_hash` 已废弃，
+  baseline 仍写、refactor 不再写并在偏好重写时清掉；比较前统一删掉该键（只命中 JSON，
+  zip 条目不受影响）。`test_storage` 的 `pref_keys` 也显式排除了这个死字段。
+* v0.5.5 新增的 Web 路由 `/export_all` 与 handler 在 `test_load.py` 里对 baseline 侧补齐后再比较。
 
 ## 测试环境的边界（诚实说明，没有静默跳过）
 
@@ -192,11 +226,50 @@ tests/
 * 迁移包导入：QQ 指令路径要求包内主人 QQ 与发送者一致；已存在本地日记 zip 时拒绝覆盖；
   Web 导入是管理员操作，允许换绑原主人入口，但仍用本机密钥重新签名。
 * 群聊注入过滤只过滤“写于私聊”的片段；旧格式无场景标记的片段按私聊处理（宁可不注入）。
-* 指令在群聊里按 `bot_call_names`/At 组件/`group_require_at` 决定是否响应；
+* 指令在群聊里按 At 组件/`group_require_at` 决定是否响应（v0.5.5 起删除 `bot_call_names`，
+  指令 token 内的文本 @ 一律视为叫别人、保持沉默——该差异由 `test_v055_features.py` 单独固定）；
   群聊里查看/删除/导出/导入/密码等隐私操作一律拒绝并提示私聊。
 * 无新素材时 `/日记` 默认写“她的日常随笔”，同一天只写一篇；关闭该配置后返回固定文案。
 * 非交互环境（`_SESSION_WAITER_OK=False`）时：查看日记降级为直接显示最新一篇，
   删除日记明确拒绝改动，导入提示去 Web 页面——都不静默改数据。
+
+## 发布收尾检查（改完源码后必做）
+
+发布包 `astrbot_plugin_memory_diary_v0.5.5.zip` 是**快照**，不是源码目录的符号链接：
+改了源码却不重建 zip，发布包就还是旧代码（v0.5.5 遗留问题修复报告 §0 硬约束第 5 条）。
+当前发布目录里的 `..._v0.5.5.zip` 已经是**修复后构建**（sha256 `6903d823…`），不存在单独的
+`..._patched.zip`；重建时直接覆盖同名 `..._v0.5.5.zip`。
+每次改完源码按下面顺序收尾：
+
+1. **跑全量测试**：`tests\run.py` 必须全绿；把最终 passed / failed / skipped 数同步到
+   `CHANGELOG.md`、`RELEASE_NOTES_v0.5.5.md` 与本文档（三处数字保持一致）。
+2. **重建发布 zip**：只打包 21 个运行时文件（脚本见 `v0.5.5 遗留问题修复报告_给下一个AI.md` 第 0 节）。
+   zip 根目录名必须是 `astrbot_plugin_memory_diary/`；**不要从 `_extract/` 重打包**
+   （那是旧一轮解包目录，带 `__pycache__`）。
+3. **逐文件 SHA256 对比源码**：解压 zip，对每个文件取 SHA256，与源码目录同名文件逐一比对，
+   任何一处不一致都不算通过（下面是 Windows PowerShell 写法，`<用户名>` 按实际替换）：
+   ```powershell
+   $root = "C:\Users\<用户名>\Desktop\记忆日记"
+   $src  = "$root\记忆日记v0.5.4+版本更新工作\源码_v0.5.5"
+   $zip  = "$root\记忆日记发布_v0.5.5\astrbot_plugin_memory_diary_v0.5.5.zip"
+   $tmp  = Join-Path $env:TEMP "md_zip_verify"
+   Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+   Expand-Archive $zip $tmp
+   $pkg  = Join-Path $tmp "astrbot_plugin_memory_diary"
+   $files = Get-ChildItem $pkg -Recurse -File
+   "文件数：$($files.Count)（应为 21）"
+   $mismatch = $files | Where-Object {
+       $rel = $_.FullName.Substring($pkg.Length + 1)
+       (Get-FileHash $_.FullName -Algorithm SHA256).Hash -ne
+       (Get-FileHash (Join-Path $src $rel) -Algorithm SHA256).Hash
+   }
+   if ($mismatch) { "SHA256 不一致："; $mismatch.FullName } else { "全部文件 SHA256 一致" }
+   ```
+4. **包内禁入项自查**：zip 里**不得含** `.diary_key`（及任何 `*key*` 密钥文件）、
+   `tests/`、`baseline/`、`__pycache__/`、`*.corrupt-<时间戳>.zip`、`diary_*.zip`、
+   `*.tmp` / `*.tmp-<pid>` 临时残骸；解压后 `Get-ChildItem -Recurse` 看一遍确认。
+5. **安装验收**：用发布 zip 在本机 AstrBot 重装并重载插件，确认配置页、`/日记状态`、
+   日记本页面与 Web 一键备份均正常，再对外发布。
 
 ## 如何新增场景
 

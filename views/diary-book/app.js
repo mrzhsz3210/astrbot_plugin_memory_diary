@@ -605,8 +605,53 @@ function renderDayListActive() {
 }
 
 /* ---------- 导出 / 导入 ---------- */
+/* 一键备份全部用户日记（管理员）：只含日记 zip，不含签名钥匙 */
+async function doBackupAll() {
+  try {
+    const r = await bridge.download(
+      "export_all",
+      {},
+      "memory_diary_backup.zip"
+    );
+    toast(
+      `备份包已下载：${r.filename}（不含签名钥匙；整机迁移请连同主密钥 .diary_key 一起备份）`,
+      6000
+    );
+  } catch (e) {
+    toast(e.message || "备份失败", 4500);
+  }
+}
+
+/* 一键备份全部用户日记 → 存到本机「下载」文件夹并打开位置（面板须开在本机） */
+async function doBackupAllLocal() {
+  try {
+    const r = await bridge.apiGet("export_all_local");
+    toast(
+      `已存到「下载」文件夹并打开位置：${r.filename}` +
+        "（不含签名钥匙；整机迁移请连同主密钥 .diary_key 一起备份）",
+      6000
+    );
+  } catch (e) {
+    const msg = e.message || "";
+    toast(
+      msg.includes("REMOTE_PANEL")
+        ? "管理面板不在服务器本机，无法自动打开文件夹；请改用「备份全部日记（管理员）」下载到浏览器"
+        : msg || "备份失败",
+      6000
+    );
+  }
+}
+
 /* mode: "browser" 浏览器下载 ｜ "local" 存到本机下载文件夹并打开位置（面板须开在本机） */
 async function doExport(mode) {
+  if (mode === "backup_all") {
+    await doBackupAll();
+    return;
+  }
+  if (mode === "backup_all_local") {
+    await doBackupAllLocal();
+    return;
+  }
   const u = users.find((x) => x.file_key === currentKey);
   if (!u) return;
 

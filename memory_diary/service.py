@@ -9,11 +9,11 @@ AstrBot。真正的消息平台适配留在 main.py。
 """
 
 import asyncio
-import hashlib
 import inspect
 import json
 import os
 import re
+import secrets
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -27,12 +27,17 @@ from .constants import (
     AUTO_DIARY_STATE_FILE,
     AUTO_DIARY_USERS_FILE,
     BRIEF_SYSTEM_PROMPT,
+    CALIB_EWMA_ALPHA,
+    CALIB_FACTOR_MAX,
+    CALIB_FACTOR_MIN,
+    CALIB_RATIO_SKIP,
     CHARS_PER_TOKEN,
     DIARY_SYSTEM_PROMPT,
     ERR_NO_NEW_MATERIAL,
     LIFE_SYSTEM_PROMPT,
     _STATE_CAP,
 )
+from .token_estimator import estimate_messages, estimate_request
 from .errors import (
     DiaryCorruptError,
     DiaryKeyUnavailable,
@@ -338,17 +343,14 @@ class ServiceMixin:
         has_merge_material = requested == "full" and bool(briefs)
         new_material = bool(convo_text or memos)
         no_new_material = not new_material and not has_merge_material
-        material_hash = (
-            hashlib.md5(convo_text.encode("utf-8")).hexdigest() if convo_text else ""
-        )
 
         if no_new_material:
             if not allow_life:
                 return None, ERR_NO_NEW_MATERIAL
             if not bool(self.config.get("empty_diary_as_life", True)):
                 return None, "距离上次写日记还没有新的聊天内容，今天没有什么可记的啦"
-            # 同一天最多写一篇"她的日常随笔"：否则素材哈希永远不变，
-            # 每 5 分钟一次的冷却一过又会写一篇，当天文件会被随笔刷屏
+            # 同一天最多写一篇"她的日常随笔"：无新对话时素材游标不会前进，
+            # 每过一遍操作冷却又会触发一次，当天文件会被随笔刷屏
             if self._load_pref_data(sender_id).get(
                 "last_life_day"
             ) == self._now().strftime("%Y%m%d"):
@@ -493,7 +495,6 @@ class ServiceMixin:
                 mode=mode,
                 absorb_headers=absorb_headers,
             )
-            self._save_material_hash(sender_id, material_hash)
             # 记录本次读到的历史边界，下一次只取游标之后的新消息。
             # 自动触发时当前消息可能还没进 history，记下它的哈希，下一轮跳过。
             last_msg_hash = (
@@ -588,8 +589,37 @@ class ServiceMixin:
         return canned
     # ------------------------- 上下文哨兵 -------------------------
 
+    def _token_estimation_v2(self) -> bool:
+        """改进版 token 估算开关（实验性功能，默认关闭）；关闭回退 v0.5.4 旧公式。"""
+        return bool(self.config.get("token_estimation_v2", False))
+
+    def _context_limit(self) -> int:
+        """模型上下文窗口（tokens）；0 或负数表示哨兵与比例门槛停用。
+
+        不能用 ``config.get(...) or 60000`` 读取——那样 0 会被静默当成默认
+        60000，管理员想用 0 停用哨兵时会看起来"配置没生效"。这里只在缺省/
+        非法值时回退默认 60000，0/负数原样返回，由调用方按"停用"处理：
+        哨兵不判定、`/日记状态` 不显示百分比、手动写日记的比例门槛跳过。
+        """
+        try:
+            return int(self.config.get("context_token_limit", 60000))
+        except (TypeError, ValueError):
+            return 60000
+
+    def _calibration_enabled(self) -> bool:
+        """EWMA 自适应校准开关（实验性功能，默认关闭；仅改进版估算开启时生效）。"""
+        return self._token_estimation_v2() and bool(
+            self.config.get("token_calibration_enabled", False)
+        )
+
     def _estimate_tokens(self, req: ProviderRequest) -> int:
-        """粗略估算本次请求携带的上下文 token 数。"""
+        """估算本次请求携带的上下文 token 数（静态估算，不含校准系数）。
+
+        token_estimation_v2 开启：按字符类别加权 + 消息/工具/多模态开销；
+        关闭：旧公式（字符数 ÷ 1.8），行为与 v0.5.4 完全一致。
+        """
+        if self._token_estimation_v2():
+            return estimate_request(req)
         total_chars = len(req.system_prompt or "") + len(req.prompt or "")
         for msg in getattr(req, "contexts", None) or []:
             if isinstance(msg, dict):
@@ -597,6 +627,194 @@ class ServiceMixin:
             else:
                 total_chars += len(str(msg))
         return int(total_chars / CHARS_PER_TOKEN)
+
+    async def _estimate_history_tokens(self, umo: str) -> int:
+        """手动写日记门槛与 /日记状态 共用：按会话历史估算占用（含校准系数）。
+
+        v2 走与哨兵同一个 estimator（同输入必同输出）；关闭时用旧公式。
+        """
+        history = await self._get_history(umo)
+        if not self._token_estimation_v2():
+            chars = 0
+            for msg in history:
+                if isinstance(msg, dict):
+                    chars += len(self._content_to_text(msg.get("content", "")))
+                else:
+                    chars += len(str(msg))
+            return int(chars / CHARS_PER_TOKEN)
+        base = estimate_messages(history)
+        key = await self._provider_key(umo)
+        return int(base * self._calib_factor(key))
+
+    async def _context_used(self, umo: str) -> int:
+        """当前上下文占用：v2 下与哨兵同口径，供状态页和手动门槛复用。
+
+        优先取最近一次请求时哨兵算出的 used（同一会话、同一窗口大小）——
+        这样 /日记状态、手动写日记门槛看到的百分比和哨兵判定完全一致，
+        不会再出现"哨兵说该写了、状态页说没满"。没有可用记录（还没发过
+        请求 / 哨兵停用 / 窗口大小刚改过）时回退按历史估算。
+        旧公式路径保持 v0.5.4 的历史口径不变。
+        """
+        if self._token_estimation_v2():
+            info = self._last_context_used.get(umo)
+            limit = self._context_limit()
+            if limit > 0 and info and int(info.get("limit", -1)) == limit:
+                return int(info.get("used", 0) or 0)
+        return await self._estimate_history_tokens(umo)
+
+    async def _context_calib_key(self, umo: str) -> str:
+        """观测行用的 provider::model：优先复用哨兵最近一次请求记下的 key。"""
+        if self._token_estimation_v2():
+            info = self._last_context_used.get(umo)
+            limit = self._context_limit()
+            if limit > 0 and info and int(info.get("limit", -1)) == limit and info.get("key"):
+                return str(info["key"])
+        return await self._provider_key(umo)
+
+    async def _stage_pending_estimate(self, umo: str, req) -> None:
+        """P2-1：暂存本次静态估算 E，供 on_llm_response 拿到真实 usage 后校准。
+
+        与“上下文哨兵是否启用”解耦：用户把提醒/自动写两档阈值都设 0（合法配置）
+        或 context_token_limit<=0 时，_watch_context 会提前返回；过去暂存写在
+        _watch_context 里，导致这些用户的 EWMA 永远不更新。现在由 on_llm_request
+        统一暂存，_watch_context 只负责阈值判定。
+
+        v2 或校准关闭时不暂存，保持 v0.5.4 行为不变（差分套件默认两者都关闭）。
+        """
+        if not self._calibration_enabled():
+            return
+        try:
+            key = await self._provider_key(umo, req)
+            if not key:
+                return
+            self._pending_estimates[umo] = {
+                "key": key,
+                "estimate": self._estimate_tokens(req),
+            }
+            self._cap_state(self._pending_estimates)
+        except Exception as e:
+            logger.debug(f"[memory_diary] 暂存校准估算失败: {e}")
+
+    def _refresh_pending_estimate(self, umo: str, req) -> None:
+        """日记注入完成后重算本次静态估算，让校准样本 E 与真实请求同口径。
+
+        on_llm_request 里哨兵先于注入执行（触发判定必须尽早），若拿注入前的
+        E 去对注入后的 actual 做 EWMA，样本会被系统性抬高（persist_inject
+        每轮都会发生）。注入完成后重算一次即可消除这部分偏差。
+        """
+        pending = self._pending_estimates.get(umo)
+        if not pending or not self._token_estimation_v2():
+            return
+        try:
+            pending["estimate"] = self._estimate_tokens(req)
+        except Exception as e:
+            logger.debug(f"[memory_diary] 重算校准估算失败: {e}")
+
+    # ---- token 估算自适应校准（EWMA，按 provider::model 持久化） ----
+
+    async def _provider_key(self, umo: str, req=None) -> str:
+        """校准系数的键 provider::model；取不到返回空串（该次不参与校准）。
+
+        provider 段优先用配置里的 provider id（``provider_config["id"]``）：
+        标准 AstrBot Provider 实例没有 ``provider_id`` 属性，且 ``meta`` 是方法
+        不是属性，所以先把 ``meta()`` 调出来再兜底取 id/name。
+        """
+        try:
+            provider = await self.context.get_using_provider_async(umo=umo)
+        except Exception:
+            return ""
+        if provider is None:
+            return ""
+        cfg = getattr(provider, "provider_config", None)
+        cfg_id = str(cfg.get("id", "") or "") if isinstance(cfg, dict) else ""
+        meta = getattr(provider, "meta", None)
+        if callable(meta):
+            try:
+                meta = meta()
+            except Exception:
+                meta = None
+        name = str(
+            getattr(provider, "provider_id", "")
+            or cfg_id
+            or getattr(meta, "id", "")
+            or getattr(meta, "name", "")
+            or type(provider).__name__
+        )
+        model = ""
+        if req is not None:
+            model = str(getattr(req, "model", "") or "")
+        if not model:
+            model = str(
+                getattr(provider, "model", "")
+                or getattr(provider, "model_name", "")
+                or ""
+            )
+        return f"{name}::{model}" if model else name
+
+    def _calib_table(self) -> dict:
+        if self._token_calib is None:
+            self._token_calib = self._load_token_calibration()
+        return self._token_calib
+
+    def _calib_factor(self, key: str) -> float:
+        """某 provider::model 的当前校准系数；无样本/未开启时 1.0（纯静态估算）。"""
+        if not key or not self._calibration_enabled():
+            return 1.0
+        rec = self._calib_table().get(key)
+        if not rec:
+            return 1.0
+        factor = float(rec.get("factor", 1.0))
+        return min(max(factor, CALIB_FACTOR_MIN), CALIB_FACTOR_MAX)
+
+    def _calib_status_line(self, key: str) -> str:
+        """/日记状态 的校准观测行；无样本或未开启时返回空串。"""
+        if not key or not self._calibration_enabled():
+            return ""
+        rec = self._calib_table().get(key)
+        if not rec or not rec.get("samples"):
+            return ""
+        # P3-8：显示也按读取口径钳制，避免手改/坏文件出现“系数 99.00”
+        # 但实际按 5.00 计算的观感不一致。
+        factor = min(
+            max(float(rec.get("factor", 1.0)), CALIB_FACTOR_MIN), CALIB_FACTOR_MAX
+        )
+        return (
+            f"· 校准：上次实际 {int(rec.get('last_actual', 0)):,}"
+            f"（系数 {factor:.2f}，"
+            f"样本 {int(rec.get('samples', 0))}，{key}）"
+        )
+
+    def _update_calibration(self, key: str, estimate: int, actual: int):
+        """EWMA 自适应：factor = factor×0.8 + (actual/E)×0.2，钳制 [0.3, 5.0]。
+
+        actual 或 E 为 0、比例异常（>10 倍或 <1/10）时跳过本次更新。
+        """
+        if not key or estimate <= 0 or actual <= 0:
+            return
+        ratio = actual / estimate
+        if ratio > CALIB_RATIO_SKIP or ratio < 1 / CALIB_RATIO_SKIP:
+            logger.debug(
+                f"[memory_diary] token 校准样本异常（E={estimate}, actual={actual}），跳过"
+            )
+            return
+        table = self._calib_table()
+        rec = table.get(key) or {"factor": 1.0, "samples": 0}
+        old = min(
+            max(float(rec.get("factor", 1.0)), CALIB_FACTOR_MIN), CALIB_FACTOR_MAX
+        )
+        new = old * (1 - CALIB_EWMA_ALPHA) + ratio * CALIB_EWMA_ALPHA
+        new = min(max(new, CALIB_FACTOR_MIN), CALIB_FACTOR_MAX)
+        table[key] = {
+            "factor": round(new, 4),
+            "samples": int(rec.get("samples", 0) or 0) + 1,
+            "last_actual": int(actual),
+            "updated": self._now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if self._save_token_calibration(table):
+            logger.debug(
+                f"[memory_diary] token 校准更新（{key}）：系数 {old:.3f} → {new:.3f}"
+                f"（E={estimate}, actual={actual}, 样本 {table[key]['samples']}）"
+            )
 
     def _watch(self, umo: str, cid: str) -> dict:
         """取/重置某会话的哨兵状态。conversation_id 变化时视为新会话。"""
@@ -608,18 +826,37 @@ class ServiceMixin:
         return state
 
     def _watch_ratios(self):
-        """读取提醒/自动写日记阈值，并强制 remind_ratio <= auto_ratio。
+        """读取提醒/自动写日记阈值（0 = 该档关闭），并强制 remind <= auto。
 
+        哨兵启用开关已并入滑条：两档都为 0 即哨兵整体停用。
+        存量兼容：老配置 enable_context_watch=false 仍存在时视为两档都关，
+        并记一次迁移日志（只读旧键、永不写入）。
         _conf_schema.json 无法表达跨字段校验，只能在读取时兜底：
-        配置颠倒时把提醒阈值截断到自动阈值并警告一次——否则"提醒"会
-        晚于"自动写日记"甚至永不触发，哨兵行为变得不可解释。
-        越界值钳制到 [0.01, 1.0]，防止 0 或大于 1 让阈值失效。
+        auto>0 且 remind>auto 时把提醒阈值截断到自动阈值并警告一次——否则"提醒"
+        会晚于"自动写日记"甚至永不触发，哨兵行为变得不可解释。
+        越界值钳制到 [0, 1]。
         """
-        remind = float(self.config.get("remind_ratio", 0.75) or 0.75)
-        auto = float(self.config.get("auto_ratio", 0.9) or 0.9)
-        remind = min(max(remind, 0.01), 1.0)
-        auto = min(max(auto, 0.01), 1.0)
-        if remind > auto:
+
+        def _ratio(name, default):
+            try:
+                v = float(self.config.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return min(max(v, 0.0), 1.0)
+
+        remind = _ratio("remind_ratio", 0.75)
+        auto = _ratio("auto_ratio", 0.9)
+        legacy = self.config.get("enable_context_watch", None)
+        if legacy is not None and not bool(legacy):
+            if not self._watch_migrate_warned:
+                self._watch_migrate_warned = True
+                logger.warning(
+                    "[memory_diary] 检测到旧配置 enable_context_watch=false：哨兵已停用。"
+                    "该开关已并入阈值滑条（0 = 不提醒 / 不自动写），"
+                    "请到插件配置页确认两档阈值后可忽略此提示"
+                )
+            return 0.0, 0.0
+        if auto > 0 and remind > auto:
             if not self._ratio_warned:
                 self._ratio_warned = True
                 logger.warning(
@@ -631,30 +868,48 @@ class ServiceMixin:
 
     async def _watch_context(self, event: AstrMessageEvent, req: ProviderRequest):
         """估算上下文占用，触发提醒 / 自动写日记。"""
-        if not bool(self.config.get("enable_context_watch", True)):
-            return
-
-        limit = int(self.config.get("context_token_limit", 60000) or 60000)
+        limit = self._context_limit()
         remind_ratio, auto_ratio = self._watch_ratios()
-        if limit <= 0:
+        if limit <= 0 or (remind_ratio <= 0 and auto_ratio <= 0):
             return
 
-        used = self._estimate_tokens(req)
+        umo = event.unified_msg_origin
+        base = self._estimate_tokens(req)
+        key = ""
+        if self._token_estimation_v2():
+            # P2-1：校准样本暂存已上移到 on_llm_request（与哨兵启用解耦）；
+            # 这里复用那一份 provider key，保证判定与样本用同一个 key。
+            staged = self._pending_estimates.get(umo)
+            key = str((staged or {}).get("key") or "")
+            if not key:
+                key = await self._provider_key(umo, req)
+        used = int(base * self._calib_factor(key))
+        if self._token_estimation_v2():
+            # 记下本次哨兵口径的占用，供 /日记状态 与手动写日记门槛复用：
+            # 三处看到同一个数，避免"哨兵说该写了、状态页说没满"。
+            self._last_context_used[umo] = {
+                "used": used,
+                "limit": limit,
+                "key": key,
+            }
+            self._cap_state(self._last_context_used)
         ratio = used / limit
         if ratio < remind_ratio:
             return
 
-        umo = event.unified_msg_origin
         cid = await self._curr_cid(umo)
         state = self._watch(umo, cid)
         pct = int(ratio * 100)
 
-        if ratio >= auto_ratio and not state["auto_written"]:
-            if umo in self._writing:
-                return  # 上一次自动写日记还没写完，避免并发
-            self._writing.add(umo)
+        if auto_ratio > 0 and ratio >= auto_ratio and not state["auto_written"]:
+            sender_id = event.get_sender_id()
+            # 互斥锁的粒度是 sender_id，不是会话 umo：写的是 diary_<sender_id>.zip。
+            # 同一群里不同用户各写各的日记，不能互相阻塞；同一用户的私聊/群聊写
+            # 同一个 zip，必须互斥（手动、哨兵、每天定时共用这把锁）。
+            if sender_id in self._writing:
+                return  # 该用户已有写日记流程在进行
+            self._writing.add(sender_id)
             try:
-                sender_id = event.get_sender_id()
                 sender_name = event.get_sender_name() or sender_id
                 diary, err = await self._write_diary(
                     umo,
@@ -668,8 +923,14 @@ class ServiceMixin:
                     from_auto=True,
                 )
             finally:
-                self._writing.discard(umo)
+                self._writing.discard(sender_id)
 
+            # 每代际（每个 conversation_id）只自动尝试一次：_write_diary 返回 err 时
+            # 也置位，本代际不再重试——否则 LLM 网络抖动时每轮请求都会重试、连续刷
+            # 失败提示并反复打 provider；用户已经从失败提示里拿到 /日记（手动重试）
+            # 和 /reset 两个出口。其中 ERR_NO_NEW_MATERIAL 是确定性结果（确实没有
+            # 新内容），重试无意义。（_write_diary 内部已捕获各类异常并转成 err；
+            # 若它抛出未捕获异常，则走不到这里，下一次请求会重新尝试。）
             state["auto_written"] = True
             state["reminded"] = True
             if err == ERR_NO_NEW_MATERIAL:
@@ -729,7 +990,7 @@ class ServiceMixin:
                     )
                 )
 
-        elif ratio >= remind_ratio and not state["reminded"]:
+        elif remind_ratio > 0 and ratio >= remind_ratio and not state["reminded"]:
             state["reminded"] = True
             canned = (
                 f"📝 小提醒：我们的上下文已用约 {pct}%（估算 {used}/{limit} tokens）。"
@@ -789,7 +1050,7 @@ class ServiceMixin:
     def _save_auto_users(self) -> bool:
         try:
             path = self._auto_diary_users_path()
-            tmp = path.with_name(path.name + ".tmp")
+            tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
             tmp.write_text(
                 json.dumps({"users": self._auto_users}, ensure_ascii=False),
                 encoding="utf-8",
@@ -811,6 +1072,8 @@ class ServiceMixin:
             umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
             if not sender_id or not umo:
                 return
+            if not self._is_allowed(sender_id):
+                return  # 白名单外的用户不登记进定时自动写日记名单
             try:
                 name = event.get_sender_name() or ""
             except Exception:
@@ -859,6 +1122,8 @@ class ServiceMixin:
             sender_id = parts[-1].strip()
             if not sender_id:
                 continue
+            if not self._is_allowed(sender_id):
+                continue  # 白名单外的用户不补进定时自动写日记名单
             rec = self._auto_users.get(sender_id)
             name = str(rec.get("name") or "") if rec else ""
             if not name:
@@ -897,7 +1162,7 @@ class ServiceMixin:
     def _save_auto_state(self, state: dict) -> bool:
         try:
             path = self._auto_diary_state_path()
-            tmp = path.with_name(path.name + ".tmp")
+            tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
             tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, path)
             return True
@@ -1002,6 +1267,19 @@ class ServiceMixin:
             + self._full_count_for_scene(content, "group")
         )
 
+    def _full_diary_count_today(self, sender_id: str, is_group: bool) -> int:
+        """今天当前场景已写的完整日记篇数（用于 /日记 完整 后的名额提示）。"""
+        entry = self._md_entry(self._now().strftime("%Y%m%d"))
+        entries = self._list_entries(sender_id)
+        if entry not in entries:
+            return 0
+        content, tampered = self._load_entry(sender_id, entry)
+        if tampered:
+            return 0
+        return self._full_count_for_scene(
+            content, "group" if is_group else "private"
+        )
+
     async def _run_auto_diaries(self, day: str):
         """给登记过的私聊用户逐个写完整日记；单个失败继续下一个，不重试。"""
         users = list(self._auto_users.items())
@@ -1012,12 +1290,17 @@ class ServiceMixin:
         for sender_id, rec in users:
             sender_id = str(sender_id)
             rec = rec if isinstance(rec, dict) else {}
+            if not self._is_allowed(sender_id):
+                # 真正触发前再过一遍白名单：管理员收紧名单后无需重启，
+                # 已登记的用户也不再被写
+                skipped += 1
+                continue
             umo = str(rec.get("umo") or "").strip()
             if not umo:
                 skipped += 1
                 continue
-            if umo in self._writing:
-                # 同一会话正在被哨兵自动写/上一次自动写，避免并发
+            if sender_id in self._writing:
+                # 同一用户已有写日记流程（手动/哨兵/定时）在进行，避免并发重写 zip
                 skipped += 1
                 continue
             try:
@@ -1030,7 +1313,7 @@ class ServiceMixin:
                 )
                 skipped += 1
                 continue
-            self._writing.add(umo)
+            self._writing.add(sender_id)
             diary, err = None, None
             try:
                 diary, err = await self._write_diary(
@@ -1044,7 +1327,7 @@ class ServiceMixin:
             except Exception as e:
                 err = f"自动写日记异常：{e}"
             finally:
-                self._writing.discard(umo)
+                self._writing.discard(sender_id)
             if diary:
                 wrote += 1
                 await self._notify_auto_diary_success(umo, diary)

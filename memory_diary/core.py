@@ -6,10 +6,12 @@ Web API 与主动消息发送留在 main.py。
 """
 
 import re
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from .common import strip_invisible
 from .constants import PLUGIN_NAME, _STATE_CAP
 from .log import logger
 from .service import ServiceMixin
@@ -106,6 +108,17 @@ class MemoryDiaryCore(StorageMixin, ServiceMixin):
         self._tz_warned = False
         # 阈值顺序被截断只警告一次
         self._ratio_warned = False
+        # 旧开关 enable_context_watch 的迁移提示只记一次
+        self._watch_migrate_warned = False
+
+        # token 估算校准：umo -> {"key": provider::model, "estimate": int}
+        # （on_llm_request 暂存本次静态估算，on_llm_response 拿真实用量后消费）
+        self._pending_estimates: dict = {}
+        # 最近一次请求时「哨兵口径」的上下文占用：umo -> {"used","limit","key"}
+        # 供 /日记状态 与手动写日记门槛复用，保证三处显示同一个数（v2 估算下）
+        self._last_context_used: dict = {}
+        # 校准系数内存缓存（None 表示尚未从 token_calibration.json 加载）
+        self._token_calib = None
 
         # 每天定时自动写完整日记：后台任务、私聊用户登记表、当天触发状态
         self._auto_task = None
@@ -115,6 +128,34 @@ class MemoryDiaryCore(StorageMixin, ServiceMixin):
         self._auto_time_warned = ""
         # 插件是否已进入终止流程：终止后即使还有旧 handler 被派发也不许再起后台任务
         self._terminated = False
+
+    # ------------------------- 白名单 -------------------------
+
+    def _allowed_user_ids(self) -> set:
+        """解析配置的用户白名单；空配置返回空集（表示不限制，向后兼容）。
+
+        P3-12：管理员从聊天里复制/粘贴的 QQ 号可能带零宽、方向控制字符或
+        全角数字，解析前统一剥离不可见字符并做 NFKC 归一，否则 ID 精确匹配
+        会把管理员自己挡在门外。
+        """
+        raw = strip_invisible(str(self.config.get("allowed_users", "") or ""))
+        raw = unicodedata.normalize("NFKC", raw)
+        return {t for t in re.split(r"[,，、\s]+", raw) if t}
+
+    def _is_allowed(self, sender_id) -> bool:
+        """白名单判定（纯逻辑、无 AstrBot 依赖）。
+
+        - 名单为空 → 恒 True（老用户零感知）；
+        - 名单非空且 sender_id 为空/不在名单 → False（fail closed，取不到身份一律不放行）；
+        - ID 按字符串精确匹配。
+        """
+        allowed = self._allowed_user_ids()
+        if not allowed:
+            return True
+        sid = str(sender_id or "").strip()
+        if not sid:
+            return False
+        return sid in allowed
 
     async def initialize(self):
         """插件被激活时调用：载入自动写日记的私聊用户表，启动后台定时任务。"""
@@ -211,3 +252,5 @@ class MemoryDiaryCore(StorageMixin, ServiceMixin):
         self._writing.clear()
         self._op_last.clear()
         self._reset_pending.clear()
+        self._pending_estimates.clear()
+        self._last_context_used.clear()

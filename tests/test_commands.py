@@ -219,7 +219,8 @@ async def test_write_diary_command_first_full_then_brief():
                 "content1_info": content1_info,
                 "content2_info": content2_info,
                 "calls": len(inst.provider.calls),
-                "prompts": inst.provider.call_digest(),
+                # v0.5.5 起日记提示词在 refactor 侧口吻化，两边 system 内容
+                # 不再逐字节一致，不再做 call_digest 差分；语义断言见下方
             }
 
         pair = await world.run_pair(scenario, label="write command")
@@ -961,7 +962,8 @@ async def test_persona_voice_for_notices_and_diary_system_prompt():
             return {
                 "memo": memo,
                 "written": written,
-                "calls": inst.provider.call_digest(),
+                # v0.5.5 起日记提示词在 refactor 侧口吻化，call_digest 的
+                # system_sha 两边不再一致，差分只保留语义字段
                 "persona_in_memo_system": "你是小深" in calls[0]["system_prompt"],
                 "persona_in_diary_system": "你是小深" in calls[1]["system_prompt"],
                 "persona_in_notice_system": "你是小深" in calls[2]["system_prompt"],
@@ -978,4 +980,60 @@ async def test_persona_voice_for_notices_and_diary_system_prompt():
         assert value["persona_in_notice_system"] is True
         assert value["diary_prompt_has_memo"] is True
         assert value["entries"] == ["diaries/20261023.md"]
+
+
+# ---------------------------------------------------------------------------
+# P2-2 第 3 点 / P3-19：提示词契约的 refactor-only 断言
+#   差分套件里 ④ 注入模板的新增句被 World.normalise_text 整句归一化掉、
+#   日记提示词也不参与字节比较，所以「四个部分 / 顺序固定 / 小标题由人设」
+#   这类承诺必须在这里单独钉住，否则文案丢失不会有任何告警。
+# ---------------------------------------------------------------------------
+
+
+def _refactor_constants():
+    import importlib
+
+    from harness import env, loader
+
+    main_mod = loader.get_module(env.SIDE_REFACTOR)
+    return importlib.import_module(
+        main_mod.__name__.rsplit(".", 1)[0] + ".memory_diary.constants"
+    )
+
+
+def test_diary_system_prompt_keeps_four_section_contract():
+    prompt = _refactor_constants().DIARY_SYSTEM_PROMPT
+    # ① 必须明确「四个部分」
+    assert "四个部分" in prompt
+    # ② 顺序固定且必须严格遵守
+    assert "顺序" in prompt and "严格遵守" in prompt
+    # ③ 小标题由 AI 按人设自由起名
+    assert "小标题" in prompt
+    assert "人设" in prompt
+    assert "由你自由发挥" in prompt
+    # P3-6：小标题不得用「——」包裹，避免与日记片段分隔条混淆
+    assert "——" in prompt and "分隔条" in prompt
+    # 复查补丁：用户画像必须是拟人化观察，而不是字段清单/档案表/项目符号列表
+    assert "字段清单" in prompt
+    assert "像人类观察" in prompt
+    assert "项目符号" in prompt
+    assert "编号列表" in prompt
+    assert "不得编造" in prompt
+
+
+def test_diary_system_prompt_keeps_four_section_order():
+    """顺序必须是「时间 → 画像 → 评价与感受 → 叮嘱」，改顺序会破坏日记结构。"""
+    prompt = _refactor_constants().DIARY_SYSTEM_PROMPT
+    idx_time = prompt.find("起止时间")
+    idx_profile = prompt.find("用户画像")
+    idx_eval = prompt.find("真实看法与评价")
+    idx_remind = prompt.find("叮嘱下一个自己")
+    assert -1 not in (idx_time, idx_profile, idx_eval, idx_remind)
+    assert idx_time < idx_profile < idx_eval < idx_remind
+
+
+def test_brief_prompt_is_not_four_section():
+    """简记提示词必须与完整篇区分：明确「不需要四个部分」。"""
+    brief = _refactor_constants().BRIEF_SYSTEM_PROMPT
+    assert "不需要" in brief and "四个部分" in brief
 

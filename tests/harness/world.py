@@ -34,12 +34,18 @@ LIFE_TEXT = "今天没有人来找我聊天，我翻了一会儿旧日记。"
 SECOND_DAILY = "第二篇对话素材。"
 
 # Defaults from _conf_schema.json; tests override selectively.
+# 注意：v0.5.5 的新行为默认关闭，保持与 baseline 的差分可比——
+# token_estimation_v2 / token_calibration_enabled / allowed_users 的
+# 开启态行为由 test_v055_features.py 单独驱动 refactor 侧验证。
 DEFAULT_CONFIG = {
     "enable_auto_inject": True,
     "enable_context_watch": True,
     "context_token_limit": 60000,
     "remind_ratio": 0.75,
     "auto_ratio": 0.9,
+    "token_estimation_v2": False,
+    "token_calibration_enabled": False,
+    "allowed_users": "",
     "diary_op_interval": 5,
     "write_min_ratio": 0,
     "use_persona": True,
@@ -53,7 +59,6 @@ DEFAULT_CONFIG = {
     "persist_inject": False,
     "max_history_messages": 60,
     "group_history_multiplier": 3,
-    "bot_call_names": "",
     "group_require_at": False,
     "extra_instruction": "",
     "max_full_diaries_per_day": 1,
@@ -330,6 +335,13 @@ class World:
         return result
 
     # -- normalisation ------------------------------------------------
+    # v0.5.5 注入模板差分豁免：INJECT_TEMPLATE 新增一句小标题说明，
+    # 两边比较前统一归一掉，保持与 v0.5.4 baseline 可差分比较。
+    _INJECT_TEMPLATE_V055_SENTENCE = (
+        "其中的小标题是你按自己的人设起的名字，"
+        "依次对应：时间范围 / 用户画像 / 你的评价与感受 / 给未来的叮嘱。\n\n"
+    )
+
     def normalise_text(self, text: str, inst: Instance) -> str:
         replacements = [
             (str(inst.data_dir), "<DATA_DIR>"),
@@ -337,7 +349,7 @@ class World:
             (str(inst.captured_dir), "<CAPTURED_DIR>"),
             (str(self.tmp), "<WORLD_TMP>"),
         ]
-        out = text
+        out = text.replace(self._INJECT_TEMPLATE_V055_SENTENCE, "")
         for needle, marker in replacements:
             out = out.replace(needle, marker)
             out = out.replace(needle.replace("\\", "\\\\"), marker)

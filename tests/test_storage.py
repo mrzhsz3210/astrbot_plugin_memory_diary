@@ -269,7 +269,6 @@ async def test_pref_scope_and_material_cursor():
             }
             plugin._save_pref("10001", "days:3")
             scope = plugin._load_pref("10001")
-            plugin._save_material_hash("10001", "abc123")
             plugin._save_material_cursor(
                 "10001", "aiocqhttp:FriendMessage:10001", {"cid": "cid-1", "count": 3}
             )
@@ -294,7 +293,6 @@ async def test_pref_scope_and_material_cursor():
             return {
                 "parsed": parsed,
                 "scope": scope,
-                "material_hash": plugin._load_material_hash("10001"),
                 "cursor": cursor,
                 "cursor_pref": plugin._load_pref_data("10001"),
                 "cleared": cleared,
@@ -766,8 +764,9 @@ async def test_material_cursor_only_reads_new_history():
                 "second_prompt": second_prompt,
                 "third_prompt": third_prompt,
                 "second_content": second_content,
-                "pref_keys": sorted(pref.keys()),
-                "material_hash": plugin._load_material_hash("10001"),
+                # v0.5.5 低危清理：last_material_hash 已废弃，refactor 不再写它
+                # （baseline 仍写），这里显式排除，避免把“有意删除死字段”当差分。
+                "pref_keys": sorted(k for k in pref if k != "last_material_hash"),
                 "last_life_day": pref.get("last_life_day"),
             }
 

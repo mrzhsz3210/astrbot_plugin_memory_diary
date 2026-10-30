@@ -23,7 +23,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Star, register
 
-from .memory_diary.constants import CHARS_PER_TOKEN, INJECT_TEMPLATE, PLUGIN_NAME
+from .memory_diary.constants import INJECT_TEMPLATE, PLUGIN_NAME
 from .memory_diary.core import MemoryDiaryCore
 from .memory_diary.errors import DiaryKeyUnavailable
 from .memory_diary.log import logger
@@ -91,7 +91,7 @@ def resolve_data_dir() -> Path:
     "astrbot_plugin_memory_diary",
     "mrzhsz3210",
     "指令/定时自动触发写日记（用户画像 / 对用户的评价 / 给未来自己的叮嘱），新上下文自动读取日记，上下文将满时自动提醒，支持每天定时自动写完整日记。",
-    "v0.5.4",
+    "v0.5.5",
 )
 
 class MemoryDiaryPlugin(MemoryDiaryCore, Star):
@@ -105,22 +105,70 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         except Exception as e:
             logger.warning(f"[memory_diary] 注册 Web API 失败，日记本页面不可用: {e}")
 
-    # ------------------------- 群聊多 AI 防冲突 -------------------------
+    # ------------------------- 启动清理（P3-7） -------------------------
 
-    def _bot_names(self) -> list:
-        """配置的"我的称呼"列表（用于文本形式 @名字 的比对）。"""
-        raw = str(self.config.get("bot_call_names", "") or "")
-        return [n.strip().lstrip("@") for n in re.split(r"[,，、]", raw) if n.strip()]
+    # 导出/一键备份的临时包前缀：正常路径都在下载后延迟删除，能留到下次启动的
+    # 只可能是进程崩溃/被杀（export 包含用户派生签名钥匙，backup 是全部用户日记）。
+    _STALE_BUNDLE_GLOBS = (
+        "memory_diary_export_*.zip",
+        "memory_diary_backup_*.zip",
+    )
+
+    async def initialize(self):
+        """插件启动/激活：先清掉上次异常退出残留的临时包，再走原有初始化。"""
+        try:
+            self._purge_stale_bundles()
+        except Exception as e:
+            logger.warning(f"[memory_diary] 启动清理残留临时包失败: {e}")
+        await super().initialize()
+
+    def _purge_stale_bundles(self) -> None:
+        """删除数据目录里残留的临时导出/备份包（P3-7）。
+
+        这两类文件只在“打包 → 交给 Web 下载 → 延迟删除”期间存在；插件重新
+        启动时数据目录里还能看到的，都是上一次进程崩溃/强杀留下的残骸。
+        export 包带用户签名钥匙、backup 包带全部用户日记，都不应长期留在磁盘。
+
+        为什么不怕误删“重载插件时正在下载的在途包”：下载期间 Starlette 的
+        FileResponse 持有已打开的文件句柄——Windows 上 unlink 会因共享冲突抛
+        PermissionError（下面的 except 会跳过它），POSIX 上 unlink 后已打开的 fd
+        仍读原 inode，下载不会中断。只有“包刚建好、还没开始读文件”的毫秒级窗口
+        才可能踩到。改成按 pid/mtime 判活虽然也能清残骸，但需要额外区分“重载的在途
+        窗口”和“崩溃残骸”（两者对 pid/mtime 的判定并不一致），收益低、代码风险高，
+        故保持“启动即清”。
+        """
+        removed = 0
+        for pattern in self._STALE_BUNDLE_GLOBS:
+            for path in self.data_dir.glob(pattern):
+                try:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+                except Exception as e:
+                    logger.warning(f"[memory_diary] 删除残留临时包失败 {path}: {e}")
+        if removed:
+            logger.info(
+                f"[memory_diary] 启动清理：已删除 {removed} 个残留的临时导出/备份包"
+            )
+
+    # ------------------------- 群聊多 AI 防冲突 -------------------------
 
     def _should_respond(self, event: AstrMessageEvent) -> bool:
         """判断这条指令是不是发给我的（群里多个 AI 都装了本插件时防冲突）。
 
         - 私聊：永远响应；
-        - 群里 @了我（QQ 的 At 组件指向我，或文本 @名字 命中配置的"我的称呼"）：响应；
-        - 群里明确 @了别人（At 组件不是我、或文本 @名字 不在我的称呼里）：沉默，
-          让被点名的那个 AI 响应；
+        - 群里 @了我（QQ 原生 At 组件指向我）：响应；
+        - 群里明确 @了别人（At 组件不是我）：沉默，让被点名的那个 AI 响应；
+        - 指令 token 内出现任何文本形式的 @（如 "/写日记@小深"）：一律视为
+          在叫别人、保持沉默——QQ 原生 At 组件带 QQ 号已足够可靠，
+          文本 @ 无法确认身份，宁可沉默也不抢话；
         - 群里没有任何 @：响应（广义兼容模式），除非配置开启"群里只响应@我的指令"。
         """
+        if not self._is_allowed(event.get_sender_id()):
+            # 白名单外的用户：静默拒绝（不回复、不刷屏），只留 debug 日志
+            logger.debug(
+                f"[memory_diary] 用户 {event.get_sender_id()} 不在白名单，已静默忽略指令"
+            )
+            return False
         if not event.get_group_id():
             return True
         self_id = ""
@@ -145,15 +193,23 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         # 内容里出现的 @（例如 /记一下 记得@张三 他下周考试）不算点名，避免误判沉默
         full_text = (event.message_str or "").strip()
         cmd_token = full_text.split(None, 1)[0] if full_text else ""
-        m = re.search(r"@([^\s@，,]+)", cmd_token)
-        if m:
-            target = m.group(1)
-            names = self._bot_names()
-            # 文本 @命中我的称呼才响应；@的是别人（或无法确认是我）一律沉默
-            return any(target.lower() == n.lower() for n in names)
+        if re.search(r"@[^\s@，,]+", cmd_token):
+            # 指令 token 内出现任何文本 @ 一律视为在叫别人，保持沉默
+            return False
         if at_other:
             return False
         return not bool(self.config.get("group_require_at", False))
+
+    # 零宽与方向控制字符：其他插件会在 message_str 末尾追加不可见标记，
+    # 不剥掉会把指令参数判为"不认识"（日志里用 repr 才能看到它们）
+    _INVISIBLE_RE = re.compile(
+        "[\u200b-\u200f\u202a-\u202e\u2060\ufeff]"
+    )
+
+    @classmethod
+    def _strip_invisible(cls, text: str) -> str:
+        """剥离零宽与方向控制字符；只影响指令解析，不回写消息内容。"""
+        return cls._INVISIBLE_RE.sub("", text or "")
 
     def _command_arg(self, event: AstrMessageEvent) -> str:
         """从原始消息取指令后的完整参数，并剥掉 @提及。
@@ -162,11 +218,11 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         处理函数的参数——"/日记范围 2026-10-01 到 2026-10-23" 会被截成单日。
         这里直接解析 event.message_str，保留带空格的完整参数。
         """
-        text = (event.message_str or "").strip()
+        text = self._strip_invisible(event.message_str or "").strip()
         parts = text.split(maxsplit=1)
         arg = parts[1] if len(parts) > 1 else ""
-        if not arg and "　" in text:  # 兼容全角空格
-            arg = text.split("　", 1)[1]
+        # 全角空格（U+3000）无需额外兜底：str.split() 默认按 Unicode 空白切分，
+        # 已把全角空格当分隔符处理。
         return re.sub(r"@[^\s@，,]+", "", arg).strip()
     # ------------------------- 指令：帮助 -------------------------
 
@@ -210,20 +266,21 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         if not self._should_respond(event):
             return
         sender_id = event.get_sender_id()
-        text = (event.message_str or "").strip()
-        # 指令与内容在同一句话内、用空格分开：去掉第一个词（指令本体）
-        parts = text.split(maxsplit=1)
-        note = parts[1].strip() if len(parts) > 1 else ""
-        # 兼容用户把指令和内容用全角空格分开的情况
-        if not note and "　" in text:
-            note = text.split("　", 1)[1].strip()
-        # 群里点名写法（/记一下 @我 内容）：把 @我的部分从内容里剥掉
-        for n in self._bot_names():
-            if note.startswith("@" + n):
-                note = note[len(n) + 1 :].strip(" ，,")
-                break
+        raw_text = event.message_str or ""
+        # P3-13：零宽/方向控制字符只用于「判定指令与内容」，备忘内容一律保存原文——
+        # 对整条消息剥离会破坏 ZWJ emoji（👨\u200d👩\u200d👧 会被拆成三个独立人像）
+        # 和阿拉伯/波斯文正字法必需的 ZWNJ（影响字形连写）。
+        # 指令与内容在同一句话内、用空格分开。剥离只删非空白字符，不改变空白
+        # 分隔位置，所以内容可以从原文按同一分割位置取回，保留不可见字符原样。
+        # 全角空格（U+3000）由 str.split() 当 Unicode 空白一并处理，无需兜底分支。
+        raw_parts = raw_text.strip().split(maxsplit=1)
+        note = raw_parts[1].strip() if len(raw_parts) > 1 else ""
 
         if not note:
+            # P3-15：用法提示分支记 repr，日志里能看到其他插件追加的不可见字符
+            logger.warning(
+                f"[memory_diary] 记一下 缺少内容，原始消息：{raw_text!r}"
+            )
             yield event.plain_result(
                 "在指令后面空一格，写上要我记住的事就可以啦，例如：\n"
                 "/记一下 我下周三要考试\n"
@@ -346,7 +403,8 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         async def memo_delete_waiter(
             controller: SessionController, ev: AstrMessageEvent
         ):
-            text = (ev.message_str or "").strip()
+            # P3-14：不可见字符只影响「取消/全部/序号」判断，剥离后不回写消息
+            text = self._strip_invisible(ev.message_str or "").strip()
             if self._is_cancel(text):
                 await ev.send(
                     ev.plain_result(
@@ -435,6 +493,11 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                     )
                 controller.stop()
                 return
+            # P3-15：用法提示分支记 repr，便于看到不可见字符
+            logger.warning(
+                f"[memory_diary] 删除备忘没看懂用户回复，原始消息："
+                f"{(ev.message_str or '')!r}"
+            )
             await ev.send(
                 ev.plain_result(
                     await self._say(
@@ -456,6 +519,16 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
 
     # ------------------------- 指令：写日记 -------------------------
 
+    async def _writing_busy_text(self, umo: str) -> str:
+        """写日记互斥时手动入口的婉拒文案（两处检查共用）。"""
+        return await self._say(
+            umo,
+            "⏳ 我正在写日记呢，等我写完这半篇再来找我好不好～",
+            "用户让你写日记，但你正在为他写另一篇日记（自动触发、定时任务或刚启动的）。"
+            "请用你自己的口吻让他稍等片刻（不要说技术细节），"
+            "告诉他你写完手头的这半篇再来找他。两三句话以内。",
+        )
+
     @filter.command("diary", alias={"日记", "写日记"})
     async def write_diary_cmd(self, event: AstrMessageEvent):
         """写日记：默认简记；/日记 完整 写完整篇；/日记 简记 强制简记。"""
@@ -473,6 +546,11 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         elif arg in ("", "自动", "auto"):
             requested_mode = "auto"
         else:
+            # 参数不认识时记录 repr：不可见字符（其他插件追加的标记）肉眼看不见
+            logger.warning(
+                f"[memory_diary] 无法识别的写日记参数，原始消息："
+                f"{(event.message_str or '')!r}"
+            )
             yield event.plain_result(
                 "📖 用法：\n"
                 "· /日记 —— 默认简记（第一次写日记会写完整）\n"
@@ -495,18 +573,22 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             )
             return
 
+        # 与哨兵/定时任务的自动写日记互斥：三者都走 _save_diary 整体重写同一 zip。
+        # 锁的粒度是 sender_id（保护的是 diary_<sender_id>.zip），不是会话 umo：
+        # 同一群里不同用户各写各的日记，不能互相阻塞；同一用户的私聊/群聊写同
+        # 一个 zip，必须互斥。写的时候还要占位（见下面 _write_diary 处的 try/finally）。
+        if sender_id in self._writing:
+            yield event.plain_result(await self._writing_busy_text(umo))
+            return
+
         # 阈值门：上下文占用未达配置比例时不允许手动写日记（0 为不限制）
+        # 估算与哨兵/状态页同口径（v2 下复用哨兵最近一次请求的数字）
+        # 窗口 0/负数 = 比例体系停用：百分比算不出来，门槛一并跳过（否则会永远拦人）
         min_ratio = float(self.config.get("write_min_ratio", 0) or 0)
-        if min_ratio > 0:
-            limit = int(self.config.get("context_token_limit", 60000) or 60000)
-            history = await self._get_history(umo)
-            chars = 0
-            for msg in history:
-                if isinstance(msg, dict):
-                    chars += len(self._content_to_text(msg.get("content", "")))
-                else:
-                    chars += len(str(msg))
-            ratio = (chars / CHARS_PER_TOKEN) / limit if limit > 0 else 0
+        limit = self._context_limit()
+        if min_ratio > 0 and limit > 0:
+            used = await self._context_used(umo)
+            ratio = used / limit
             if ratio < min_ratio:
                 canned = (
                     f"⏳ 上下文才用了约 {int(ratio * 100)}%，还没到该写日记的时候"
@@ -523,13 +605,28 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                 )
                 return
 
-        diary_content, err = await self._write_diary(
-            umo,
-            sender_id,
-            sender_name,
-            is_group=bool(event.get_group_id()),
-            requested_mode=requested_mode,
+        full_before = self._full_diary_count_today(
+            sender_id, bool(event.get_group_id())
         )
+        # 双向互斥：手动写期间也要占住 _writing。只做开头的“检查”是不够的——
+        # 手动写要等 LLM 生成（数秒到数十秒），这期间哨兵/每天定时的自动写仍会
+        # 启动，两边都整体重写同一个 zip，照样丢一篇。占位与自动写同一把锁。
+        # 另外：上面的门槛检查里有 await（_context_used），check 与 add 之间可能
+        # 被别的写者插进来，所以占位前同步复查一次，紧接着 add（中间没有 await）。
+        if sender_id in self._writing:
+            yield event.plain_result(await self._writing_busy_text(umo))
+            return
+        self._writing.add(sender_id)
+        try:
+            diary_content, err = await self._write_diary(
+                umo,
+                sender_id,
+                sender_name,
+                is_group=bool(event.get_group_id()),
+                requested_mode=requested_mode,
+            )
+        finally:
+            self._writing.discard(sender_id)
         if err:
             # 对话式的婉拒（没新内容/今天随笔已写过）走人设口吻；技术性报错保持固定文案，保证信息准确
             conversational = err.startswith(("距离上次", "今天的随笔"))
@@ -565,6 +662,30 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             f"\n\n（本篇约 {len(diary_content)} 字，/reset 后的第一轮会一次性读入，"
             "不会每轮重复消耗 token）"
         )
+
+        # 完整篇每日名额提示（仅当本次确实新增了完整篇且配置了上限；0=不限）
+        try:
+            max_full = int(self.config.get("max_full_diaries_per_day", 1))
+        except (TypeError, ValueError):
+            max_full = 1
+        if max_full < 0:
+            max_full = 1
+        if requested_mode == "full" and max_full > 0:
+            full_after = self._full_diary_count_today(
+                sender_id, bool(event.get_group_id())
+            )
+            if full_after > full_before:
+                remaining = max(0, max_full - full_after)
+                if remaining > 0:
+                    notice += (
+                        f"\n\n（今天这个场景的完整日记已写 {full_after}/{max_full} 篇，"
+                        f"还剩 {remaining} 篇；次日 00:00 重置）"
+                    )
+                else:
+                    notice += (
+                        f"\n\n（今天这个场景的完整日记已写 {full_after}/{max_full} 篇，"
+                        "名额已用完；可以继续写简记，或次日 00:00 重置后再写完整篇）"
+                    )
 
         if (
             bool(self.config.get("show_diary_after_write", False))
@@ -653,7 +774,8 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         async def diary_view_waiter(
             controller: SessionController, ev: AstrMessageEvent
         ):
-            text = (ev.message_str or "").strip()
+            # P3-14：不可见字符只影响「取消/最新/序号/日期」判断，剥离后不回写消息
+            text = self._strip_invisible(ev.message_str or "").strip()
             low = text.lower()
             if self._is_cancel(text):
                 await ev.send(
@@ -685,6 +807,11 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                     targets = [name] if name in entries else []
 
             if targets is None:
+                # P3-15：用法提示分支记 repr，便于看到不可见字符
+                logger.warning(
+                    f"[memory_diary] 查看日记没看懂用户回复，原始消息："
+                    f"{(ev.message_str or '')!r}"
+                )
                 await ev.send(
                     ev.plain_result(
                         "📖 没看懂～回复「最新」、序号，或日期（如 2026-10-23）。"
@@ -798,7 +925,8 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         async def diary_delete_waiter(
             controller: SessionController, ev: AstrMessageEvent
         ):
-            text = (ev.message_str or "").strip()
+            # P3-14：不可见字符只影响「取消/全部/序号/日期/时间段」判断，不回写消息
+            text = self._strip_invisible(ev.message_str or "").strip()
             low = text.lower()
 
             # 任意阶段都可以取消（包括「全部删除」的二次确认阶段）
@@ -888,6 +1016,11 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                         targets = [name] if name in entries else []
 
             if targets is None:
+                # P3-15：用法提示分支记 repr，便于看到不可见字符
+                logger.warning(
+                    f"[memory_diary] 删除日记没看懂用户回复，原始消息："
+                    f"{(ev.message_str or '')!r}"
+                )
                 await ev.send(
                     ev.plain_result(
                         "📖 没看懂～回复「全部」、序号、日期，或时间段（如 2026-10-20 到 2026-10-23）。"
@@ -1114,7 +1247,8 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         async def diary_import_waiter(
             controller: SessionController, ev: AstrMessageEvent
         ):
-            if self._is_cancel(ev.message_str or ""):
+            # P3-14：取消口令要先剥不可见字符再判断（只判断，不回写消息）
+            if self._is_cancel(self._strip_invisible(ev.message_str or "")):
                 await ev.send(
                     ev.plain_result(
                         await self._say(
@@ -1284,6 +1418,10 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             "日记本：读取某天的日记")
         reg(f"/{PLUGIN_NAME}/export/<file_key>", self.web_export, ["GET"],
             "日记本：导出迁移包（浏览器下载）")
+        reg(f"/{PLUGIN_NAME}/export_all", self.web_export_all, ["GET"],
+            "日记本：一键备份全部用户日记（不含签名钥匙）")
+        reg(f"/{PLUGIN_NAME}/export_all_local", self.web_export_all_local, ["GET"],
+            "日记本：一键备份全部用户日记到本机并打开位置")
         reg(f"/{PLUGIN_NAME}/export_local/<file_key>", self.web_export_local, ["GET"],
             "日记本：导出迁移包到本机下载文件夹并打开位置")
         reg(f"/{PLUGIN_NAME}/import", self.web_import, ["POST"],
@@ -1340,6 +1478,13 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                 latest = self._entry_label(days[-1]) if days else ""
             except Exception:
                 pass
+            # glob 与 stat 之间文件可能被并发删除/替换（例如同一时刻正在导入覆盖
+            # 该用户的 zip）。stat 失败只影响列表里的“大小”一列，不能让它把整个
+            # 用户列表接口打成 500（那样页面连已存在的用户都列不出来）。
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
             users.append({
                 "file_key": file_key,
                 "nickname": nick or "（未知昵称）",
@@ -1347,7 +1492,7 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                 "protected": bool(owner and self._view_password_rec(owner)),
                 "day_count": day_count,
                 "latest": latest,
-                "size": path.stat().st_size,
+                "size": size,
             })
         return _web_json({"users": users})
 
@@ -1437,14 +1582,83 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         bundle, err_resp = self._web_prepare_export(file_key)
         if err_resp is not None:
             return err_resp
-        # file_response 在 handler 返回后才读文件，立即删除会竞态；
-        # 延迟 120 秒清理——迁移包含签名钥匙，不能长期留在磁盘上
+        # file_response 在 handler 返回后才读文件，立即删除会竞态——
+        # 按包大小延迟清理（与 web_export_all 同一套 _bundle_cleanup_delay：
+        # 固定 120 秒对多年日记的大包/慢网下载可能不够，包被提前删掉会让下载
+        # 损坏且无法重试）；迁移包含签名钥匙，不能长期留在磁盘上
         try:
             asyncio.get_running_loop().call_later(
-                120, lambda: bundle.unlink(missing_ok=True)
+                self._bundle_cleanup_delay(bundle),
+                lambda: bundle.unlink(missing_ok=True),
             )
         except Exception as e:
             logger.warning(f"[memory_diary] 迁移包延迟清理注册失败: {e}")
+        return _web_file(bundle, filename=bundle.name,
+                         content_type="application/zip")
+
+    @staticmethod
+    def _bundle_cleanup_delay(bundle: Path) -> int:
+        """临时包的延迟清理秒数：基础 600 秒 + 每 MB 1 秒，封顶 1 小时。
+
+        ``file_response`` 在 handler 返回后才读文件，下载期间包必须存在。
+        固定 120 秒对大包（多年日记、全量备份、慢网/移动端）可能不够——包被
+        提前删掉会让下载损坏且无法重试；下载被截断的代价高于多留一会儿。
+        注意两类包：一键备份包不含签名钥匙；单用户导出包含派生钥匙
+        （user_key.txt），本函数对它按同一规则延长保留，是为了保证下载完整，
+        而不是认为它“不含钥匙”；单用户导出若要更短保留时间，需先确认下载已完成。
+        """
+        try:
+            size_mb = bundle.stat().st_size // (1024 * 1024)
+        except OSError:
+            size_mb = 0
+        return min(3600, 600 + size_mb)
+
+    def _prepare_backup_all(self):
+        """打包全部用户日记（不含签名钥匙）；返回 (bundle, 用户数, 错误响应)。"""
+        paths = []
+        for path in sorted(self.data_dir.glob("diary_*.zip")):
+            file_key = path.stem[len("diary_"):]
+            if self._valid_file_key(file_key):
+                paths.append(path)
+        if not paths:
+            return None, 0, _web_error("还没有任何用户的日记可备份", status_code=400)
+        stamp = self._now().strftime("%Y%m%d_%H%M%S")
+        bundle = (
+            self.data_dir
+            / f"memory_diary_backup_{stamp}_{secrets.token_hex(2)}.zip"
+        )
+        try:
+            with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as z:
+                for p in paths:
+                    z.write(p, p.name)
+                z.writestr("备份说明.txt", self._backup_readme_text(len(paths)))
+        except Exception as e:
+            bundle.unlink(missing_ok=True)
+            logger.error(f"[memory_diary] 一键备份打包失败: {e}")
+            return None, 0, _web_error("备份打包失败，详见后台日志", status_code=500)
+        return bundle, len(paths), None
+
+    async def web_export_all(self):
+        """一键备份全部用户日记：数据目录下所有 diary_*.zip 打成单个 zip 下载。
+
+        只含日记 zip，绝不含签名钥匙（"绝不入包"原则不变）；包内附 备份说明.txt。
+        继承面板登录鉴权，等价管理员本机操作，不加额外密码闸。
+        """
+        bundle, count, err = self._prepare_backup_all()
+        if err is not None:
+            return err
+        # file_response 在 handler 返回后才读文件：按包大小延迟清理（见
+        # _bundle_cleanup_delay 的注释；固定 120 秒对大包可能不够）
+        try:
+            asyncio.get_running_loop().call_later(
+                self._bundle_cleanup_delay(bundle),
+                lambda: bundle.unlink(missing_ok=True),
+            )
+        except Exception as e:
+            logger.warning(f"[memory_diary] 备份包延迟清理注册失败: {e}")
+        logger.info(
+            f"[memory_diary] 已打出一键备份包：{count} 个用户的日记"
+        )
         return _web_file(bundle, filename=bundle.name,
                          content_type="application/zip")
 
@@ -1477,6 +1691,59 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         first = forwarded.split(",")[0].strip().lower()
         return not first or first in self._WEB_LOOPBACKS
 
+    @staticmethod
+    def _open_file_location(target: Path) -> None:
+        """在本机文件管理器中打开并选中文件（失败只记日志，不影响已保存文件）。"""
+        try:
+            if os.name == "nt":
+                subprocess.Popen(["explorer", "/select,", str(target)])
+            elif os.uname().sysname == "Darwin":  # type: ignore[attr-defined]
+                subprocess.Popen(["open", "-R", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target.parent)])
+        except Exception as e:
+            logger.warning(f"[memory_diary] 打开文件位置失败（文件已保存）: {e}")
+
+    def _save_bundle_to_downloads(self, bundle: Path) -> Path:
+        """把临时包移到本机「下载」文件夹（重名自动加序号），并打开文件位置。"""
+        downloads = Path.home() / "Downloads"
+        if not downloads.is_dir():
+            downloads = Path.home()
+        target = downloads / bundle.name
+        n = 1
+        while target.exists():
+            target = downloads / f"{bundle.stem}_{n}{bundle.suffix}"
+            n += 1
+        shutil.move(str(bundle), str(target))
+        self._open_file_location(target)
+        return target
+
+    async def web_export_all_local(self):
+        """一键备份全部用户日记 → 存到本机「下载」文件夹并打开位置。
+
+        与「备份全部日记（浏览器下载）」内容完全一致（只含日记 zip、附备份说明、
+        绝不含签名钥匙）；区别是后端把包直接落到服务器本机下载目录并唤起文件管理器，
+        因此和单用户 `web_export_local` 一样只允许在本机面板访问时使用。
+        """
+        if not self._web_is_local_panel():
+            return _web_error(
+                "REMOTE_PANEL：管理面板不在服务器本机，请改用「下载到浏览器」",
+                status_code=400,
+            )
+        bundle, count, err = self._prepare_backup_all()
+        if err is not None:
+            return err
+        try:
+            target = self._save_bundle_to_downloads(bundle)
+        except Exception as e:
+            bundle.unlink(missing_ok=True)
+            logger.error(f"[memory_diary] 一键备份保存到下载目录失败: {e}")
+            return _web_error("保存到下载文件夹失败，详见后台日志", status_code=500)
+        logger.info(
+            f"[memory_diary] 一键备份已存到本机：{count} 个用户的日记 → {target.name}"
+        )
+        return _web_json({"saved_to": str(target), "filename": target.name})
+
     async def web_export_local(self, file_key: str):
         """存到本机「下载」文件夹并打开文件位置。
 
@@ -1492,30 +1759,12 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         bundle, err_resp = self._web_prepare_export(file_key)
         if err_resp is not None:
             return err_resp
-        downloads = Path.home() / "Downloads"
-        if not downloads.is_dir():
-            downloads = Path.home()
-        target = downloads / bundle.name
-        n = 1
-        while target.exists():
-            target = downloads / f"{bundle.stem}_{n}{bundle.suffix}"
-            n += 1
         try:
-            shutil.move(str(bundle), str(target))
+            target = self._save_bundle_to_downloads(bundle)
         except Exception as e:
             bundle.unlink(missing_ok=True)
             logger.error(f"[memory_diary] 迁移包保存到下载目录失败: {e}")
             return _web_error("保存到下载文件夹失败，详见后台日志", status_code=500)
-        # 打开文件管理器并选中文件（失败也不回滚，文件已就位）
-        try:
-            if os.name == "nt":
-                subprocess.Popen(["explorer", "/select,", str(target)])
-            elif os.uname().sysname == "Darwin":  # type: ignore[attr-defined]
-                subprocess.Popen(["open", "-R", str(target)])
-            else:
-                subprocess.Popen(["xdg-open", str(target.parent)])
-        except Exception as e:
-            logger.warning(f"[memory_diary] 打开文件位置失败（文件已保存）: {e}")
         return _web_json({"saved_to": str(target), "filename": target.name})
 
     async def web_import(self):
@@ -1594,7 +1843,7 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             all_prefs = self._load_view_prefs()
             all_prefs[username] = clean
             p = self._view_prefs_path()
-            tmp = p.with_name(p.name + ".tmp")
+            tmp = p.with_name(f"{p.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
             tmp.write_text(json.dumps(all_prefs, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, p)
         except Exception as e:
@@ -1696,8 +1945,9 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             return
         sender_id = event.get_sender_id()
         # message_str 含指令名本身（"/日记密码 设置 xxx"），先剥掉第一个 token。
-        # 不用 _command_arg：它会剥 @提及，可能误伤含 @ 的密码。
-        tokens = (event.message_str or "").strip().split()
+        # 这里不用 _command_arg：它会剥 @提及，可能误伤含 @ 的密码；
+        # 但零宽/方向控制字符必须先剥掉，否则密码会带着看不见的字符存进哈希。
+        tokens = self._strip_invisible(event.message_str or "").strip().split()
         parts = tokens[1:]
         data = self._load_pref_data(sender_id)
         cur = data.get("view_password")
@@ -1836,6 +2086,11 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             )
             return
 
+        # 参数没看懂：记 repr 方便定位零宽/方向控制字符（密码指令不在 _command_arg 链路里）
+        logger.warning(
+            f"[memory_diary] 无法识别的日记密码参数，原始消息："
+            f"{(event.message_str or '')!r}"
+        )
         yield event.plain_result(usage)
 
     @filter.command("日记状态", alias={"diary_status"})
@@ -1845,6 +2100,9 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             return
         sender_id = event.get_sender_id()
         umo = event.unified_msg_origin
+        # 群聊里不展示个人日记统计与实例级校准观测（同群可见，属元数据暴露）；
+        # 上下文占用/哨兵状态是群会话本身的信息，保留展示。
+        in_group = bool(event.get_group_id())
 
         # 日记信息：先做全量 zip 健康检查，损坏时不能显示“0 字，校验通过”
         corrupt = self._corrupt_notice(sender_id)
@@ -1875,23 +2133,31 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         else:
             diary_info = "还没有写过日记"
 
-        # 上下文占用估算（基于会话历史）
-        limit = int(self.config.get("context_token_limit", 60000) or 60000)
+        if in_group:
+            # 日记篇数/最新日期属于个人元数据，群聊里同群可见——只提示去私聊看
+            diary_info = "群聊不展示个人日记统计（私聊发送 /日记状态 查看）"
+
+        # 上下文占用估算（v2 下与哨兵同口径：复用最近一次请求的估算）
+        # 窗口 0/负数 = 哨兵与比例门槛停用（P?: 原 `or 60000` 会把 0 吞成默认值）
+        limit = self._context_limit()
         remind_ratio, auto_ratio = self._watch_ratios()
-        history = await self._get_history(umo)
-        chars = 0
-        for msg in history:
-            if isinstance(msg, dict):
-                chars += len(self._content_to_text(msg.get("content", "")))
-            else:
-                chars += len(str(msg))
-        used = int(chars / CHARS_PER_TOKEN)
+        used = await self._context_used(umo)
         pct = int(used / limit * 100) if limit > 0 else 0
+        # 阈值显示用原始配置值（哨兵关闭时也如实展示配置），生效与否看"本会话哨兵"行
+        def _cfg_ratio(name, default):
+            try:
+                v = float(self.config.get(name, default))
+            except (TypeError, ValueError):
+                v = default
+            return int(min(max(v, 0.0), 1.0) * 100)
+
+        remind_pct = _cfg_ratio("remind_ratio", 0.75)
+        auto_pct = _cfg_ratio("auto_ratio", 0.9)
 
         # 哨兵状态
         cid = await self._curr_cid(umo)
         state = self._watch_state.get(umo) or {}
-        watch_ok = bool(self.config.get("enable_context_watch", True))
+        watch_ok = (remind_ratio > 0 or auto_ratio > 0) and limit > 0
         if watch_ok and state.get("cid") == cid:
             flags = []
             if state.get("reminded"):
@@ -1914,20 +2180,56 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         else:
             inject_info = "本会话未注入（你下一句正常对话时注入；命令消息不触发）"
 
-        yield event.plain_result(
-            "📖 日记状态：\n"
-            f"· 日记：{diary_info}\n"
-            f"· 当前上下文：约 {used}/{limit} tokens（{pct}%，估算值）\n"
-            f"· 阈值：提醒 {int(remind_ratio * 100)}% / 自动写日记 {int(auto_ratio * 100)}%\n"
-            f"· 本会话哨兵：{watch_info}\n"
-            f"· 本会话日记注入：{inject_info}"
-        )
+        # 上下文占用行：v2 显示"估算 X / Y tokens"并附校准观测行；旧公式保持原格式
+        # 窗口 0/负数时无法换算百分比：明确提示比例体系已停用，不显示会误导的 0%
+        # 群聊里不显示校准观测行（provider::model / 样本数 / 上次实际是实例级元数据）
+        if limit <= 0:
+            context_line = (
+                "· 当前上下文：模型上下文窗口配置为 0/负数，"
+                f"哨兵与比例门槛已停用（估算 {used:,} tokens）"
+            )
+            # 校准与哨兵启停解耦（P2-1）：窗口停用但校准仍照常采样，观测行保留（群聊除外）
+            calib_line = (
+                self._calib_status_line(await self._context_calib_key(umo))
+                if self._token_estimation_v2() and not in_group
+                else ""
+            )
+        elif self._token_estimation_v2():
+            context_line = f"· 当前上下文：估算 {used:,} / {limit:,} tokens（{pct}%）"
+            calib_line = (
+                ""
+                if in_group
+                else self._calib_status_line(await self._context_calib_key(umo))
+            )
+        else:
+            context_line = f"· 当前上下文：约 {used}/{limit} tokens（{pct}%，估算值）"
+            calib_line = ""
+
+        lines = [
+            "📖 日记状态：",
+            f"· 日记：{diary_info}",
+            context_line,
+        ]
+        if calib_line:
+            lines.append(calib_line)
+        lines += [
+            f"· 阈值：提醒 {remind_pct}% / 自动写日记 {auto_pct}%",
+            f"· 本会话哨兵：{watch_info}",
+            f"· 本会话日记注入：{inject_info}",
+        ]
+        yield event.plain_result("\n".join(lines))
 
     # ------------------------- 指令：注入范围 -------------------------
 
     @filter.command("日记范围", alias={"diary_scope"})
     async def diary_scope(self, event: AstrMessageEvent, scope: str = ""):
-        """设置新上下文注入哪些日记：最新 / 全部 / 最近N天 / 时间段。"""
+        """设置新上下文注入哪些日记：最新 / 全部 / 最近N天 / 时间段。
+
+        ``scope`` 是给 AstrBot CommandFilter 的占位参数：它按处理函数签名收集
+        参数（前两个参数视为 self/event）。参数实际由 _command_arg() 从原始消息
+        解析，这里不使用 scope 的值；保留它只为让“带参数的调用”与框架的指令参数
+        语义对齐（当前去掉也能工作，但保留成本更低、对未来框架收紧更稳）。
+        """
         if not self._should_respond(event):
             return
         sender_id = event.get_sender_id()
@@ -1967,6 +2269,10 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                 parsed = p
 
         if parsed == "KEEP":
+            logger.warning(
+                f"[memory_diary] 无法识别的日记范围参数，原始消息："
+                f"{(event.message_str or '')!r}"
+            )
             yield event.plain_result(
                 "📖 没看懂～可选：最新 / 全部 / 最近N天（如 最近7天）/ 日期（如 2026-10-23）/ 时间段（如 2026-10-01到2026-10-23）。"
             )
@@ -2039,6 +2345,10 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
 
         parsed = self._parse_scope(arg)
         if parsed is None:
+            logger.warning(
+                f"[memory_diary] 无法识别的注入范围参数，原始消息："
+                f"{(event.message_str or '')!r}"
+            )
             yield event.plain_result(
                 "📖 没看懂～可选：最新 / 全部 / 最近N天 / 日期 / 时间段。"
             )
@@ -2123,7 +2433,8 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         task = getattr(self, "_auto_task", None)
         if not getattr(self, "_terminated", False) and (task is None or task.done()):
             self._start_auto_diary_task()
-        text = (event.message_str or "").strip().lower()
+        # P3-14：/reset 识别前先剥不可见字符（只用于判断，不回写消息内容）
+        text = self._strip_invisible(event.message_str or "").strip().lower()
         if text in ("/reset", "reset", "/重置", "重置"):
             self._reset_pending.add(event.unified_msg_origin)
             self._cap_state(self._reset_pending)
@@ -2131,6 +2442,17 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         """每次 LLM 请求前：新会话注入日记；同时执行上下文哨兵。"""
+        # 白名单外的用户：不注入日记、不跑上下文哨兵（"不给任何人写日记"的核心拦截点）
+        # P3-11：判定异常必须 fail-closed（与 _is_allowed 的原则一致）——宁可这一轮
+        # 不注入，也不要在身份不明时把日记塞进请求里。
+        try:
+            if not self._is_allowed(event.get_sender_id()):
+                return
+        except Exception as e:
+            logger.warning(
+                f"[memory_diary] 白名单判定异常，按拒绝处理（fail-closed，本轮跳过）: {e}"
+            )
+            return
         # 0) /reset 代际识别（P0-1 修复 + 双保险）：
         # AstrBot 4.x 的 /reset 只清空 history、不换 conversation_id，
         # 所以"新会话"不能只认 cid。两条识别路径，任一命中即视为新的一代：
@@ -2155,12 +2477,19 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                     self._injected_entries.pop(umo0, None)
                     self._pending_inject.pop(umo0, None)
                     self._watch_state.pop(umo0, None)
+                    # 新上下文：上一代的占用估算已失效，状态页回退历史估算
+                    self._last_context_used.pop(umo0, None)
                     logger.info(
                         "[memory_diary] 检测到 /reset（指令标记或上下文已清空），"
                         "会话代际状态已重置，本轮将重新注入日记"
                     )
         except Exception as e:
             logger.warning(f"[memory_diary] reset 代际识别异常: {e}")
+
+        # P2-1：校准样本 E 与哨兵是否启用解耦——哨兵停用（两档阈值都 0 或
+        # context_token_limit<=0）时 _watch_context 会提前返回，样本必须在它之前暂存。
+        # 注入完成后由 finally 里的 _refresh_pending_estimate 按注入后的请求重算。
+        await self._stage_pending_estimate(event.unified_msg_origin, req)
 
         # 1) 上下文哨兵
         try:
@@ -2255,6 +2584,40 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             logger.info(f"[memory_diary] 已在新会话为用户 {sender_id} 注入日记")
         except Exception as e:
             logger.warning(f"[memory_diary] 注入日记异常: {e}")
+        finally:
+            # 注入完成后重算本次静态估算：校准样本 E 要与真正发出去的请求同口径
+            self._refresh_pending_estimate(event.unified_msg_origin, req)
+
+    async def on_llm_response(self, event: AstrMessageEvent, resp):
+        """拿到本次请求的真实 token 用量，对估算系数做 EWMA 自适应校准。
+
+        仅在「改进版token估算」+「自动校准」同时开启时生效；
+        on_llm_request 里暂存的静态估算 E 在这里被消费。
+
+        P2-5：方法体保持普通 async 方法，装饰器在类定义完成后按 AstrBot 是否
+        提供 on_llm_response 钩子动态应用（见文件末尾）——老 4.x 缺该钩子时
+        插件仍能正常加载，只是不做校准。
+        """
+        try:
+            if not self._calibration_enabled():
+                return
+            umo = event.unified_msg_origin
+            pending = self._pending_estimates.pop(umo, None)
+            if not pending:
+                return
+            usage = getattr(resp, "usage", None)
+            if usage is None:
+                return
+            actual = int(getattr(usage, "input_other", 0) or 0) + int(
+                getattr(usage, "input_cached", 0) or 0
+            )
+            self._update_calibration(
+                str(pending.get("key") or ""),
+                int(pending.get("estimate", 0) or 0),
+                actual,
+            )
+        except Exception as e:
+            logger.warning(f"[memory_diary] token 估算校准异常: {e}")
 
     @staticmethod
     def _deliver_inject(req: ProviderRequest, inject_text: str):
@@ -2270,4 +2633,20 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             req.extra_user_content_parts.append(part)
         except Exception:
             req.system_prompt = (req.system_prompt or "") + "\n\n" + inject_text
+
+
+# P2-5 兼容注册：老 AstrBot 4.x 可能没有 on_llm_response 钩子。模块导入期硬用
+# @filter.on_llm_response() 会让整个插件在 import 阶段 AttributeError、直接加载
+# 失败；这里在类定义完成后按钩子是否存在动态应用装饰器（保持方法名与直接调用
+# 不变）——缺钩子时插件照常加载，只是不做 token 校准（降级而非崩溃）。
+# 注：metadata.yaml 的 astrbot_version 下限不在这里维护（由发布配置/文档负责）。
+if hasattr(filter, "on_llm_response"):
+    MemoryDiaryPlugin.on_llm_response = filter.on_llm_response()(
+        MemoryDiaryPlugin.on_llm_response
+    )
+else:  # pragma: no cover - 只有缺少该钩子的老版本 AstrBot 会走到
+    logger.warning(
+        "[memory_diary] 当前 AstrBot 版本没有 on_llm_response 钩子，"
+        "token 估算自动校准不可用（插件其余功能正常）"
+    )
 

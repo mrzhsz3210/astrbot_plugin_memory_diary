@@ -20,6 +20,7 @@ from harness.world import DIARY_TEXT, World
 
 SENDER = "10001"
 SENDER_NAME = "阿罗"
+OTHER = "20002"
 
 
 def _json(resp) -> dict:
@@ -350,6 +351,51 @@ async def test_web_export_bundle_and_local_export():
                 assert "REMOTE_PANEL" in resp["body"]["message"]
 
 
+async def test_web_export_all_local_saves_to_downloads_and_opens():
+    """一键备份全部日记也能「存到本机并打开位置」（仅本机面板）。"""
+    async with World(config={"use_persona": False}) as world:
+        inst = world.refactor
+        plugin = inst.plugin
+        plugin._save_diary(
+            SENDER, DIARY_TEXT, sender_name=SENDER_NAME, origin="private", mode="full"
+        )
+        plugin._save_diary(
+            OTHER, DIARY_TEXT, sender_name="阿堵", origin="private", mode="full"
+        )
+        # 把 Path.home() 指向临时目录，绝不动真实「下载」文件夹；Popen 也打桩
+        home = inst.root / "home"
+        (home / "Downloads").mkdir(parents=True, exist_ok=True)
+        started = []
+        with mock.patch.object(Path, "home", classmethod(lambda cls: home)):
+            with mock.patch.object(
+                subprocess, "Popen", lambda *a, **k: started.append(a)
+            ):
+                local = await _call(
+                    plugin.web_export_all_local, FakeWebRequest()
+                )
+                remote = await _call(
+                    plugin.web_export_all_local,
+                    FakeWebRequest(client_host="10.0.0.5"),
+                )
+
+        assert local["status"] == 200
+        target = Path(local["body"]["saved_to"])
+        assert target.exists(), "备份包应真的落到本机下载目录"
+        assert target.parent == home / "Downloads"
+        assert started, "保存后应尝试打开文件位置"
+        with zipfile.ZipFile(target) as z:
+            names = set(z.namelist())
+        assert plugin._diary_path(SENDER).name in names
+        assert plugin._diary_path(OTHER).name in names
+        assert "备份说明.txt" in names
+        assert not any("key" in n.lower() for n in names), "备份包绝不能含钥匙"
+        # 数据目录里不残留临时备份包（已移走）
+        assert not list(inst.data_dir.glob("memory_diary_backup_*.zip"))
+        # 远程面板不允许触发本机文件操作
+        assert remote["status"] == 400
+        assert "REMOTE_PANEL" in remote["body"]["message"]
+
+
 async def test_web_import_round_trip_and_errors():
     async with World(config={"use_persona": False}) as world:
         async def scenario(inst):
@@ -558,3 +604,65 @@ async def test_web_image_payload_survives_bridge_unwrap():
         assert payload["found"] is True
         assert payload["mime"] == "image/png"
         assert base64.b64decode(payload["image"]) == png
+
+
+# ---------------------------------------------------------------------------
+# P2-2 第 4 点：一键备份全部用户日记（/export_all）
+#   该接口是 v0.5.5 新特性，baseline 不存在，因此只驱动 refactor 侧。
+# ---------------------------------------------------------------------------
+
+
+async def _call_raw(handler, request, *args):
+    """与 _call 相同地绑定 request context，但返回原始响应对象。
+
+    ``FileResponse`` 需要读 ``resp.path`` 才能检查包内容，_call 会把它转成
+    dict 摘要、丢掉 path。
+    """
+    with _bind(request):
+        return await handler(*args)
+
+
+async def test_web_export_all_backup_bundle():
+    if env.is_baseline_only():
+        return  # 新接口只存在于 refactor 侧
+    async with World(config={"use_persona": False}) as world:
+        inst = world.refactor
+        plugin = inst.plugin
+
+        # 还没有任何日记：必须 400，不能给一个空包
+        empty = await _call_raw(plugin.web_export_all, FakeWebRequest())
+        assert getattr(empty, "status_code", None) == 400
+
+        _seed_diary(inst)
+        _seed_diary(inst, OTHER, "阿堵")
+        # P3-16：构造真实命名的临时残留 diary_<16hex>.zip.tmp-<pid>，不应入包
+        stray = inst.data_dir / "diary_0123456789abcdef.zip.tmp-4242"
+        stray.write_text("x", encoding="utf-8")
+        assert stray.exists()
+
+        resp = await _call_raw(plugin.web_export_all, FakeWebRequest())
+        assert type(resp).__name__ == "FileResponse"
+        path = Path(resp.path)
+        assert path.exists()
+        assert path.name.startswith("memory_diary_backup_")
+        assert path.name.endswith(".zip")
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            readme = z.read("备份说明.txt").decode("utf-8")
+        expected = {
+            plugin._diary_path(SENDER).name,
+            plugin._diary_path(OTHER).name,
+            "备份说明.txt",
+        }
+        assert names == expected
+        # 绝不包含主密钥/签名钥匙；临时残留也不入包
+        assert not any("key" in n.lower() for n in names)
+        assert stray.name not in names
+        assert not any(".zip.tmp-" in n for n in names)
+        # 备份说明：份数 + 整机迁移要连同 .diary_key 一起备份
+        assert "用户份数：2 份" in readme
+        assert ".diary_key" in readme
+
+        # 路由已注册（否则前端按钮点了没反应）
+        routes = [r[0] for r in inst.ctx.registered_web_apis]
+        assert any(r.endswith("/export_all") for r in routes)

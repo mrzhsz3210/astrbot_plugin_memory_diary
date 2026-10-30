@@ -134,10 +134,17 @@ async def test_instantiation_uses_star_tools_data_dir_and_registers_web_apis():
             assert inst.ctx.registered_web_apis, "web APIs were not registered"
         routes = sorted(r[0] for r in base.ctx.registered_web_apis)
         routes_new = sorted(r[0] for r in new.ctx.registered_web_apis)
-        compare.assert_equal(routes, routes_new, "web API routes")
+        # v0.5.5 新增「一键备份」路由，baseline 侧补齐后再做差分比较
+        routes += [
+            "/astrbot_plugin_memory_diary/export_all",
+            "/astrbot_plugin_memory_diary/export_all_local",
+        ]
+        compare.assert_equal(sorted(routes), routes_new, "web API routes")
         handler_names = sorted(r[1].__name__ for r in base.ctx.registered_web_apis)
+        # v0.5.5 新增 web_export_all / web_export_all_local handler
+        handler_names += ["web_export_all", "web_export_all_local"]
         compare.assert_equal(
-            handler_names,
+            sorted(handler_names),
             sorted(r[1].__name__ for r in new.ctx.registered_web_apis),
             "web API handlers",
         )
@@ -174,3 +181,50 @@ async def test_roundtrip_provider_scripted_smoke():
             }
 
         await world.run_pair(scenario, label="smoke diary write")
+
+
+def test_on_llm_response_conditional_registration():
+    """P2-5：`on_llm_response` 必须条件注册，老 AstrBot 4.x 缺该钩子也能加载。
+
+    模块导入期硬用 `@filter.on_llm_response()` 时，缺少该装饰器的老 4.x 会在
+    import 阶段 AttributeError、整个插件加载失败。这里同时钉住三点：
+    1) 类方法体上不再挂裸装饰器（否则条件注册可能被改回去）；
+    2) 注册入口是 `hasattr(filter, "on_llm_response")` 判断；
+    3) 在当前有该钩子的 AstrBot 上，refactor 侧确实把 handler 注册进了
+       star_handlers_registry，且方法仍是可 await 的协程。
+    """
+    if env.is_baseline_only():
+        return  # refactor 侧专属约定
+
+    import ast
+
+    source = (env.REFACTOR_DIR / "main.py").read_text(encoding="utf-8")
+    assert 'hasattr(filter, "on_llm_response")' in source, (
+        "on_llm_response 应采用 hasattr 条件注册（P2-5）"
+    )
+    tree = ast.parse(source)
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MemoryDiaryPlugin"
+    )
+    method = next(
+        node
+        for node in cls.body
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name == "on_llm_response"
+    )
+    assert not method.decorator_list, (
+        "on_llm_response 不能再挂模块导入期的裸装饰器（老 4.x 会直接加载失败）"
+    )
+
+    module = loader.get_module(env.SIDE_REFACTOR)
+    handlers = [
+        handler
+        for handler in star_handlers_registry
+        if handler.handler_module_path == module.__name__
+        and handler.handler_name == "on_llm_response"
+    ]
+    assert len(handlers) == 1, "当前 AstrBot 有 on_llm_response 钩子，必须注册"
+    assert handlers[0].event_type.name == "OnLLMResponseEvent"
+    assert inspect.iscoroutinefunction(module.MemoryDiaryPlugin.on_llm_response)

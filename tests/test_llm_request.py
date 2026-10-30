@@ -382,9 +382,6 @@ async def test_watch_ratio_clamping_and_estimate_tokens():
             plugin.config["remind_ratio"] = 0.95
             plugin.config["auto_ratio"] = 0.5
             clamped = plugin._watch_ratios()
-            plugin.config["remind_ratio"] = 0
-            plugin.config["auto_ratio"] = 5
-            bounds = plugin._watch_ratios()
             req = ProviderRequest(
                 prompt="abc",
                 system_prompt="defg",
@@ -400,7 +397,6 @@ async def test_watch_ratio_clamping_and_estimate_tokens():
             }
             return {
                 "clamped": clamped,
-                "bounds": bounds,
                 "estimate": estimate,
                 "detected": detected,
                 "flattened": plugin._flatten_history(
@@ -412,7 +408,32 @@ async def test_watch_ratio_clamping_and_estimate_tokens():
                 ),
             }
 
-        await world.run_pair(scenario, label="watch helpers")
+        pair = await world.run_pair(scenario, label="watch helpers")
+        # normalise_value 把 tuple 归一为 list
+        assert pair.value["clamped"] == [0.5, 0.5]
+
+
+async def test_watch_ratio_zero_disables_refactor_only():
+    """v0.5.5 新语义：阈值 0 = 该档关闭；旧开关 enable_context_watch=false 兼容。
+
+    baseline 把 0 钳到 0.01 / 回退默认值，语义不同，故只驱动 refactor 侧。
+    """
+    async with World(config={"use_persona": False}) as world:
+        inst = world.refactor
+        plugin = inst.plugin
+        plugin.config["remind_ratio"] = 0
+        plugin.config["auto_ratio"] = 5
+        assert plugin._watch_ratios() == (0.0, 1.0)
+        # auto=0 时不把 remind 截断到 0：只提醒、不自动写是合法配置
+        plugin.config["remind_ratio"] = 0.75
+        plugin.config["auto_ratio"] = 0
+        assert plugin._watch_ratios() == (0.75, 0.0)
+        # 旧开关 false：两档都关（存量兼容），并只记一次迁移日志
+        plugin.config["enable_context_watch"] = False
+        assert plugin._watch_ratios() == (0.0, 0.0)
+        plugin.config["remind_ratio"] = 0.8
+        plugin.config["auto_ratio"] = 0.9
+        assert plugin._watch_ratios() == (0.0, 0.0)
 
 
 async def test_inject_delivery_system_prompt_fallback():
