@@ -130,7 +130,12 @@ async def test_instantiation_uses_star_tools_data_dir_and_registers_web_apis():
         assert base.data_dir != new.data_dir
         assert base.data_dir.is_dir() and new.data_dir.is_dir()
         for inst in (base, new):
-            assert str(inst.data_dir).endswith("data\\plugin_data\\astrbot_plugin_memory_diary")
+            # 用 pathlib 比较末尾路径分量，避免硬编码 Windows 分隔符（Linux CI 也要通过）
+            assert Path(inst.data_dir).parts[-3:] == (
+                "data",
+                "plugin_data",
+                "astrbot_plugin_memory_diary",
+            )
             assert inst.ctx.registered_web_apis, "web APIs were not registered"
         routes = sorted(r[0] for r in base.ctx.registered_web_apis)
         routes_new = sorted(r[0] for r in new.ctx.registered_web_apis)
