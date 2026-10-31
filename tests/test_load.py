@@ -144,10 +144,14 @@ async def test_instantiation_uses_star_tools_data_dir_and_registers_web_apis():
             "/astrbot_plugin_memory_diary/export_all",
             "/astrbot_plugin_memory_diary/export_all_local",
         ]
+        # v0.6 新增「插图画」路由（D5，baseline 没有插图功能），同样给 baseline 补齐
+        routes += ["/astrbot_plugin_memory_diary/image/<file_key>/<name>"]
         compare.assert_equal(sorted(routes), routes_new, "web API routes")
         handler_names = sorted(r[1].__name__ for r in base.ctx.registered_web_apis)
         # v0.5.5 新增 web_export_all / web_export_all_local handler
         handler_names += ["web_export_all", "web_export_all_local"]
+        # v0.6 新增 web_get_diary_image handler
+        handler_names += ["web_get_diary_image"]
         compare.assert_equal(
             sorted(handler_names),
             sorted(r[1].__name__ for r in new.ctx.registered_web_apis),
