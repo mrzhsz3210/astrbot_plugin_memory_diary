@@ -11,14 +11,19 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from .annotation import AnnotationMixin
 from .common import strip_invisible
 from .constants import PLUGIN_NAME, _STATE_CAP
+from .illustration import IllustrationMixin
+from .imaging import ImagingMixin
 from .log import logger
 from .service import ServiceMixin
 from .storage import StorageMixin
 
 
-class MemoryDiaryCore(StorageMixin, ServiceMixin):
+class MemoryDiaryCore(
+    StorageMixin, ServiceMixin, ImagingMixin, IllustrationMixin, AnnotationMixin
+):
     """插件业务核心，可被 main.py 的 Star 子类直接继承。"""
 
     README_ZIP_ENTRY = "说明.txt"
@@ -61,6 +66,14 @@ class MemoryDiaryCore(StorageMixin, ServiceMixin):
         "memo",
         "memo_view",
         "memo_delete",
+        "形象",
+        "日记形象",
+        # v0.6 批注指令（与 service._OP_USER_COMMANDS 保持同一份口径）
+        "查看批注",
+        "写回批注",
+        "annotations",
+        "diary_annotations",
+        "diary_writeback",
         "reset",
         "重置",
     )
@@ -128,6 +141,19 @@ class MemoryDiaryCore(StorageMixin, ServiceMixin):
         self._auto_time_warned = ""
         # 插件是否已进入终止流程：终止后即使还有旧 handler 被派发也不许再起后台任务
         self._terminated = False
+
+        # ---- 插图（v0.6）----
+        # 后台生图任务集合（terminate 时取消，避免卸载后还在写 zip）
+        self._image_tasks: set = set()
+        # 本地生图通道类型缓存（url -> "sdwebui"/"comfy"，探测一次即可）
+        self._image_local_kind: dict = {}
+        # 全局并发生图上限（image_concurrency；首次调度时惰性创建）
+        self._image_semaphore = None
+        self._image_semaphore_cap = 0
+        # 最近一次写日记的插图提示行（main.py 在"写好了"通知后读取并清空）
+        self._image_last_notice = ""
+        # 白名单拒绝提示已发过的身份（附录 A 修复：每个身份只提示一次，防刷屏）
+        self._whitelist_hint_sent: set = set()
 
     # ------------------------- 白名单 -------------------------
 
@@ -245,6 +271,19 @@ class MemoryDiaryCore(StorageMixin, ServiceMixin):
                 pass
             except Exception as e:
                 logger.warning(f"[memory_diary] 停止自动写日记任务异常: {e}")
+        # 插图后台任务：先取消再逐个等退出，避免卸载后还在改 zip/发消息
+        image_tasks = list(getattr(self, "_image_tasks", None) or [])
+        self._image_tasks = set()
+        self._image_semaphore = None
+        for itask in image_tasks:
+            itask.cancel()
+        for itask in image_tasks:
+            try:
+                await itask
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"[memory_diary] 停止插图任务异常: {e}")
         self._injected_cid.clear()
         self._injected_entries.clear()
         self._pending_inject.clear()
@@ -254,3 +293,4 @@ class MemoryDiaryCore(StorageMixin, ServiceMixin):
         self._reset_pending.clear()
         self._pending_estimates.clear()
         self._last_context_used.clear()
+        self._whitelist_hint_sent.clear()

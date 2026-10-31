@@ -81,6 +81,18 @@ async def test_help_command_private_and_group_addressing():
         value = pair.value
         assert "📖 记忆日记 · 指令一览" in value["private"][0]
         assert "本群多 AI 防冲突" in value["group_plain"][0]
+        # v0.6：帮助菜单新增 /形象（插图形象档案）。差分比较前已在
+        # harness.normalise_text 里归一掉这一行（pair.value 是归一后的文本），
+        # 所以这里直接驱动 refactor 侧原始输出，显式钉住它确实存在。
+        raw_help = await world.refactor.run_handler(
+            "diary_help", private_event("/日记帮助")
+        )
+        assert "/形象" in raw_help[0]
+        assert "查看/确认/修改/重拟" in raw_help[0]
+        # v0.6：帮助菜单新增 /查看批注、/写回批注（同样在差分前被归一掉）
+        assert "/查看批注" in raw_help[0]
+        assert "/写回批注" in raw_help[0]
+        assert "私聊专用" in raw_help[0].split("/查看批注")[1][:40]
         assert value["group_at_other"] == []
         assert value["group_require_no_at"] == []
 

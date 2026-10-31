@@ -68,6 +68,9 @@ class FakeEvent:
         self.unified_msg_origin = umo or self._default_umo()
         self._messages = list(messages or [])
         self.sent: list[FakeResult] = []
+        # v0.6 插图：记录每次 MessageChain 发送的组件类型名（如 ["Image"]），
+        # 供 QQ 图文穿插测试断言"图片确实以 Image 组件发出、不是只有文字"。
+        self.sent_chains: list[list[str]] = []
         self.captured_files: list[Path] = []
         self.captured_dir = captured_dir
         self.stopped = False
@@ -109,6 +112,7 @@ class FakeEvent:
             self.sent.append(result)
             return
         if isinstance(result, MessageChain):
+            self.sent_chains.append([type(comp).__name__ for comp in result.chain])
             texts = []
             for comp in result.chain:
                 if isinstance(comp, Plain):

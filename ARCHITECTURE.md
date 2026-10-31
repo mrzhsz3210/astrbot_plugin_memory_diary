@@ -5,19 +5,30 @@
 指令与 Web 页面均保持不变。
 
 ```text
-main.py                         AstrBot 适配层（约 2200 行）
+main.py                         AstrBot 适配层（指令/事件钩子/Web 路由/消息发送）
 └── memory_diary/               领域核心（不 import astrbot，可单独测试）
     ├── constants.py            提示词、注入模板、默认值
     ├── errors.py               DiaryKeyUnavailable / DiaryTamperedError / DiaryCorruptError
-    ├── common.py               文件名 key 等无状态工具
+    ├── common.py               文件名 key、图片魔数嗅探等无状态工具
     ├── log.py                  日志兼容层（有 AstrBot 用其 logger，无则静默丢弃）
     ├── storage.py              文件布局、HMAC 验签、偏好/备忘、旧格式迁移、
-    │                           迁移包导入导出、Web 数据
+    │                           迁移包导入导出、Web 数据、图片入 zip（v0.6）、
+    │                           批注侧车 annotations.json（v0.6）
     ├── service.py              会话历史 → 写作素材 → LLM 写作 → 保存、
     │                           上下文哨兵、token 校准（EWMA）、每天定时自动写日记
     ├── token_estimator.py      纯函数 token 估算：分类加权 + 消息/工具/多模态开销（v0.5.5）
+    ├── imaging.py              生图通道：本地 SD-WebUI / ComfyUI、云端 OpenAI 兼容
+    │                           images API、尺寸/超时/参考图退化、用量记账（v0.6 插图）
+    ├── illustration.py         插图领域编排：AI 意愿×概率×限额闸门、正文标记解析、
+    │                           用户照片扫描、PENDING 占位与异步落图、形象档案（v0.6 插图）
+    ├── annotation.py           批注领域编排：reset 同步生成、注入裁剪/渲染、
+    │                           /查看批注 文案、QQ 第五部分、写回蒸馏、Web 角标数据（v0.6 批注）
     └── core.py                 MemoryDiaryCore：组合上述 mixin，管理内存状态/生命周期
 ```
+
+> v0.6 起 `image_*` / `annotation_*` 两个 feature 完全独立、各自可开关：
+> 插图代码只出现在 `imaging.py` / `illustration.py`，批注代码只出现在
+> `annotation.py`；两者共用 storage 的 zip / HMAC 公共能力，互不 import。**
 
 ## 为什么这样切
 

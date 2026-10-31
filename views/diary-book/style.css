@@ -15,6 +15,8 @@
   --shadow: rgba(61, 50, 37, 0.35);
   --btn: #6b5a41;
   --btn-text: #f8f2e3;
+  --badge-bg: rgba(168, 82, 63, 0.12);
+  --badge-bg-strong: rgba(168, 82, 63, 0.26);
 }
 
 [data-theme="dark"] {
@@ -32,6 +34,8 @@
   --shadow: rgba(0, 0, 0, 0.6);
   --btn: #55483a;
   --btn-text: #e8dfc9;
+  --badge-bg: rgba(207, 122, 99, 0.18);
+  --badge-bg-strong: rgba(207, 122, 99, 0.34);
 }
 
 * { box-sizing: border-box; }
@@ -93,12 +97,17 @@ select.ctl { max-width: 220px; }
   min-height: 0;
 }
 
+/* 书本投影用 box-shadow 而不是 filter: drop-shadow：filter 会让 .book 成为
+ * fixed 定位的包含块，批注卡片（position: fixed，见下方 .ann-card）就会被
+ * .page 的 overflow: hidden 裁掉。书本外缘四个圆角都是 14px，box-shadow
+ * 的形状与原来的 drop-shadow 一致。 */
 .book {
   display: flex;
   width: min(1060px, 96%);
   height: 100%;
   max-height: 720px;
-  filter: drop-shadow(0 14px 22px var(--shadow));
+  border-radius: 14px;
+  box-shadow: 0 14px 22px var(--shadow);
 }
 
 .page {
@@ -232,6 +241,206 @@ select.ctl { max-width: 220px; }
 }
 .diary-body .tampered {
   color: var(--accent);
+}
+
+/* ---------- 日记插图（v0.6） ----------
+ * app.js 先把 `![alt](images/name)` 渲染成 figure.diary-img 占位，取回 base64 后
+ * 换成 data URL，再按图片自然宽高打 landscape / portrait / square 之一。
+ * 尺寸规范（设计 7.3）：横图通栏、竖图约 70% 宽居中、方图居中，圆角 + 上下留白。 */
+.diary-body figure.diary-img {
+  display: block;
+  margin: 16px auto;
+  max-width: 100%;
+  text-align: center;
+  white-space: normal;
+  line-height: 1.5;
+}
+.diary-img img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+  border-radius: 8px;
+  box-shadow: 0 2px 10px rgba(61, 50, 37, 0.18);
+}
+.diary-img.landscape img { max-width: 100%; }
+.diary-img.portrait img { max-width: 70%; }
+.diary-img.square img { max-width: 80%; }
+
+/* 加载中 / 图还没画好：只显示文字占位，不显示空 img 的破图图标 */
+.diary-img.pending img,
+.diary-img.img-generating img { display: none; }
+.diary-img.pending::after {
+  content: "插图加载中…";
+  display: block;
+  padding: 14px 16px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  color: var(--ink-soft);
+  font-size: 13px;
+  letter-spacing: 1px;
+}
+.diary-img.img-generating::after { content: "插图还在画…"; }
+
+/* 缺图（优雅降级）与篡改（入侵警告）两种占位 */
+.diary-img.img-missing,
+.diary-img.img-tampered {
+  display: block;
+  padding: 14px 16px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.diary-img.img-tampered {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-size: 14px;
+}
+.diary-img .img-warning,
+.diary-img .img-missing-text { white-space: normal; word-break: break-word; }
+
+/* ---------- 页边批注（v0.6） ----------
+ * 角标落在原文旁边（学术论文式上标）；.ann-mark 是锚点原文 + 角标 + 卡片的
+ * 包层，卡片是 position: fixed 的悬浮层（浮在活页本之上，坐标由 app.js 写入），
+ * 桌面靠 :hover 展开、触屏点按切换 .open。
+ * 锚点失配的批注不丢，收进 .ann-margin 页边区（静态排布）；验签失败用
+ * .ann-tampered 警告条。零批注时这些节点都不存在，视觉与 v0.5.5 一致。 */
+/* 角标：上标感的圆角小牌，普通数字 + 明确底色。
+ * 序号用普通数字（JS 的 annSupNumber），不再用 ⁰¹² 上标字符——上标字符本身
+ * 只有半个字高，再叠一层 <sup> 会小到看不清。 */
+.diary-body .ann-badge {
+  display: inline-block;
+  min-width: 1.5em;
+  margin-left: 2px;
+  padding: 0 5px;
+  vertical-align: 0.5em;
+  font-size: 0.85em;
+  font-weight: 700;
+  line-height: 1.5;
+  text-align: center;
+  letter-spacing: 0;
+  color: var(--accent);
+  background: var(--badge-bg);
+  border-radius: 999px;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.diary-body .ann-mark.open .ann-badge { background: var(--badge-bg-strong); }
+/* 触屏没有可靠的 hover（点按会留下 sticky :hover）：悬停态只在桌面指针设备启用，
+ * 触屏统一走 JS 切换的 .open；键盘用 :focus-within。 */
+@media (hover: hover) and (pointer: fine) {
+  .diary-body .ann-badge:hover,
+  .diary-body .ann-mark:hover .ann-badge { background: var(--badge-bg-strong); }
+}
+.diary-body .ann-badge:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 批注卡片：固定定位的悬浮层，浮在活页本（书页 / 书脊 / 书页圆角）之上。
+ * 以前的卡片是 .page-inner 里的绝对定位子元素，长批注会被书页下缘 / 右缘裁掉
+ * （看起来像被活页本盖住一角）。position: fixed 的元素不会被中间层的
+ * overflow: hidden 裁切，前提是祖先里没有 filter / transform —— 所以 .book
+ * 的投影改成了 box-shadow。left / top / max-height 由 app.js 的
+ * positionAnnCard() 按角标位置与视口空间写入：放不下时翻到角标上方，
+ * 内容比可用空间还高时卡片内部滚动。 */
+.diary-body .ann-card {
+  display: none;
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 60;
+  width: min(280px, 72vw);
+  max-width: 72vw;
+  max-height: 70vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--ink);
+  box-shadow: 0 10px 26px var(--shadow);
+  font-size: 14px;
+  line-height: 1.65;
+  letter-spacing: 0;
+  text-align: left;
+  white-space: normal;
+  word-break: break-word;
+  cursor: auto;
+}
+.diary-body .ann-mark.open .ann-card,
+.diary-body .ann-mark:focus-within .ann-card { display: block; }
+@media (hover: hover) and (pointer: fine) {
+  .diary-body .ann-mark:hover .ann-card { display: block; }
+}
+
+.diary-body .ann-note { display: block; }
+.diary-body .ann-reply {
+  display: block;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+}
+.diary-body .ann-reply-title {
+  display: block;
+  font-size: 13px;
+  letter-spacing: 1px;
+  color: var(--accent);
+}
+.diary-body .ann-summary { display: block; margin-top: 4px; }
+.diary-body .ann-spec {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+/* 锚点失配兜底：当天日记底部的页边区，静态排布、条间留白。
+ * 一期不加"批注内容"字样标题，只用一条细分割线与正文区分。 */
+.diary-body .ann-margin {
+  display: block;
+  margin-top: 22px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--line);
+  white-space: normal;
+}
+.diary-body .ann-margin-card {
+  display: block;
+  margin: 0 0 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ring);
+  border-radius: 8px;
+  background: var(--bg);
+  font-size: 14px;
+  line-height: 1.65;
+  letter-spacing: 0;
+  text-align: left;
+  word-break: break-word;
+}
+.diary-body .ann-margin-anchor {
+  margin-bottom: 5px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+/* 批注验签失败：与插图 .img-tampered 同级的入侵警告 */
+.diary-body .ann-tampered {
+  display: block;
+  margin: 0 0 14px;
+  padding: 8px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--paper-edge);
+  color: var(--accent);
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: normal;
 }
 
 /* ---------- 底栏 ---------- */
@@ -398,4 +607,14 @@ body.custom-backdrop {
   .spine { display: none; }
   .page-right { border-radius: 14px; }
   .page-inner { padding: 22px; }
+  /* 窄屏阅读栏变窄：竖图/方图适当放宽，避免缩得太小；仍受 100% 上限约束不撑破活页本 */
+  .diary-body figure.diary-img { margin: 12px auto; }
+  .diary-img.portrait img { max-width: 82%; }
+  .diary-img.square img { max-width: 92%; }
+  /* 批注卡片：窄屏收小；宽度上限 78vw，真正落位时 app.js 还会夹进视口 */
+  .diary-body .ann-card {
+    width: min(240px, 78vw);
+    max-width: 78vw;
+  }
+  .diary-body .ann-margin-card { padding: 8px 10px; }
 }

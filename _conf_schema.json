@@ -10,14 +10,22 @@
     "type": "float",
     "hint": "上下文占用达到该比例时提醒一次，默认 0.75；设为 0 表示不提醒。必须小于等于自动写日记阈值，配置颠倒时插件会自动截断并记日志",
     "default": 0.75,
-    "slider": {"min": 0, "max": 1, "step": 0.05}
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.05
+    }
   },
   "auto_ratio": {
     "description": "自动写日记阈值（占比，0=不自动写）",
     "type": "float",
     "hint": "上下文占用达到该比例时自动写好日记并提醒你 /reset，默认 0.9；设为 0 表示不自动写。两档都为 0 时上下文哨兵整体停用",
     "default": 0.9,
-    "slider": {"min": 0, "max": 1, "step": 0.05}
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.05
+    }
   },
   "token_estimation_v2": {
     "description": "改进版token估算（实验性功能，默认关闭）",
@@ -28,8 +36,11 @@
   "token_calibration_enabled": {
     "description": "token估算自动校准（实验性功能，默认关闭）",
     "type": "bool",
-    "hint": "实验性功能，默认关闭。开启后按模型用服务提供商返回的真实 token 用量自动修正估算系数（EWMA），仅当上一项「改进版token估算」也开启时生效。关闭后：估算仍按静态公式（系数恒 1.0），不会采样、不写 token_calibration.json；已有校准文件不会被删除，重新开启会继续沿用其中系数（想从 1.0 重学请删除该文件并重载插件）。",
-    "default": false
+    "hint": "实验性功能，默认关闭。开启后按模型用服务提供商返回的真实 token 用量自动修正估算系数（EWMA），仅当上一项「改进版token估算」也开启时生效。关闭后：估算仍按静态公式（系数恒 1.0），不会采样、不写 token_calibration.json；已有校准文件不会被删除，重新开启会继续沿用其中系数（想从 1.0 重学请删除该文件并重载插件）。本项配置页上仅在「改进版token估算」开启后才显示。",
+    "default": false,
+    "condition": {
+      "token_estimation_v2": true
+    }
   },
   "enable_auto_inject": {
     "description": "新会话自动读取日记",
@@ -140,22 +151,293 @@
     "hint": "每个用户两次写日记/删日记之间的最小间隔；0 为不限制，最高 60 分钟",
     "default": 5
   },
-  "enable_context_watch": {
-    "description": "启用上下文哨兵（已废弃，仅兼容旧配置）",
-    "type": "bool",
-    "hint": "v0.5.5 起请改用上方「提醒阈值 / 自动写日记阈值」：某档设为 0 即关闭该档，两档都 0 等于哨兵停用。本项只为兼容 v0.5.4 及更早的旧配置而保留：旧配置里为 false 时会被视为两档阈值都 0（不会提醒/不会自动写）；想让哨兵重新工作，请把本项改为 true 后去上方调整阈值。AstrBot 会在加载配置时保留本项，所以旧用户的 false 不会丢。",
-    "default": true
-  },
   "web_diary_brand": {
     "description": "日记本页面的称呼",
     "type": "string",
     "hint": "管理面板「日记本」视图左上角的标题，显示为「XX的日记本」，默认 TA；留空也用 TA，最长 12 个字符",
     "default": "TA"
   },
+  "image_enabled": {
+    "description": "插图功能总开关（AI 生图 / 用户照片入日记）",
+    "type": "bool",
+    "hint": "v0.6 新增，默认关闭。开启后她写日记时才可能顺手画一张插图，并把你们聊天里你发过的照片收进日记；关闭时插图相关逻辑与模型调用全部不执行（零额外消耗），日记本页面也不会出现插图。默认走本机生图，不把内容发到外部服务商。",
+    "default": false
+  },
+  "image_mode": {
+    "description": "生图通道",
+    "type": "string",
+    "options": [
+      "local",
+      "cloud"
+    ],
+    "labels": [
+      "本地（SD-WebUI / ComfyUI）",
+      "云端（OpenAI 兼容 API）"
+    ],
+    "hint": "local 走本机或局域网里的 SD-WebUI / ComfyUI（插件会按地址自动识别两种接口）；cloud 走任意 OpenAI 兼容的图片接口。默认本地，隐私优先；选云端前请看清下方隐私提示。",
+    "default": "local",
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "image_local_url": {
+    "description": "本地生图服务地址",
+    "type": "string",
+    "hint": "例如 http://127.0.0.1:7860（SD-WebUI）或 http://127.0.0.1:8188（ComfyUI），插件会按地址自动识别通道。留空 = 本地生图不可用（不报错，只是不出图）。",
+    "default": "",
+    "condition": {
+      "image_enabled": true,
+      "image_mode": "local"
+    }
+  },
+  "image_api_base": {
+    "description": "云端生图 API 地址",
+    "type": "string",
+    "hint": "OpenAI 兼容的 images API 基础地址，例如 https://api.openai.com/v1（需保证 <base>/images/generations 可用）。⚠ 隐私提示：日记内容摘要与你的照片将发送到该服务商，请确认你信任该服务商及其数据政策。",
+    "default": "",
+    "condition": {
+      "image_enabled": true,
+      "image_mode": "cloud"
+    }
+  },
+  "image_api_key": {
+    "description": "云端生图 API Key",
+    "type": "string",
+    "secret": true,
+    "hint": "云端生图服务的 API Key。⚠ 隐私提示：日记内容摘要与你的照片将发送到该服务商。",
+    "default": "",
+    "condition": {
+      "image_enabled": true,
+      "image_mode": "cloud"
+    }
+  },
+  "image_model": {
+    "description": "云端生图模型",
+    "type": "string",
+    "hint": "OpenAI 兼容图片接口的模型名，例如 gpt-image-1、dall-e-3 或服务商提供的同类模型；留空则用服务商默认模型。⚠ 隐私提示：日记内容摘要与你的照片将发送到该服务商。",
+    "default": "",
+    "condition": {
+      "image_enabled": true,
+      "image_mode": "cloud"
+    }
+  },
+  "image_size_preset": {
+    "description": "插图尺寸档位（JSON）",
+    "type": "string",
+    "hint": "横/竖/方三档的生成尺寸，格式为 JSON，例如 {\"portrait\":[768,1024],\"landscape\":[1024,768],\"square\":[1024,1024]}，每项为 [宽,高]。本地模型原生尺寸不同（如 SD 的 512/768 档）时可整体替换。填错或留空会回退默认值，不会影响插件运行。",
+    "default": "{\"portrait\": [768, 1024], \"landscape\": [1024, 768], \"square\": [1024, 1024]}",
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "image_prob_memo": {
+    "description": "简记插图触发概率（0~1）",
+    "type": "float",
+    "hint": "每篇简记按该概率决定画不画；0 = 简记不插图（默认），1 = 每篇都画。概率只是“可能性”，最终还要看 AI 是否在正文里标了插图位置。",
+    "default": 0.0,
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.05
+    },
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "image_prob_full": {
+    "description": "完整日记插图触发概率（0~1）",
+    "type": "float",
+    "hint": "每篇完整日记按该概率决定画不画，默认 0.3；0 = 完整日记也不插图。",
+    "default": 0.3,
+    "slider": {
+      "min": 0,
+      "max": 1,
+      "step": 0.05
+    },
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "image_limit_memo": {
+    "description": "单篇简记最多几张插图",
+    "type": "int",
+    "hint": "默认 0 = 简记不画（0 是「不画」而不是「不限」）。简记篇幅短，想要插图请调到 1，并把上面的「简记插图触发概率」一起调高；仍受每日总量与概率闸门约束。",
+    "default": 0,
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "image_limit_full": {
+    "description": "单篇完整日记最多几张插图",
+    "type": "int",
+    "hint": "默认 2；0 = 完整日记也不画（0 是「不画」而不是「不限」）。",
+    "default": 2,
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "image_limit_daily": {
+    "description": "每日插图总量上限（全局兜底）",
+    "type": "int",
+    "hint": "所有用户、所有日记加起来的每日生图张数上限，默认 6；填 0 表示今天不画（全局兜底关闭即不画）；想彻底停用插图请用上方「插图功能总开关」。生成失败不计数。",
+    "default": 6,
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "image_limit_group": {
+    "description": "群聊单篇最多几张插图",
+    "type": "int",
+    "hint": "默认 0 = 群聊不插图（群聊连发多张有刷屏感）；私聊与 WebUI 不受影响。",
+    "default": 0,
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "image_concurrency": {
+    "description": "同时生成插图的最大数量",
+    "type": "int",
+    "hint": "1~8，默认 2；本地显卡较弱时建议 1，避免排队把每张都拖到超时。",
+    "default": 2,
+    "slider": {
+      "min": 1,
+      "max": 8,
+      "step": 1
+    },
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "image_timeout": {
+    "description": "单张插图生成超时（秒）",
+    "type": "int",
+    "hint": "超时视为失败，静默清掉正文里的占位；默认 120 秒；本地模型较慢时可调大（如 300）。",
+    "default": 120,
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "persona_image_desc": {
+    "description": "AI 形象描述（画图专用，唯一事实源）",
+    "type": "string",
+    "hint": "用一小段固定格式描述她在画里长什么样（发色、服饰、气质等），生图时原样嵌入提示词，防止形象漂移。可在 QQ 私聊用 /形象 指令查看、修改、重拟；留空时首次插图会先请人设提炼一版提案待你确认。",
+    "default": "",
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "image_style_prompt": {
+    "description": "画风锚（额外提示词）",
+    "type": "string",
+    "hint": "追加到每次生图提示词末尾的画风约束，例如「柔和的水彩插画，暖色调，留白」，防止画风漂移；留空则用插件内置的默认画风。",
+    "default": "",
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "user_image_enabled": {
+    "description": "把用户发来的照片收进日记",
+    "type": "bool",
+    "hint": "默认开启（仅私聊写日记时生效；群聊写日记不收集照片，避免收进群成员的照片）。开启后她会判断你发的照片值不值得入日记（表情包等随手图不收）；关闭后只画 AI 插图、不收用户照片。照片只走你配置的生图/视觉通道，图片本体不进 LLM 文本上下文。",
+    "default": true,
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "user_image_limit": {
+    "description": "单篇日记最多收几张用户照片",
+    "type": "int",
+    "hint": "默认 1；0 = 不收照片（不是不限）。注意：群聊写日记不收集照片——会话历史无法区分群成员谁发的图，避免把别人的照片收进写作者的日记。",
+    "default": 1,
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "user_ref_photo": {
+    "description": "参考照片路径",
+    "type": "string",
+    "hint": "本机可访问的参考照片路径（例如 data/ref.png）；生图通道支持参考图时会一起传给模型以稳定形象，留空则只靠上面的形象描述。",
+    "default": "",
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "vision_api_base": {
+    "description": "可选视觉接口 API 地址",
+    "type": "string",
+    "hint": "可选。配置后她才能“看见”用户照片的真实画面、写出更准确的描述；填 OpenAI 兼容视觉接口的基础地址，例如 https://api.openai.com/v1。⚠ 隐私提示：用户照片将发送到该服务商用于画面识别。不配置 = 诚实降级：只根据对话上下文描述，不编造画面。",
+    "default": "",
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "vision_api_key": {
+    "description": "可选视觉接口 API Key",
+    "type": "string",
+    "secret": true,
+    "hint": "视觉接口 API Key。⚠ 隐私提示：用户照片将发送到该服务商用于画面识别。",
+    "default": "",
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "vision_api_model": {
+    "description": "可选视觉接口模型",
+    "type": "string",
+    "hint": "视觉接口模型名，例如 gpt-4o-mini（需该模型接受图片输入）；不配置则视觉识别不可用，按诚实降级处理。",
+    "default": "",
+    "condition": {
+      "image_enabled": true
+    }
+  },
+  "annotation_enabled": {
+    "description": "批注功能总开关",
+    "type": "bool",
+    "hint": "v0.6 新增，默认关闭。开启后 reset 时会先读一遍日记、同步生成 1~5 条页边批注，并随日记一起注入；她可以在页边留下陈述或疑问，你在日记本页面能看到上标角标，私聊可用 /查看批注、/写回批注（写回需要你签字确认）。批注是纯文字玩法，任何环节都不会画图、不会调用插图；关闭时批注相关逻辑与模型调用全部不执行（零额外消耗），QQ 注入与日记本页面与 v0.5.5 完全一致。",
+    "default": false
+  },
+  "annotation_max_per_round": {
+    "description": "每轮最多生成几条批注",
+    "type": "int",
+    "hint": "1~5，默认 5。实际条数还会按当轮日记正文字数折算额度（正文越长越接近这个上限）；批注只在私聊生成、注入和展示，群聊不生成也不注入。",
+    "default": 5,
+    "slider": {
+      "min": 1,
+      "max": 5,
+      "step": 1
+    },
+    "condition": {
+      "annotation_enabled": true
+    }
+  },
+  "annotation_question_hint": {
+    "description": "疑问句软引导",
+    "type": "bool",
+    "hint": "默认开启：生成批注的提示词里保留「至少留一个真问题」的软引导，让批注更像她自己想追问的事。关闭后只写陈述性批注，不再引导她写疑问句。",
+    "default": true,
+    "condition": {
+      "annotation_enabled": true
+    }
+  },
+  "annotation_timeout": {
+    "description": "批注生成超时（秒）",
+    "type": "int",
+    "hint": "默认 30 秒，可填 5~300。批注在 reset 后首次注入时同步生成，超过该时间按失败降级：本轮先不带批注、日记照常注入，下次 reset 再试；不会阻塞对话，也不会写坏数据或清掉旧批注。",
+    "default": 30,
+    "condition": {
+      "annotation_enabled": true
+    }
+  },
   "diary_timezone": {
     "description": "日记时区",
     "type": "string",
     "hint": "写日记的时间戳、按天归档、'最近N天'都用这个时区，填 IANA 时区名，例如 Asia/Shanghai；留空则跟随服务器本地时间；填错会回退本地时间并记日志",
     "default": "Asia/Shanghai"
+  },
+  "enable_context_watch": {
+    "description": "启用上下文哨兵（已废弃，仅兼容旧配置）",
+    "type": "bool",
+    "hint": "v0.5.5 起请改用上方「提醒阈值 / 自动写日记阈值」：某档设为 0 即关闭该档，两档都 0 等于哨兵停用。本项只为兼容 v0.5.4 及更早的旧配置而保留：旧配置里为 false 时会被视为两档阈值都 0（不会提醒/不会自动写）；想让哨兵重新工作，请把本项改为 true 后去上方调整阈值。AstrBot 会在加载配置时保留本项，所以旧用户的 false 不会丢。",
+    "default": true
   }
 }

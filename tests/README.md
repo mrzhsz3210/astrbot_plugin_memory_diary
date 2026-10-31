@@ -100,6 +100,8 @@ tests/
 │   ├── session.py         # 把 session_waiter 换成可脚本化的 fake（驱动交互式分支）
 │   ├── compare.py         # 返回值比较、数据目录快照、zip 条目摘要
 │   └── errors.py          # SkipTest
+├── image_testkit.py        # 插图测试共用工具（假图片/zip 篡改/迁移包重打包）
+├── annotation_testkit.py  # 批注测试共用工具（配置/记录构造/种子/侧车篡改/迁移包）
 ├── test_load.py           # AstrBot 真实注册/模块路径/handler 元数据/实例化
 ├── test_storage.py        # 存储/签名/篡改/损坏隔离/迁移/偏好/备忘/素材游标
 ├── test_commands.py       # 全部聊天指令 + 交互式分支 + 导出/导入 + 人设口吻
@@ -108,7 +110,13 @@ tests/
 ├── test_auto_diary.py     # 每天定时自动写日记 tick、用户登记、失败通知、生命周期
 ├── test_bundle.py         # 迁移包校验/安装、换钥匙重签名、跨实现互导
 ├── test_v055_features.py  # v0.5.5 新功能：白名单/零宽字符/一键备份/token 估算与校准（只驱动 refactor）
-└── test_v055_lowfix.py    # v0.5.5 低危清理：原文验签（读/迁移包/主人解析）/素材哈希清理/冷却兜底/stat 竞态/双向互斥与锁粒度/全角参数（只驱动 refactor）
+├── test_v055_lowfix.py    # v0.5.5 低危清理：原文验签（读/迁移包/主人解析）/素材哈希清理/冷却兜底/stat 竞态/双向互斥与锁粒度/全角参数（只驱动 refactor）
+├── test_annotation_storage.py    # v0.6 D7 批注存储：侧车往返/签名三态/级联删除/500 上限/迁移包（只驱动 refactor）
+├── test_annotation_generation.py # v0.6 D8 批注生成：prompt/JSON 解析/额度/锚点/去重/降级（只驱动 refactor）
+├── test_annotation_inject.py     # v0.6 D8 批注注入：格式/裁剪/群聊隔离/关闭态逐字节一致（只驱动 refactor）
+├── test_annotation_commands.py   # v0.6 D9/D10 /查看批注、/写回批注、QQ 第五部分（只驱动 refactor）
+├── test_annotation_web.py        # v0.6 D10 web_read_day 字段/鉴权/导入带批注（只驱动 refactor）
+└── test_annotation_view.py       # v0.6 D10 app.js/style.css/schema/README 静态断言（只驱动 refactor）
 ```
 
 ## 差分机制
@@ -168,7 +176,8 @@ tests/
   错主人拒绝且不落盘；baseline 导出的包含已用 baseline 自己的密钥签名，refactor 能原样导入
   （反向亦然），两边最终数据目录摘要一致。
 * **v0.5.5 新功能**（`test_v055_features.py`；行为与 baseline 有意不同，故**只驱动 refactor 侧**）：
-  白名单解析与空名单全放行、名单外指令静默/注入与哨兵被挡/定时任务登记与触发过滤；
+  白名单解析与空名单全放行、名单外指令被拦截（私聊一次性 UID 提示、群聊/普通闲聊静默）/
+  注入与哨兵被挡/定时任务登记与触发过滤；
   零宽与方向控制字符在 `_command_arg`/`memo_cmd` 被剥离；指令 token 内文本 @ 一律沉默
   （旧配置 `bot_call_names` 残留失效）；Web `export_all` 一键备份（含全部用户、不含 `.diary_key`、
   附 `备份说明.txt`）；token 估算器纯函数（分类加权/消息与多模态开销/两入口一致）；
@@ -185,6 +194,26 @@ tests/
   手动写与自动写双向互斥、锁粒度是 sender_id（同群不同用户不互拒、同用户跨场景互斥）、
   占位前复查（门槛 await 期间被插队也不写盘）、哨兵/每天定时两处锁键护栏（锁被占时不调 LLM
   不写盘）；全角空格分隔的指令参数解析不变。
+
+* **v0.6 批注**（`test_annotation_*`；行为与 baseline 有意不同，故**只驱动 refactor 侧**）：
+  `annotations.json` 侧车（zip 内 + `sigs/annotations.json.sig` 整体 HMAC）往返与签名三态
+  （missing 不告警 / tampered 不展示不重签不覆盖 / no_key=不可信）；`_save_diary` 逐字节保留
+  批注、删日记级联删锚定该天的批注、500 条上限先丢最旧已解；迁移包 `_verify_bundle` 5 元组
+  往返（旧包无批注为 `None`）、包内批注验签失败拒绝导入、`_install_bundle` 用本机钥匙重签；
+  生成（开关关闭/群聊零模型调用、prompt 含人设/天数/额度/已有未解清单、疑问句软引导开关、
+  对象/纯数组/```json 围栏/坏 JSON 解析、额度按字数、锚点找不到丢弃、anchor+note 去重、
+  超时/异常/落盘失败静默降级、id 递增与 round/title 落盘、LLM 输出消毒）；注入（契约固定格式
+  与纪律文案、只注入 open/deferred、上限按「最新疑问句优先」、按时间升序、1500 字预算保险丝、
+  tampered 不注入但日记照常、群聊不生成不注入、关闭态注入文本与 baseline 逐字节一致、
+  reset 新代际才重新生成、persist 模式每轮注入但只生成一次）；指令（`/查看批注` 关闭/群聊/
+  空态/本轮+悬置筛选/已解摘要/验签告警；`/写回批注` 列表/选号/草稿/确认落盘/悬置/取消/
+  非法输入/超时/非交互拒绝/蒸馏失败；`/查看日记` 第五部分零批注逐字节一致、有批注收在文末、
+  篡改一行警告、按天取批注、帮助菜单两行）；Web（`web_read_day` 条件字段、零批注不加字段、
+  tampered 暴露、日记篡改早退不泄露、密码/主人闸不回归、Web 导入与 `/导入日记` 带批注）；
+  视图与配置（app.js node 语法检查、角标/卡片两区/失配页边兜底/验签警告/零批注不改 DOM/
+  全文本 escape、style.css 选择器、4 个配置项类型默认值条件与顺序、README §10.13 四个 bullet；
+  另在 `test_v055_features.py` 校验配置页 schema 键顺序与 README §10 的 10.12/10.13/10.16 逐项一致、
+  「改进版token估算 → 自动校准」条件显示、时区与废弃项固定在最后两项）。
 
 ## 差分与 v0.5.5 的相处方式
 

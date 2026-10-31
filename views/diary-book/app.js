@@ -15,6 +15,9 @@ let currentKey = "";
 let days = [];
 let dayIdx = -1;
 let loading = false;
+/* 插图回填的“代次”：每次真正替换正文前自增。图片请求是异步的，
+ * 返回时 token 或当前页不匹配说明用户已经翻页/换人，这张图必须丢弃。 */
+let viewToken = 0;
 
 /* ---------- 界面偏好：字号 / 字体（存后端，按面板账号分开） ---------- */
 const FONT_FAMILIES = [
@@ -391,16 +394,427 @@ function escapeHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/* 日记正文渲染：分隔条（—— …… ——）染成淡色小字，其余保持原样 */
+/* alt / data-entry 要放进属性值里，除 HTML 三件套外还要处理引号 */
+function escapeAttr(s) {
+  return escapeHtml(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+/* ---------- 日记正文渲染 ----------
+ * 轻量自渲染器：分隔条（—— …… ——）染成淡色小字；识别标准 markdown 图片语法
+ * `![alt](images/name)`（只认 images/ 开头，与契约第 2 节一致）渲染成 <figure> 占位。
+ * 图片本身不能直接 <img src>：插件视图在 sandbox iframe 里，浏览器请求不带
+ * Dashboard 鉴权，必须由 JS 走 bridge 取回 JSON base64 再换成 data URL。
+ */
+const IMAGE_MARKDOWN_RE = /!\[([^\]]*)\]\((images\/[^)\s]+)\)/g;
+
+function imageFigureHtml(alt, entry) {
+  const name = entry.slice("images/".length);
+  // 图还没生成好：只显示“还在画”占位，不发请求；
+  // 后端 replace_pending_images() 成功后会把这行换成最终文件名。
+  const generating = /^PENDING-/i.test(name);
+  const cls = generating
+    ? "diary-img pending img-generating"
+    : "diary-img pending";
+  return (
+    `<figure class="${cls}" data-entry="${escapeAttr(entry)}">` +
+    `<img alt="${escapeAttr(alt)}"></figure>`
+  );
+}
+
+/* 单行正文：把图片语法换成 <figure>，其余片段照常转义 */
+function renderLineWithImages(line) {
+  if (!line.includes("![")) return escapeHtml(line);
+  IMAGE_MARKDOWN_RE.lastIndex = 0;
+  let out = "";
+  let last = 0;
+  let m;
+  while ((m = IMAGE_MARKDOWN_RE.exec(line)) !== null) {
+    out += escapeHtml(line.slice(last, m.index));
+    out += imageFigureHtml(m[1], m[2]);
+    last = m.index + m[0].length;
+  }
+  out += escapeHtml(line.slice(last));
+  return out;
+}
+
 function renderContent(text) {
-  return escapeHtml(text)
+  return text
     .split("\n")
     .map((line) =>
       /^——.+——$/.test(line.trim())
-        ? `<span class="seg-header">${line}</span>`
-        : line
+        ? `<span class="seg-header">${escapeHtml(line)}</span>`
+        : renderLineWithImages(line)
     )
     .join("\n");
+}
+
+/* ---------- 页边批注（v0.6） ----------
+ * 后端 GET day/... 只在开启且有批注时返回 annotations，验签失败时返回
+ * annotations_tampered。这里按 anchor（原文摘录 ≤30 字）在正文纯文本里定位：
+ * 命中处插入上标角标 + 悬停/点按卡片；找不到的不丢，收进当天日记底部的
+ * .ann-margin 页边区域（日记被面板外改过时锚点会失配）。
+ * 全部文本一律 escape（批注/摘要/标题都来自 LLM，绝不直接拼进 HTML）。
+ */
+const ANN_SKIP_SELECTOR =
+  "figure.diary-img, sup, .seg-header, .ann-mark, .ann-card, .ann-margin, .ann-tampered";
+/* 批注卡片是 position: fixed 的悬浮层（见 style.css），会浮在活页本之上、
+ * 不被书页裁切；下面三个常量用于打开时把它钉在角标旁并夹进视口。 */
+const ANN_CARD_OVERLAP = 2; /* 卡片与角标叠住 2px：鼠标从角标移进卡片时不断 :hover */
+const ANN_VIEW_MARGIN = 10; /* 卡片离视口边缘的最小距离（px） */
+const ANN_CARD_MIN_SPACE = 120; /* 可用高度太小时的下限，卡片内部滚动 */
+
+function annText(v) {
+  if (typeof v === "string") return v;
+  if (v === null || v === undefined) return "";
+  return String(v);
+}
+
+/* 角标序号：1 → 1，12 → 12。用普通数字而不是 ⁰¹² 上标字符：上标字符本身
+ * 只有半个字高，再叠一层 <sup> 会小到看不清（放大角标时改的）。 */
+function annSupNumber(n) {
+  const digits = String(n).replace(/\D/g, "");
+  return digits || "1";
+}
+
+/* 卡片两区：批注原文（不加"批注内容"字样标题）+ 回复区（reply 存在时才有） */
+function annotationBodyHtml(ann) {
+  let html = `<span class="ann-note">${escapeHtml(annText(ann && ann.note))}</span>`;
+  const reply = ann && ann.reply;
+  if (reply && typeof reply === "object") {
+    let inner = "";
+    if (reply.reply_title) {
+      inner +=
+        `<span class="ann-reply-title">` +
+        `${escapeHtml(annText(reply.reply_title))}</span>`;
+    }
+    if (reply.summary) {
+      inner += `<span class="ann-summary">${escapeHtml(annText(reply.summary))}</span>`;
+    }
+    if (reply.speculation_marked) {
+      inner +=
+        `<span class="ann-spec">推测：` +
+        `${escapeHtml(annText(reply.speculation_marked))}</span>`;
+    }
+    if (inner) html += `<span class="ann-reply">${inner}</span>`;
+  }
+  return html;
+}
+
+function annotationCardHtml(ann) {
+  return (
+    `<span class="ann-card" role="note" data-ann-id="` +
+    `${escapeAttr(annText(ann && ann.id))}">` +
+    annotationBodyHtml(ann) +
+    `</span>`
+  );
+}
+
+/* 在正文纯文本里找 anchor 第一次出现的位置；跳过图片/角标/批注卡片自身等节点 */
+function findAnnAnchor(anchor) {
+  const body = $("diaryBody");
+  if (!body) return null;
+  const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (!node.nodeValue || node.nodeValue.indexOf(anchor) < 0) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      let p = node.parentNode;
+      while (p && p !== body) {
+        if (
+          p.nodeType === 1 &&
+          p.matches &&
+          p.matches(ANN_SKIP_SELECTOR)
+        ) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        p = p.parentNode;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const index = node.nodeValue.indexOf(anchor);
+    if (index >= 0) return { node, index };
+  }
+  return null;
+}
+
+function insertAnnMark(hit, anchor, ann, ord) {
+  const node = hit.node;
+  const parent = node.parentNode;
+  if (!parent) return false;
+  const after = node.splitText(hit.index + anchor.length);
+  const mid = node.splitText(hit.index);
+  const mark = document.createElement("span");
+  mark.className = "ann-mark";
+  mark.setAttribute("data-ann-id", annText(ann && ann.id));
+  mark.appendChild(mid);
+  const badge =
+    `<sup class="ann-badge" data-ann-id="${escapeAttr(annText(ann && ann.id))}"` +
+    ` role="button" tabindex="0" title="页边批注">${annSupNumber(ord)}</sup>`;
+  mark.insertAdjacentHTML("beforeend", badge + annotationCardHtml(ann));
+  // 卡片是 fixed 悬浮层：鼠标移上来（悬停展开）或键盘聚焦角标时，按角标
+  // 当前位置把卡片钉好；触屏点按在 onAnnBadgeClick 里另有一处。
+  mark.addEventListener("mouseenter", () => trackAnnMark(mark));
+  mark.addEventListener("focusin", () => trackAnnMark(mark));
+  parent.insertBefore(mark, after);
+  return true;
+}
+
+/* 锚点失配兜底：收进当天日记底部的页边区域，条间留白、同样两区内容。
+ * 按设计方案 8.3 一期不加"批注内容"字样标题（页面无 AI 标题可对上），
+ * 只保留一条细分割线与正文区分。 */
+function appendAnnMargin(items) {
+  const body = $("diaryBody");
+  if (!body || !items.length) return;
+  let html = "";
+  for (const item of items) {
+    const anchor = annText(item.ann && item.ann.anchor).trim();
+    html +=
+      `<div class="ann-margin-card" data-ann-id="${escapeAttr(annText(item.ann && item.ann.id))}">` +
+      (anchor
+        ? `<div class="ann-margin-anchor">锚于「${escapeHtml(anchor)}」</div>`
+        : "") +
+      annotationBodyHtml(item.ann) +
+      `</div>`;
+  }
+  const box = document.createElement("div");
+  box.className = "ann-margin";
+  box.innerHTML = html;
+  body.appendChild(box);
+}
+
+/* 批注卡片是固定定位的悬浮层：打开时量一下角标位置，把卡片钉在角标下方
+ * （下方放不下且上方更宽松时翻到上方），再夹进视口 —— 卡片因此能盖在活页本
+ * （书页 / 书脊 / 书页圆角）之上，长批注也不会被书页边缘裁掉；内容比可用
+ * 空间还高时由 CSS 的 overflow-y 在卡片内部滚动。纯展示用，不影响内容。 */
+function annCardSize(card) {
+  // 卡片平时 display: none，量不到尺寸：先临时显示成不可见、脱离文档流再量
+  const saved = card.getAttribute("style") || "";
+  card.style.cssText =
+    saved +
+    ";display:block;visibility:hidden;position:fixed;left:-99999px;top:0;max-height:none;";
+  const width = card.offsetWidth;
+  const height = card.offsetHeight;
+  card.style.cssText = saved;
+  return { width, height };
+}
+
+function positionAnnCard(mark) {
+  const badge = mark && mark.querySelector ? mark.querySelector(".ann-badge") : null;
+  const card = mark && mark.querySelector ? mark.querySelector(".ann-card") : null;
+  if (!badge || !card) return;
+  const rect = badge.getBoundingClientRect();
+  if (!rect.width && !rect.height) return;
+  const vw = window.innerWidth || document.documentElement.clientWidth;
+  const vh = window.innerHeight || document.documentElement.clientHeight;
+  const size = annCardSize(card);
+  const width = Math.min(size.width || 280, vw - ANN_VIEW_MARGIN * 2);
+  const spaceBelow =
+    vh - ANN_VIEW_MARGIN - (rect.bottom - ANN_CARD_OVERLAP);
+  const spaceAbove = rect.top + ANN_CARD_OVERLAP - ANN_VIEW_MARGIN;
+  // 下方放得下就朝下；放不下且上方更宽松就翻到角标上方（与旧版方向一致）
+  const up = size.height > spaceBelow && spaceAbove > spaceBelow;
+  const space = Math.max(ANN_CARD_MIN_SPACE, up ? spaceAbove : spaceBelow);
+  const height = Math.min(size.height || 0, space);
+  // 水平方向：默认左缘对齐角标左缘，右/左越界时夹回视口内
+  let left = rect.left;
+  if (left + width > vw - ANN_VIEW_MARGIN) left = vw - ANN_VIEW_MARGIN - width;
+  if (left < ANN_VIEW_MARGIN) left = ANN_VIEW_MARGIN;
+  // 卡片与角标叠住 2px：鼠标从角标移进卡片时 :hover 不断，长批注才滚得动
+  const top = up
+    ? rect.top + ANN_CARD_OVERLAP - height
+    : rect.bottom - ANN_CARD_OVERLAP;
+  card.style.maxHeight = Math.round(space) + "px";
+  card.style.left = Math.round(left) + "px";
+  card.style.top = Math.round(Math.max(ANN_VIEW_MARGIN, top)) + "px";
+}
+
+/* 当前展开的角标：滚动阅读栏 / 改窗口大小时按它重新钉住卡片 */
+let activeAnnMark = null;
+
+function trackAnnMark(mark) {
+  if (!mark) return;
+  activeAnnMark = mark;
+  positionAnnCard(mark);
+}
+
+function repositionActiveAnnCard() {
+  if (activeAnnMark && activeAnnMark.isConnected) positionAnnCard(activeAnnMark);
+}
+
+function closeAnnCards() {
+  activeAnnMark = null;
+  for (const mark of document.querySelectorAll(".ann-mark.open")) {
+    mark.classList.remove("open");
+  }
+}
+
+/* 触屏没有 hover：点角标切换卡片；点页面空白处收起 */
+function onAnnBadgeClick(e) {
+  const target = e.target;
+  const badge =
+    target && target.closest ? target.closest(".ann-badge") : null;
+  if (!badge) {
+    if (target && target.closest && target.closest(".ann-card")) return;
+    closeAnnCards();
+    return;
+  }
+  const mark = badge.closest(".ann-mark");
+  if (!mark) return;
+  const willOpen = !mark.classList.contains("open");
+  closeAnnCards();
+  if (willOpen) {
+    mark.classList.add("open");
+    trackAnnMark(mark);
+  }
+  e.preventDefault();
+  e.stopPropagation();
+}
+
+function onAnnBadgeKeydown(e) {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const target = e.target;
+  const badge =
+    target && target.closest ? target.closest(".ann-badge") : null;
+  if (!badge) return;
+  const mark = badge.closest(".ann-mark");
+  if (!mark) return;
+  const willOpen = !mark.classList.contains("open");
+  closeAnnCards();
+  if (willOpen) {
+    mark.classList.add("open");
+    trackAnnMark(mark);
+  }
+  e.preventDefault();
+}
+
+function applyAnnotations(annotations, tampered) {
+  const body = $("diaryBody");
+  if (!body) return;
+  // 验签失败：顶部警告条（契约 7.2；日记本身篡改时后端不会带批注字段）
+  if (tampered) {
+    const warn = document.createElement("div");
+    warn.className = "ann-tampered";
+    warn.textContent =
+      "⚠ 页边批注验签失败，疑似在插件之外被改过，已拒绝显示。";
+    body.insertBefore(warn, body.firstChild);
+  }
+  if (!Array.isArray(annotations) || annotations.length === 0) return;
+  const missed = [];
+  const usedAnchors = {};
+  let ord = 0;
+  for (const ann of annotations) {
+    if (!ann || typeof ann !== "object") continue;
+    ord += 1;
+    const anchor = annText(ann.anchor).trim();
+    // 同一锚点只标正文里第一处：重复锚点不再二次命中
+    if (anchor && !usedAnchors[anchor]) {
+      const hit = findAnnAnchor(anchor);
+      if (hit) {
+        usedAnchors[anchor] = true;
+        if (insertAnnMark(hit, anchor, ann, ord)) continue;
+      }
+    }
+    missed.push({ ann });
+  }
+  if (missed.length) appendAnnMargin(missed);
+  // 卡片是 fixed 悬浮层，打开时才按角标位置落位（见 positionAnnCard），
+  // 这里不需要预先量版。零批注时上面已提前返回，DOM 不变。
+}
+
+/* ---------- 日记插图：注入 DOM 后逐张异步回填 ----------
+ * 回填前用 token + 当前页快照双重校验：与 showDay 里 `if (!days.includes(day)) return;`
+ * 同一思路，防止上一页/上一个用户的图在请求返回时落到新一页。
+ */
+function isCurrentDiaryView(day, token) {
+  return token === viewToken && dayIdx >= 0 && days[dayIdx] === day;
+}
+
+function waitImageLoad(img) {
+  return new Promise((resolve) => {
+    if (img.complete && img.naturalWidth > 0) {
+      resolve(true);
+      return;
+    }
+    const finish = (ok) => {
+      img.removeEventListener("load", onLoad);
+      img.removeEventListener("error", onError);
+      resolve(ok);
+    };
+    const onLoad = () => finish(true);
+    const onError = () => finish(false);
+    img.addEventListener("load", onLoad);
+    img.addEventListener("error", onError);
+  });
+}
+
+/* missing：优雅降级成文本占位（正文照常可读）；tampered：按入侵给警告 */
+function markImageMissing(figure, alt, status) {
+  figure.classList.remove("pending", "img-generating");
+  if (status === "tampered") {
+    figure.classList.add("img-tampered");
+    figure.innerHTML =
+      '<span class="img-warning">⚠ 这幅插图验签失败，疑似在插件之外被换过</span>';
+    return;
+  }
+  figure.classList.add("img-missing");
+  figure.innerHTML = `<span class="img-missing-text">[插图：${escapeHtml(alt)}]</span>`;
+}
+
+async function applyDiaryImage(figure, alt, res) {
+  const img = figure.querySelector("img");
+  if (!img) return;
+  img.src = "data:" + (res.mime || "image/png") + ";base64," + res.image;
+  const ok = await waitImageLoad(img);
+  if (!ok) {
+    markImageMissing(figure, alt, "");
+    return;
+  }
+  const w = img.naturalWidth;
+  const h = img.naturalHeight;
+  // 横图通栏、竖图 70% 居中、方图居中（具体尺寸见 style.css）
+  const orientation = w > h ? "landscape" : h > w ? "portrait" : "square";
+  figure.classList.remove("pending", "img-generating");
+  figure.classList.add("img-loaded", orientation);
+}
+
+async function loadDiaryImages(day, token) {
+  const body = $("diaryBody");
+  if (!body) return;
+  const figures = Array.from(
+    body.querySelectorAll("figure.diary-img[data-entry]")
+  );
+  for (const figure of figures) {
+    if (!isCurrentDiaryView(day, token) || !figure.isConnected) return;
+    if (figure.classList.contains("img-generating")) continue; // PENDING：图还在画，不请求
+    if (figure.classList.contains("img-loaded")) continue;
+    const entry = figure.getAttribute("data-entry") || "";
+    if (!entry.startsWith("images/")) continue;
+    // 路由 /image/<file_key>/<name> 的 <name> 是单段路径：只传 zip 条目的 basename，
+    // data-entry 仍按契约保留完整的 images/<basename>。
+    const name = entry.slice("images/".length);
+    const img = figure.querySelector("img");
+    const alt = (img && img.alt) || "";
+    const params = {};
+    if (sessionPw[currentKey]) params.pw = sessionPw[currentKey];
+    let res = null;
+    try {
+      res = await bridge.apiGet(`image/${currentKey}/${name}`, params);
+    } catch (e) {
+      console.warn("插图读取失败", name, e);
+      if (!isCurrentDiaryView(day, token) || !figure.isConnected) return;
+      markImageMissing(figure, alt, "");
+      continue;
+    }
+    // 等待期间翻页/切用户了：这张图不能落到当前页
+    if (!isCurrentDiaryView(day, token) || !figure.isConnected) return;
+    if (res && res.found && res.image) {
+      await applyDiaryImage(figure, alt, res);
+    } else {
+      markImageMissing(figure, alt, res && res.status);
+    }
+  }
 }
 
 async function loadUsers() {
@@ -423,6 +837,7 @@ async function loadUsers() {
     : "还没有人写过日记——也可以点右上角「导入日记」装入迁移包";
   $("btnExport").disabled = !has;
   if (!has) {
+    viewToken += 1; // 没有任何用户：丢弃仍在路上的插图回填
     currentKey = "";
     updateLockUI();
     return;
@@ -445,6 +860,7 @@ async function loadDays() {
   days = r.days || [];
   renderDayList();
   if (days.length === 0) {
+    viewToken += 1; // 清空正文：让还在路上的旧插图请求失效
     $("diaryHeader").innerHTML = "";
     $("diaryBody").textContent = "（这个文件里还没有日记）";
     $("pageInfo").textContent = "0 / 0";
@@ -567,6 +983,9 @@ async function showDay(i, animate = true) {
   if (loading || i < 0 || i >= days.length) return;
   const day = days[i];
   loading = true;
+  // 翻页/切用户前先收起上一天还开着的批注卡片：卡片是 fixed 悬浮层，不随
+  // innerHTML 一起消失；翻页动画的 transform 也会临时把 fixed 卡片夹回页面里。
+  closeAnnCards();
   const page = $("pageRight");
   try {
     if (animate) {
@@ -579,6 +998,8 @@ async function showDay(i, animate = true) {
     // 等待（含密码/QQ 对话框）期间用户可能已切换用户或刷新目录：
     // days 已整体更换时放弃本次展示，避免旧内容配上新目录的标题
     if (!days.includes(day)) return;
+    // 真正替换正文前递增 token：上一页还在路上的插图请求从此刻起一律作废
+    const token = (viewToken += 1);
     dayIdx = i;
     $("diaryHeader").innerHTML =
       `<span>${escapeHtml(day.label)}</span>` +
@@ -588,6 +1009,11 @@ async function showDay(i, animate = true) {
         '<span class="tampered">⚠ 这一天的日记验签失败，疑似在插件之外被修改过，已拒绝展示。</span>';
     } else {
       $("diaryBody").innerHTML = renderContent(r.content || "（空白）");
+      // 页边批注：翻页/切用户时随 innerHTML 整体替换，不需要额外清理；
+      // 零批注且未验签失败时本函数不改动 DOM（契约 7.2）。
+      applyAnnotations(r.annotations || [], r.annotations_tampered);
+      // 不 await：图片走异步回填，不阻塞翻页（大图 base64 可能很慢）
+      void loadDiaryImages(day, token);
     }
     $("pageInfo").textContent = `${i + 1} / ${days.length}`;
     renderDayListActive();
@@ -851,6 +1277,22 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "ArrowRight") showDay(dayIdx + 1, true);
 });
 $("btnLock").addEventListener("click", onLockClick);
+
+/* 页边批注：点按切换卡片（触屏没有 hover）、键盘可操作；卡片是 fixed
+ * 悬浮层，滚动阅读栏 / 改窗口大小后按角标新位置重新钉一次。 */
+$("diaryBody").addEventListener("click", onAnnBadgeClick);
+$("diaryBody").addEventListener("keydown", onAnnBadgeKeydown);
+const annPageInner = $("pageInner");
+if (annPageInner) {
+  annPageInner.addEventListener("scroll", repositionActiveAnnCard, {
+    passive: true,
+  });
+}
+let annResizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(annResizeTimer);
+  annResizeTimer = setTimeout(repositionActiveAnnCard, 120);
+});
 
 await loadUsers();
 if (currentKey) await loadDays();

@@ -186,6 +186,14 @@ class ServiceMixin:
         "memo",
         "memo_view",
         "memo_delete",
+        "形象",
+        "日记形象",
+        # v0.6 批注指令：翻批注/写回批注都是操作，不进写作素材，也不进写回蒸馏素材
+        "查看批注",
+        "写回批注",
+        "annotations",
+        "diary_annotations",
+        "diary_writeback",
         "reset",
         "重置",
     )
@@ -225,6 +233,29 @@ class ServiceMixin:
         return "\n".join(kept)
 
     # ------------------------- 写日记（指令与自动共用） -------------------------
+
+    # 写作模型标出的"自发挥"片段：<self>…</self>。保存前剥离，原文记入来源侧车，
+    # 供批注锚定过滤（批注不允许落在 AI 自编内容上）。
+    _SELF_MARK_RE = re.compile(r"<self>(.*?)</self>", re.IGNORECASE | re.DOTALL)
+
+    @classmethod
+    def _extract_self_marks(cls, content: str):
+        """剥离 <self>…</self> 标签。返回（干净正文, [自发挥原文子串]）。
+
+        模型不合规（未闭合/落单标签）时兜底剥掉裸标签，只留文字——
+        绝不让标签原样漏进落盘正文或用户眼睛。
+        """
+        spans: list = []
+
+        def _grab(m):
+            inner = m.group(1).strip()
+            if inner:
+                spans.append(inner)
+            return inner
+
+        text = cls._SELF_MARK_RE.sub(_grab, str(content or ""))
+        text = re.sub(r"</?self\s*>", "", text, flags=re.IGNORECASE)
+        return text, spans
 
     async def _write_diary(
         self,
@@ -441,6 +472,50 @@ class ServiceMixin:
                     "",
                     f"额外写作要求（来自用户设置）：{extra_instruction}",
                 ]
+
+        # ---- 插图（v0.6）：扫描用户照片 + 追加插图决策提示词 ----
+        # 图标关闭时 image_addon 为空串：不额外调用模型、不改变原有 prompt（零感知）。
+        image_photos: list = []
+        image_notice_extra = ""
+        self._image_last_notice = ""
+        try:
+            if self._image_enabled():
+                image_cfg = self._image_cfg()
+                photo_limit = (
+                    image_cfg["user_image_limit"]
+                    if image_cfg["user_image_enabled"]
+                    else 0
+                )
+                # 群聊写日记不收集照片（审查 P1-3）：会话历史里所有成员的消息都是
+                # role=user，无法区分"这张照片是谁发的"——把别人的照片收进写作者
+                # 的日记 zip 是跨用户隐私事故，宁可少收。
+                if is_group:
+                    photo_limit = 0
+                if photo_limit > 0:
+                    image_photos = self._collect_user_photos(
+                        new_history, photo_limit
+                    )
+                    # 可选视觉接口：配置了才补"真实画面描述"；否则保持内容未识别
+                    image_photos = await self._caption_user_photos(image_photos)
+                # 最近图回顾只在真的可能画插图时才读 zip（省 IO）
+                ai_slots = (
+                    image_cfg["image_limit_full"]
+                    if mode == "full"
+                    else image_cfg["image_limit_memo"]
+                )
+                recent_images = (
+                    self._image_style_summary(sender_id) if ai_slots > 0 else []
+                )
+                image_addon = self._image_prompt_addon(
+                    mode,
+                    image_photos,
+                    image_cfg["persona_image_desc"],
+                    recent_images,
+                )
+                if image_addon:
+                    prompt_parts += ["", image_addon]
+        except Exception as e:
+            logger.warning(f"[memory_diary] 组装插图提示词失败（本次不插图）: {e}")
         prompt = "\n".join(prompt_parts)
 
         provider = await self.context.get_using_provider_async(umo=umo)
@@ -481,6 +556,41 @@ class ServiceMixin:
         if not diary_content:
             return None, "模型没有返回日记内容"
 
+        # 来源标记（批注防"批在 AI 自编内容上"）：剥掉 <self> 标签，原文子串
+        # 暂存到 self_spans，等下面的保存成功后再写入来源侧车。
+        diary_content, self_spans = self._extract_self_marks(diary_content)
+
+        # ---- 插图（v0.6）：AI 意愿标记 → 闸门 → PENDING 占位 / 用户照片落盘 ----
+        # 日记正文先落盘（图后到），所以这里只做"决定与占位"，真正的生图在
+        # 保存成功之后由 _schedule_illustrations 起后台任务（设计第 5 节）。
+        image_decisions: list = []
+        image_day = self._now().strftime("%Y%m%d")
+        try:
+            if self._image_enabled():
+                wanted = self._count_ai_image_markers(diary_content)
+                allowed = self._image_gate(sender_id, is_group, mode, wanted)
+                diary_content, image_decisions = self._parse_image_markers(
+                    diary_content, allowed
+                )
+                # 即使本次没扫到照片也走一遍：清掉模型偶发写出的照片标记，
+                # 不让 〔用户照片：N｜…〕 原样留在落盘正文里。
+                # 起始序号接当天已有插图（审查 P2-4：同一天多次写日记不留重复序号）
+                photo_start_seq = self._next_image_seq(sender_id, image_day)
+                diary_content, photo_next_seq = self._apply_user_photo_markers(
+                    sender_id, diary_content, image_photos, image_day,
+                    photo_start_seq,
+                )
+                photo_count = max(
+                    0, int(photo_next_seq) - int(photo_start_seq)
+                )
+                if photo_count > 0:
+                    image_notice_extra += (
+                        f"\n\n（这篇日记收了你发来的 {photo_count} 张照片，"
+                        "她给照片写了注脚。）"
+                    )
+        except Exception as e:
+            logger.warning(f"[memory_diary] 插图决策/标记处理失败（按纯文字保存）: {e}")
+
         try:
             separator_note = "（无新对话·她的日常随笔）" if mode == "life" else ""
             absorb_headers = (
@@ -490,11 +600,29 @@ class ServiceMixin:
                 sender_id,
                 diary_content,
                 sender_name=sender_name,
+                entry_name_hint=image_day,
                 separator_note=separator_note,
                 origin="group" if is_group else "private",
                 mode=mode,
                 absorb_headers=absorb_headers,
             )
+            # 插图调度：创建后台任务（不阻塞本次返回）；形象档案为空时先走确认仪式
+            try:
+                await self._schedule_illustrations(
+                    sender_id,
+                    sender_name,
+                    umo,
+                    image_day,
+                    mode,
+                    image_decisions,
+                    self._image_cfg(),
+                )
+            except Exception as e:
+                logger.warning(f"[memory_diary] 插图调度失败（日记已保存）: {e}")
+            if image_notice_extra:
+                self._image_last_notice = (
+                    (self._image_last_notice or "") + image_notice_extra
+                )
             # 记录本次读到的历史边界，下一次只取游标之后的新消息。
             # 自动触发时当前消息可能还没进 history，记下它的哈希，下一轮跳过。
             last_msg_hash = (
@@ -514,6 +642,19 @@ class ServiceMixin:
             self._clear_memos(
                 sender_id, scenes=("group",) if is_group else ("private", "group")
             )
+            # 来源侧车：这篇日记的自发挥子串落盘（失败只记日志——日记本身
+            # 已写好，绝不能因为来源标记的存取失败把整次写作报成失败）。
+            if self_spans:
+                try:
+                    if not self.record_self_provenance(
+                        sender_id, image_day, self_spans
+                    ):
+                        logger.warning(
+                            "[memory_diary] 来源侧车写入失败（批注过滤将退化为"
+                            "仅按随笔模式过滤）"
+                        )
+                except Exception as e:
+                    logger.warning(f"[memory_diary] 记录来源标记失败（不影响日记）: {e}")
             if mode == "life":
                 # 记录今天已写过随笔，同日不再重复触发（防刷屏）
                 pref = self._load_pref_data(sender_id)
@@ -1365,7 +1506,11 @@ class ServiceMixin:
             bool(self.config.get("show_diary_after_write", False))
             and diary
         ):
-            notice += f"\n\n—— 日记全文 ——\n{diary}"
+            # 纯文本通知里不直接露出 markdown 图片语法，改成占位符（v0.6）
+            notice += (
+                "\n\n—— 日记全文 ——\n"
+                + self._image_macro_to_placeholder(diary)
+            )
         await self._send_proactive(umo, notice)
 
     async def _notify_auto_diary_failure(self, umo: str, err: str):

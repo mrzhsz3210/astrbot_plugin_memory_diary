@@ -23,6 +23,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Star, register
 
+from .memory_diary.common import sniff_image_mime
 from .memory_diary.constants import INJECT_TEMPLATE, PLUGIN_NAME
 from .memory_diary.core import MemoryDiaryCore
 from .memory_diary.errors import DiaryKeyUnavailable
@@ -32,6 +33,12 @@ try:
     from astrbot.api.message_components import At
 except ImportError:  # pragma: no cover
     At = None
+
+try:
+    # v0.6 插图：QQ 端图文穿插发送（老版本 AstrBot 没有 Image 时降级为占位文本）
+    from astrbot.api.message_components import Image as _ImageComponent
+except ImportError:  # pragma: no cover
+    _ImageComponent = None
 
 try:
     from astrbot.api.star import StarTools  # v3.5+
@@ -91,7 +98,7 @@ def resolve_data_dir() -> Path:
     "astrbot_plugin_memory_diary",
     "mrzhsz3210",
     "指令/定时自动触发写日记（用户画像 / 对用户的评价 / 给未来自己的叮嘱），新上下文自动读取日记，上下文将满时自动提醒，支持每天定时自动写完整日记。",
-    "v0.5.5",
+    "v0.6.0",
 )
 
 class MemoryDiaryPlugin(MemoryDiaryCore, Star):
@@ -115,12 +122,40 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
     )
 
     async def initialize(self):
-        """插件启动/激活：先清掉上次异常退出残留的临时包，再走原有初始化。"""
+        """插件启动/激活：先清掉上次异常退出残留的临时包/插图临时文件，再走原有初始化。"""
         try:
             self._purge_stale_bundles()
         except Exception as e:
             logger.warning(f"[memory_diary] 启动清理残留临时包失败: {e}")
+        try:
+            self._purge_temp_images()
+        except Exception as e:
+            logger.warning(f"[memory_diary] 启动清理插图临时文件失败: {e}")
         await super().initialize()
+
+    def _purge_temp_images(self) -> None:
+        """删除 data_dir/temp 下残留的插图临时文件（v0.6）。
+
+        插图临时文件只在"从 zip 读图 → 交给 Image 组件发送"的瞬间存在，正常路径
+        finally 删除；能留到下次启动的只可能是进程崩溃/强杀。启动时没有在途任务，
+        清空整个 temp 目录是安全的（该目录只由插图发送与推送使用）。
+        """
+        temp_dir = self.data_dir / "temp"
+        if not temp_dir.is_dir():
+            return
+        removed = 0
+        for path in temp_dir.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                path.unlink(missing_ok=True)
+                removed += 1
+            except Exception as e:
+                logger.warning(f"[memory_diary] 删除残留插图临时文件失败 {path}: {e}")
+        if removed:
+            logger.info(
+                f"[memory_diary] 启动清理：已删除 {removed} 个残留的插图临时文件"
+            )
 
     def _purge_stale_bundles(self) -> None:
         """删除数据目录里残留的临时导出/备份包（P3-7）。
@@ -200,6 +235,66 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             return False
         return not bool(self.config.get("group_require_at", False))
 
+    # ------------------------- 白名单拒绝提示（设计方案附录 A 修复） -------------------------
+    #
+    # v0.5.5 发现的问题：白名单静默拦截时，AstrBot WebUI 内置测试聊天的 sender_id
+    # 不是用户 QQ 号，只配置了 QQ 号的用户发 /删除日记 会「完全没反应」——分不清是
+    # 不在白名单还是插件坏了。修复：私聊里对**指令形态**的消息回一次性提示（带 UID，
+    # 指引配置页加白名单）；群聊保持静默（不暴露插件、不抢话）；普通闲聊不提示；
+    # 名单内用户完全无感。每个身份（取不到身份时按会话）只提示一次，防刷屏。
+    _WHITELIST_HINT_TEXT = (
+        "📖 这条日记指令没有执行：你的身份（UID）「{sid}」不在本插件的用户白名单里。\n"
+        "如果这是你自己（或 AstrBot WebUI 的内置测试聊天）：请管理员打开插件配置页，"
+        "把「允许使用插件的用户」填上这个 UID（多个号用逗号或空格分隔），"
+        "保存并重载插件后再试。\n"
+        "（本提示每个身份只发一次；群聊里不会提示，普通聊天也不会提示。）"
+    )
+    _WHITELIST_HINT_TEXT_NO_ID = (
+        "📖 这条日记指令没有执行：插件取不到你的身份 UID"
+        "（可能来自 AstrBot WebUI 的内置测试聊天），而本插件只允许白名单里的用户使用。\n"
+        "如果这是你自己：请管理员打开插件配置页的「允许使用插件的用户」，"
+        "把插件日志里这条消息的 sender id 加进去（或临时清空白名单验证），"
+        "保存并重载插件后再试。\n"
+        "（本提示每个会话只发一次；群聊里不会提示，普通聊天也不会提示。）"
+    )
+
+    def _is_command_shaped(self, text: str) -> bool:
+        """这条消息是不是日记插件指令（带前缀的，或裸指令词）。"""
+        try:
+            return bool(
+                self._is_op_command(self._strip_invisible(text or "").strip())
+            )
+        except Exception:
+            return False
+
+    async def _maybe_hint_whitelist_denied(self, event: AstrMessageEvent) -> None:
+        """白名单拒绝时，给私聊里的指令形态消息发一次性提示（附录 A 修复）。"""
+        try:
+            if event.get_group_id():
+                return  # 群聊保持静默（附录 A 明确要求）
+            sender_id = str(event.get_sender_id() or "").strip()
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            key = sender_id or f"umo:{umo}"
+            if key in self._whitelist_hint_sent:
+                return  # 一次性：同一身份/会话不再提示
+            if self._is_allowed(sender_id):
+                return  # 名单内用户完全无感
+            if not self._is_command_shaped(event.message_str or ""):
+                return  # 普通闲聊不提示（不打扰、不暴露插件）
+            self._whitelist_hint_sent.add(key)
+            self._cap_state(self._whitelist_hint_sent)
+            if sender_id:
+                text = self._WHITELIST_HINT_TEXT.format(sid=sender_id)
+            else:
+                text = self._WHITELIST_HINT_TEXT_NO_ID
+            logger.info(
+                f"[memory_diary] 白名单外用户（sender={sender_id!r}）发来指令，"
+                "已发送一次性配置提示"
+            )
+            await event.send(event.plain_result(text))
+        except Exception as e:  # 提示失败绝不能影响消息处理
+            logger.warning(f"[memory_diary] 白名单拒绝提示发送失败: {e}")
+
     # 零宽与方向控制字符：其他插件会在 message_str 末尾追加不可见标记，
     # 不剥掉会把指令参数判为"不认识"（日志里用 repr 才能看到它们）
     _INVISIBLE_RE = re.compile(
@@ -241,12 +336,15 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             "· /查看备忘 —— 私聊专用：查看待写入的备忘（带场景标注）\n"
             "· /删除备忘 —— 私聊专用：按序号删一条，或回复「全部」清空\n"
             "· /查看日记 —— 私聊专用：列出日期后按提示查看某天的日记\n"
+            "· /查看批注 —— 私聊专用：查看本轮读日记时留下的批注与所有未解/悬置的批注\n"
+            "· /写回批注 —— 私聊专用：把聊明白的批注写回日记（需确认，可悬置）\n"
             "· /删除日记 —— 私聊专用：删除全部 / 某天 / 某时间段的日记\n"
             "· /导出日记 —— 私聊：把自己的日记和签名钥匙打包发给你，用于换设备迁移\n"
             "· /导入日记 —— 私聊：把迁移包发给我，验签通过后自动安放日记\n"
             "· /日记状态 —— 查看上下文占用、日记篇数、哨兵状态\n"
             "· /日记范围 —— 设置新上下文注入哪些日记：最新 / 全部 / 最近N天 / 时间段 / 默认\n"
             "· /注入日记 范围 —— 主动让她现在就读指定日记（下一句对话生效，本会话去重）\n"
+            "· /形象 —— 私聊专用：查看/确认/修改/重拟插画里「她」长什么样的形象档案\n"
             "· /日记帮助 —— 就是你现在看到的这个\n"
             "━━━━━━━━━━━━━━\n"
             "小提示：上下文快满时我会主动提醒并自动写好日记；\n"
@@ -257,6 +355,132 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                 else ""
             )
         )
+
+    # ------------------------- 指令：形象档案（插图一致性，D6） -------------------------
+    #
+    # 形象档案 persona_image_desc 是"她"在插图里长什么样的唯一事实源（设计第 4 节）：
+    # AI 不能自己改，只能提议；用户确认后才写进配置。进化需签字。
+    # 这里的文案全部用固定文案，不走 _say 的人设转述——形象描述一个字都不能被
+    # 改写（转述可能把"及腰黑发"说成"长发"），而且 200 字的描述也不适合复述。
+
+    _PERSONA_DESC_MAX = 200
+
+    def _persona_image_usage_text(self) -> str:
+        return (
+            "📖 形象档案用法：\n"
+            "· /形象 —— 查看当前形象档案与待确认的提案\n"
+            "· /形象 确认 —— 采纳待确认的提案并写入配置\n"
+            "· /形象 修改 <描述> —— 直接修改形象描述（最多 200 字）\n"
+            "· /形象 重拟 —— 让我按当前人设重新提炼一版提案（先给你确认）"
+        )
+
+    @filter.command("形象", alias={"日记形象"})
+    async def persona_image_cmd(self, event: AstrMessageEvent):
+        """查看/确认/修改插图里的形象档案（仅私聊）。"""
+        if not self._should_respond(event):
+            return
+        umo = event.unified_msg_origin
+        if event.get_group_id():
+            yield event.plain_result(
+                "📖 形象档案只能私聊查看和修改哦——插画里的「她」是只给你看的样子。"
+            )
+            return
+        sender_id = event.get_sender_id()
+        arg = self._strip_invisible(self._command_arg(event)).strip()
+        parts = arg.split(None, 1)
+        action = parts[0] if parts else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+        if not arg:
+            cur = str(self.config.get("persona_image_desc", "") or "").strip()
+            pending = self._load_pending_persona_desc(sender_id)
+            pending_desc = ""
+            if isinstance(pending, dict):
+                pending_desc = str(pending.get("desc") or "").strip()
+            lines = [
+                "📖 插画里的「她」·形象档案",
+                f"· 当前形象：{cur or '（还没设置）'}",
+                f"· 待确认提案：{pending_desc or '（没有）'}",
+                "",
+                self._persona_image_usage_text(),
+            ]
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if action in ("确认", "确认提案", "采纳"):
+            ok, payload = self._apply_pending_persona_desc(sender_id)
+            if ok:
+                yield event.plain_result(
+                    "📖 形象档案已确认并写入配置，之后画插图都会照这版画：\n"
+                    f"{payload}"
+                )
+            else:
+                yield event.plain_result(
+                    f"📖 没有确认成功：{payload}\n"
+                    "可以先发 /形象 重拟 生成一版提案，或 /形象 修改 <描述> 直接写。"
+                )
+            return
+
+        if action in ("修改", "改"):
+            desc = re.sub(r"\s+", " ", rest).strip()
+            desc = self._strip_invisible(desc).strip()
+            if not desc:
+                yield event.plain_result(
+                    "📖 用法：/形象 修改 <描述>\n"
+                    "例如：/形象 修改 黑色及腰长发，浅灰眼睛，常穿白色长裙"
+                )
+                return
+            truncated = len(desc) > self._PERSONA_DESC_MAX
+            if truncated:
+                desc = desc[: self._PERSONA_DESC_MAX].strip()
+            if self._set_config_value("persona_image_desc", desc):
+                if truncated:
+                    suffix = f"（{len(desc)} 字，超出 200 字的部分已截断）"
+                else:
+                    suffix = f"（{len(desc)} 字）"
+                yield event.plain_result(
+                    f"📖 形象档案已更新{suffix}，之后画插图都会照这版画：\n{desc}"
+                )
+            else:
+                yield event.plain_result(
+                    "📖 保存失败：形象档案没能写入配置（具体原因见后台日志）。\n"
+                    "发 /形象 可以看到当前实际生效的档案。"
+                )
+            return
+
+        if action in ("重拟", "重新拟", "生成"):
+            desc = ""
+            try:
+                desc = str(await self._propose_persona_image_desc(umo) or "").strip()
+            except Exception as e:
+                logger.warning(f"[memory_diary] 提炼形象提案失败: {e}")
+            if not desc:
+                yield event.plain_result(
+                    "📖 这次没能提炼出新的形象提案（可能是模型暂时不可用）。\n"
+                    "可以稍后再发 /形象 重拟，或者用 /形象 修改 <描述> 直接写。"
+                )
+                return
+            cur = str(self.config.get("persona_image_desc", "") or "").strip()
+            saved = self._save_pending_persona_desc(
+                sender_id, desc, kind="evolve" if cur else "init"
+            )
+            tail = (
+                "确认的话发 /形象 确认 写入配置；想微调就发 /形象 修改 <描述>。"
+                if saved
+                else "（提醒：这份提案没能存成待确认状态，发 /形象 确认 可能无效；"
+                "可以重试 /形象 重拟，或用 /形象 修改 <描述> 直接写。）"
+            )
+            yield event.plain_result(
+                f"📖 我想到一版新的形象提案（{len(desc)} 字）：\n{desc}\n\n{tail}"
+            )
+            return
+
+        # 不认识的参数：记录 repr 便于排查不可见字符，然后给用法
+        logger.warning(
+            f"[memory_diary] 无法识别的形象参数，原始消息："
+            f"{(event.message_str or '')!r}"
+        )
+        yield event.plain_result(self._persona_image_usage_text())
 
     # ------------------------- 指令：记一下（备忘） -------------------------
 
@@ -687,14 +911,129 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                         "名额已用完；可以继续写简记，或次日 00:00 重置后再写完整篇）"
                     )
 
+        # v0.6 插图提示行（有图在画 / 有形象提案待确认），由 _write_diary 写入
+        # _image_last_notice；读一次即清空，避免串到下一次通知里。
+        # 只在手动 /写日记 的通知处追加——自动写日记的通知路径保持 v0.5.5 原样。
+        image_notice = getattr(self, "_image_last_notice", "") or ""
+        if image_notice:
+            notice += image_notice
+            self._image_last_notice = ""
+
         if (
             bool(self.config.get("show_diary_after_write", False))
             and not event.get_group_id()
         ):
-            # 日记全文只在私聊展示，群聊不展示，避免泄露给其他成员
-            notice += f"\n\n—— 日记全文 ——\n{diary_content}"
+            # 日记全文只在私聊展示，群聊不展示，避免泄露给其他成员。
+            # v0.6：QQ 纯文本里不露 markdown 图片语法——插图引用显示成
+            # [插图：描述] / [用户分享的照片：描述] 占位（图文穿插只走 /查看日记）。
+            notice += (
+                "\n\n—— 日记全文 ——\n"
+                f"{self._image_macro_to_placeholder(diary_content)}"
+            )
 
         yield event.plain_result(notice)
+
+    # ------------------------- 插图呈现（QQ 图文穿插） -------------------------
+    #
+    # v0.6：日记正文里的 markdown 图片引用（只认 images/ 开头，见契约第 2 节）由
+    # illustration._split_images_for_send 切成 text/image/placeholder/warning 段，
+    # 按顺序发多条消息，呈现"字 → 图 → 字"的翻日记本感觉（设计 7.1）。
+    # 图片字节从用户日记 zip 里读（storage.load_image 负责验签），落一个临时文件
+    # 交给 Image 组件，发完即删——数据目录里不留第二份图片副本。
+    # 零图片时切段结果就是单段原文，输出与 v0.5.5 逐字节一致。
+
+    async def _send_diary_image(self, event: AstrMessageEvent,
+                                sender_id: str, name: str, alt: str) -> bool:
+        """发送一张日记插图；成功返回 True，缺失/环境不支持时返回 False 由调用方降级。"""
+        if _ImageComponent is None or not callable(
+            getattr(_ImageComponent, "fromFileSystem", None)
+        ):
+            # 老版本 AstrBot 没有 Image.fromFileSystem：不崩插件，正文照常读
+            logger.warning("[memory_diary] 当前 AstrBot 版本不支持图片消息，插图降级为占位文本")
+            return False
+        try:
+            data, status = self.load_image(sender_id, name)
+        except Exception as e:
+            logger.warning(f"[memory_diary] 读取插图失败（{name}）: {e}")
+            data, status = None, "missing"
+        if not data:
+            # missing 优雅降级（占位）；tampered 已在切段层转成 warning 段，
+            # 这里若因并发变化读不到，同样按占位处理，不额外打扰用户。
+            if status == "tampered":
+                logger.warning(f"[memory_diary] 插图验签失败，按占位显示：{name}")
+            return False
+        suffix = Path(str(name or "")).suffix.lower()
+        if suffix not in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+            suffix = ".png"
+        try:
+            tmp_dir = self.data_dir / "temp"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"[memory_diary] 创建插图临时目录失败: {e}")
+            return False
+        tmp = tmp_dir / f"{secrets.token_hex(16)}{suffix}"
+        try:
+            tmp.write_bytes(data)
+            try:
+                from astrbot.api.event import MessageChain
+
+                chain = MessageChain(chain=[_ImageComponent.fromFileSystem(str(tmp))])
+            except Exception as e:
+                logger.warning(f"[memory_diary] 构造插图消息失败: {e}")
+                return False
+            await event.send(chain)
+            return True
+        except Exception as e:
+            logger.warning(f"[memory_diary] 发送插图失败（{name}）: {e}")
+            return False
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    async def _send_diary_content(self, event: AstrMessageEvent,
+                                  sender_id: str, content: str):
+        """发送日记正文：按插图引用切段做图文穿插，零图片时与旧版输出逐字节一致。
+
+        调用方（/查看日记 的私有等待分支与"最新"回退分支）把
+        ``f"📖 {label} 的日记：\\n\\n"`` 前缀并入 content 传给这里，
+        前缀因此成为首段文本的一部分，不会被拆成单独一条消息。
+        """
+        segments = self._split_images_for_send(sender_id, content)
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            if seg.get("type") == "image":
+                name = str(seg.get("name") or "")
+                alt = str(seg.get("alt") or "")
+                if await self._send_diary_image(event, sender_id, name, alt):
+                    continue
+                # 图片缺失/环境不支持：降级为占位文本（设计 6.3 优雅降级）
+                if alt.startswith(self._USER_PHOTO_ALT_PREFIX):
+                    fallback = f"[{alt}]"
+                else:
+                    fallback = f"[插图：{alt}]" if alt else "[插图]"
+                await event.send(event.plain_result(fallback))
+                continue
+            text = str(seg.get("text") or "")
+            if text:
+                await event.send(event.plain_result(text))
+
+    def _qq_annotation_section(self, sender_id: str, entry_name: str) -> str:
+        """QQ 端某天日记的第五部分（页边批注）；异常时静默降级为空串。
+
+        批注是附加内容：读取/验签出任何问题都只记 warning，绝不影响日记正文。
+        零批注时返回 ""，调用方保持与 v0.5.5 逐字节一致的输出。
+        """
+        try:
+            return (
+                self.qq_annotation_section_text(sender_id, self._entry_day(entry_name))
+                or ""
+            )
+        except Exception as e:
+            logger.warning(f"[memory_diary] 读取页边批注失败，已跳过第五部分: {e}")
+            return ""
 
     # ------------------------- 指令：查看 / 删除 -------------------------
 
@@ -765,9 +1104,13 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                     "📖 最新一篇验签失败，疑似被篡改，已拒绝读取。"
                 )
             else:
-                yield event.plain_result(
-                    f"📖 {self._entry_label(entries[-1])} 的日记：\n\n{latest_content}"
-                )
+                # v0.6：图文穿插发送（零图片时与旧版输出逐字节一致）；
+                # 页边批注作为第五部分统一放在文末，绝不穿插进正文四部分。
+                section = self._qq_annotation_section(sender_id, entries[-1])
+                text = f"📖 {self._entry_label(entries[-1])} 的日记：\n\n{latest_content}"
+                if section:
+                    text += "\n\n" + section
+                await self._send_diary_content(event, sender_id, text)
             return
 
         @session_waiter(timeout=60, record_history_chains=False)
@@ -840,11 +1183,13 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                         )
                     )
                 else:
-                    await ev.send(
-                        ev.plain_result(
-                            f"📖 {self._entry_label(name)} 的日记：\n\n{content}"
-                        )
-                    )
+                    # v0.6：图文穿插发送（零图片时与旧版输出逐字节一致）；
+                    # 页边批注作为第五部分统一放在文末，绝不穿插进正文四部分。
+                    section = self._qq_annotation_section(sender_id, name)
+                    text = f"📖 {self._entry_label(name)} 的日记：\n\n{content}"
+                    if section:
+                        text += "\n\n" + section
+                    await self._send_diary_content(ev, sender_id, text)
             controller.stop()
 
         try:
@@ -859,6 +1204,169 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             )
         except Exception as e:
             logger.warning(f"[memory_diary] 查看日记交互异常: {e}")
+        finally:
+            event.stop_event()
+
+    # ------------------------- 指令：批注（v0.6，仅私聊） -------------------------
+    #
+    # 批注是"她"读完日记后在页边留下的字，属于私人内容：只在私聊展示与写回。
+    # 展示文案全部由 memory_diary/annotation.py 生成（固定文案，不额外调模型）；
+    # 写回必须走 session_waiter 由用户签字确认，AI 不能自行改写日记/批注。
+
+    @filter.command("查看批注", alias={"annotations", "diary_annotations"})
+    async def view_annotations(self, event: AstrMessageEvent):
+        """查看页边批注（仅私聊）：本轮新写的、悬置的、已写回的都在这里。"""
+        if not self._should_respond(event):
+            return
+        if event.get_group_id():
+            yield event.plain_result("📖 批注是只给本人看的哦，请私聊我查看～")
+            return
+        if not self._annotations_enabled():
+            yield event.plain_result("📖 批注功能未开启（管理员可在配置页开启）。")
+            return
+        yield event.plain_result(
+            self.annotations_view_text(event.get_sender_id())
+        )
+
+    @filter.command("写回批注", alias={"diary_writeback"})
+    async def writeback_annotation(self, event: AstrMessageEvent):
+        """把讨论收敛后的批注写回（仅私聊，需用户签字确认，可悬置）。"""
+        if not self._should_respond(event):
+            return
+        if event.get_group_id():
+            yield event.plain_result("📖 批注是只给本人看的哦，请私聊我查看～")
+            return
+        if not self._annotations_enabled():
+            yield event.plain_result("📖 批注功能未开启（管理员可在配置页开启）。")
+            return
+
+        sender_id = event.get_sender_id()
+        umo = event.unified_msg_origin
+        # 列之前先用同一个编号口径探一下有没有可写回的批注（无则直接给固定文案）
+        try:
+            has_any = self.annotation_by_index(sender_id, 1) is not None
+        except Exception as e:
+            logger.warning(f"[memory_diary] 读取待写回批注失败: {e}")
+            has_any = False
+        try:
+            listing = self.open_annotation_list_text(sender_id)
+        except Exception as e:
+            logger.warning(f"[memory_diary] 生成待写回批注列表失败: {e}")
+            listing = "📖 暂时读不到批注，请稍后再试。"
+        if not has_any:
+            yield event.plain_result(listing)
+            return
+
+        if not _SESSION_WAITER_OK:
+            # 非交互环境明确拒绝：写回必须用户签字，绝不静默改数据
+            yield event.plain_result(
+                "📖 当前环境不支持交互确认，写回没有进行，批注原样保留。"
+            )
+            return
+
+        yield event.plain_result(listing)
+
+        pending = {"ann": None, "draft": None}
+
+        @session_waiter(timeout=60, record_history_chains=False)
+        async def annotation_writeback_waiter(
+            controller: SessionController, ev: AstrMessageEvent
+        ):
+            text = self._strip_invisible(ev.message_str or "").strip()
+            if self._is_cancel(text):
+                await ev.send(
+                    ev.plain_result("📖 已取消，批注原样保留。")
+                )
+                controller.stop()
+                return
+            # 第一步：选号
+            if pending["ann"] is None:
+                if not text.isdigit():
+                    await ev.send(
+                        ev.plain_result(
+                            "📖 请回复序号选择要写回哪一条（回复「取消」退出）。"
+                        )
+                    )
+                    controller.keep(timeout=60, reset_timeout=True)
+                    return
+                ann = self.annotation_by_index(sender_id, int(text))
+                if ann is None:
+                    await ev.send(
+                        ev.plain_result(
+                            "📖 没有这个序号，请重新回复序号（回复「取消」退出）。"
+                        )
+                    )
+                    controller.keep(timeout=60, reset_timeout=True)
+                    return
+                try:
+                    draft = await self._distill_annotation_reply(
+                        sender_id, umo, ann
+                    )
+                except Exception as e:
+                    logger.warning(f"[memory_diary] 批注写回蒸馏异常: {e}")
+                    draft = None
+                if not draft:
+                    await ev.send(
+                        ev.plain_result(
+                            "📖 这次没聊出能写回的内容，批注原样保留。"
+                        )
+                    )
+                    controller.stop()
+                    return
+                pending["ann"] = ann
+                pending["draft"] = draft
+                await ev.send(
+                    ev.plain_result(self.annotation_draft_text(ann, draft))
+                )
+                controller.keep(timeout=60, reset_timeout=True)
+                return
+            # 第二步：签字确认 / 悬置 / 取消（取消已在上方统一处理）
+            ann_id = str((pending["ann"] or {}).get("id") or "")
+            low = text.lower()
+            if low in ("确认", "确认写回", "是", "yes", "y", "ok"):
+                if self.apply_annotation_reply(sender_id, ann_id, pending["draft"]):
+                    await ev.send(
+                        ev.plain_result("📖 已确认写回，这条批注标记为已解。")
+                    )
+                else:
+                    await ev.send(
+                        ev.plain_result(
+                            "📖 保存失败（数据目录不可写或磁盘已满），批注没有改动。"
+                        )
+                    )
+                controller.stop()
+                return
+            if low in ("悬置", "暂缓", "先放着", "defer"):
+                if self.defer_annotation(sender_id, ann_id):
+                    await ev.send(
+                        ev.plain_result(
+                            "📖 已悬置，这条批注先放着；"
+                            "之后想写回再发 /写回批注 就行。"
+                        )
+                    )
+                else:
+                    await ev.send(
+                        ev.plain_result(
+                            "📖 保存失败（数据目录不可写或磁盘已满），批注没有改动。"
+                        )
+                    )
+                controller.stop()
+                return
+            await ev.send(
+                ev.plain_result(
+                    "📖 没看懂～回复「确认」写回、「悬置」先放着，或「取消」退出。"
+                )
+            )
+            controller.keep(timeout=60, reset_timeout=True)
+
+        try:
+            await annotation_writeback_waiter(event)
+        except TimeoutError:
+            yield event.plain_result(
+                "📖 交互超时啦，批注原样保留，想写回随时再发 /写回批注。"
+            )
+        except Exception as e:
+            logger.warning(f"[memory_diary] 写回批注交互异常: {e}")
         finally:
             event.stop_event()
 
@@ -1305,14 +1813,17 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                 return
 
             try:
-                owner_id, key, entries = self._verify_bundle(Path(downloaded))
+                owner_id, key, entries, images, annotations = self._verify_bundle(
+                    Path(downloaded)
+                )
                 sender_name = ""
                 try:
                     sender_name = ev.get_sender_name() or ""
                 except Exception:
                     pass
                 mode = self._install_bundle(
-                    ev.get_sender_id(), owner_id, key, entries, sender_name
+                    ev.get_sender_id(), owner_id, key, entries, sender_name,
+                    images=images, annotations=annotations,
                 )
                 n_days = len(entries)
                 if mode == "same_key":
@@ -1438,6 +1949,8 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             "日记本：读取自定义背景板")
         reg(f"/{PLUGIN_NAME}/backdrop/upload", self.web_upload_backdrop, ["POST"],
             "日记本：上传自定义背景板")
+        reg(f"/{PLUGIN_NAME}/image/<file_key>/<name>", self.web_get_diary_image,
+            ["GET"], "日记本：读取日记插图")
 
     @staticmethod
     def _valid_file_key(file_key: str) -> bool:
@@ -1541,10 +2054,72 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                 "label": self._entry_label(entry),
                 "content": "",
             })
-        return _web_json({
+        resp = {
             "tampered": False,
             "label": self._entry_label(entry),
             "content": content,
+        }
+        # 页边批注：按条件附加字段（零批注时响应与 v0.5.5 逐字节一致）。
+        # 日记本身验签失败的早退分支不加批注字段，避免泄露任何在途信息。
+        try:
+            annotations, ann_tampered = self.annotations_web_payload(owner, day)
+        except Exception as e:
+            logger.warning(f"[memory_diary] 读取 Web 批注失败，已跳过: {e}")
+            annotations, ann_tampered = [], False
+        if annotations:
+            resp["annotations"] = annotations
+        if ann_tampered:
+            resp["annotations_tampered"] = True
+        return _web_json(resp)
+
+    async def web_get_diary_image(self, file_key: str, name: str):
+        """日记插图服务路由：从用户日记 zip 读图，验签后以 base64 JSON 返回。
+
+        为什么不是二进制 file_response：日记本页面运行在 Dashboard 的 sandbox
+        iframe 里，``<img src>`` 不会带上面板 Cookie（请求 401），而 bridge 只能
+        传 JSON（契约附录 A）。所以这里把图片 base64 化后放在 ``image`` 字段——
+        不能叫 ``data``：bridge 会把响应体顶层的 data 当信封解包
+        （同款坑见 ``_web_get_image`` 与 tests/test_web.py）。
+
+        ``name`` 可以是 ``images/xxx.png`` 也可以是纯文件名 ``xxx.png``：
+        AstrBot 路由的 ``<name>`` 不匹配斜杠，页面实际用纯文件名；两种写法都
+        支持，且只认 zip 里真实存在的条目（防目录穿越）。
+        """
+        if not self._valid_file_key(file_key):
+            return _web_error("无效的用户标识", status_code=400)
+        path = self.data_dir / f"diary_{file_key}.zip"
+        if not path.exists():
+            return _web_error("日记文件不存在", status_code=404)
+        qq_hint = (_web_request.query.get("qq", "") or "").strip()
+        owner, err = self._resolve_zip_owner(path, file_key, qq_hint)
+        if not owner:
+            if err == "OWNER_UNKNOWN":
+                return _web_json({"need_owner": True})
+            return _web_error(f"无法确认日记主人：{err}", status_code=400)
+        gate = self._check_web_password(owner)
+        if gate is not None:
+            return gate
+        raw_name = str(name or "").strip()
+        entry = raw_name if raw_name.startswith("images/") else f"images/{raw_name}"
+        # 只服务确实存在于 zip 里的条目：穿越路径/拼错的名字一律按缺失处理，
+        # 不把 storage 的路径规则当作唯一防线。
+        try:
+            known = set(self.list_images(owner))
+        except Exception as e:
+            logger.warning(f"[memory_diary] Web 读取插图列表失败: {e}")
+            known = set()
+        if entry not in known:
+            return _web_json({"found": False, "status": "missing"})
+        data, status = self.load_image(owner, entry)
+        if status in ("tampered", "no_key"):
+            # no_key 与正文不可验签同口径：验不了就当篡改，宁可不显示
+            return _web_json({"found": False, "status": "tampered"})
+        if not data:
+            return _web_json({"found": False, "status": "missing"})
+        return _web_json({
+            "found": True,
+            "mime": sniff_image_mime(data),
+            "image": base64.b64encode(data).decode("ascii"),
         })
 
     def _web_prepare_export(self, file_key: str):
@@ -1775,9 +2350,10 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         tmp = self.data_dir / f"import_tmp_{secrets.token_hex(4)}.zip"
         try:
             await upload.save(tmp)
-            owner_id, key, entries = self._verify_bundle(tmp)
+            owner_id, key, entries, images, annotations = self._verify_bundle(tmp)
             mode = self._install_bundle(
-                owner_id, owner_id, key, entries, check_owner=False
+                owner_id, owner_id, key, entries, check_owner=False,
+                images=images, annotations=annotations,
             )
             logger.info(
                 f"[memory_diary] Web 页面导入迁移包成功："
@@ -2425,6 +3001,8 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                 return  # 自己发的消息不算
         except Exception:
             pass
+        # 附录 A 修复：白名单外用户在私聊发指令时给一次性提示（群聊/普通闲聊静默）
+        await self._maybe_hint_whitelist_denied(event)
         # 登记私聊会话（供每天定时自动写日记主动通知），并惰性启动后台任务
         try:
             self._remember_auto_user(event)
@@ -2438,6 +3016,66 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         if text in ("/reset", "reset", "/重置", "重置"):
             self._reset_pending.add(event.unified_msg_origin)
             self._cap_state(self._reset_pending)
+
+    async def _annotation_block_for_inject(
+        self, sender_id, umo, in_group, diary: str, names: list,
+        is_new_generation: bool,
+    ) -> str:
+        """批注注入块：reset 后首次注入时先同步生成，再返回注入块。
+
+        - 生成条件：annotation_enabled 且非群聊且日记非空且本代际还没生成过
+          （is_new_generation 由调用方按代际状态判定）；
+        - 关闭 / 群聊 / 无日记 / 已生成过 → 只返回（可能为空的）注入块；
+        - 批注层任何异常都只 warning 降级，日记注入照常，绝不阻塞对话。
+        """
+        # 群聊：不生成、不注入（批注仅私聊，隐私红线）
+        if in_group:
+            return ""
+        try:
+            if not self._annotations_enabled():
+                return ""
+        except Exception as e:
+            logger.warning(f"[memory_diary] 批注开关判定异常，本轮不注入批注: {e}")
+            return ""
+        if is_new_generation and diary:
+            try:
+                result = await self._generate_annotations(
+                    sender_id, umo, diary, list(names or []), is_group=in_group
+                )
+                if isinstance(result, dict):
+                    created = int(result.get("created") or 0)
+                    reason = str(result.get("reason") or "")
+                    if created > 0:
+                        logger.info(
+                            f"[memory_diary] 已生成 {created} 条页边批注"
+                            f"（round={result.get('round') or ''}）"
+                        )
+                    elif reason not in ("", "disabled", "group", "no_diary"):
+                        logger.warning(
+                            f"[memory_diary] 批注生成降级（{reason}），"
+                            "本轮日记照常注入"
+                        )
+            except Exception as e:
+                logger.warning(
+                    f"[memory_diary] 批注生成异常，本轮日记照常注入: {e}"
+                )
+        try:
+            # 批注和日记吃同一份注入预算（设计第二部分第 5 节）：按日记已占字数
+            # 算出还能给批注块的字数（预留 ~400 字给行为纪律），再交给批注层裁剪。
+            # 日记已把预算占满时 char_cap < 100，批注层本轮直接不注入（/查看批注 仍可看）。
+            try:
+                budget = int(self.config.get("inject_max_chars", 8000) or 8000)
+            except (TypeError, ValueError):
+                budget = 8000
+            if budget <= 0:
+                budget = 8000
+            char_cap = min(1500, max(0, budget - len(diary or "") - 400))
+            return self._annotation_inject_block(
+                sender_id, char_cap=char_cap
+            ) or ""
+        except Exception as e:
+            logger.warning(f"[memory_diary] 批注注入块读取失败，已跳过: {e}")
+            return ""
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -2549,10 +3187,25 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
                     sender_id, in_group=in_group, exclude_names=pending_names
                 )
                 if diary:
+                    # 持久模式每轮都注入日记：批注只在"本代际首次注入"时同步生成一次，
+                    # 之后每轮只附带已有的 open/deferred 批注块。代际状态挂在 rec 上，
+                    # /reset 的代际识别会重置 rec，从而允许新代际重新生成。
+                    seeded = bool(rec.get("annotation_generated"))
+                    if not seeded:
+                        # 先占位再 await：生成要等模型最多 annotation_timeout 秒，
+                        # 期间并发第二个请求不应再触发一次生成。
+                        rec["annotation_generated"] = True
+                    ann_block = await self._annotation_block_for_inject(
+                        sender_id, umo, in_group, diary, names,
+                        is_new_generation=not seeded,
+                    )
+                    inject_diary = (
+                        diary + "\n\n" + ann_block if ann_block else diary
+                    )
                     req.system_prompt = (
                         (req.system_prompt or "")
                         + "\n\n"
-                        + INJECT_TEMPLATE.format(diary=diary)
+                        + INJECT_TEMPLATE.format(diary=inject_diary)
                     )
                     self._injected_cid[umo] = cid
                     self._cap_state(self._injected_cid)
@@ -2580,7 +3233,20 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             self._injected_cid[umo] = cid
             self._cap_state(self._injected_cid)
             rec["names"].update(names)
-            self._deliver_inject(req, INJECT_TEMPLATE.format(diary=diary))
+            # 本分支就是"本代际第一次注入日记"：此刻同步生成批注（失败静默降级），
+            # 再把批注块拼在日记后一起注入；关闭态返回空串，注入文本逐字节不变。
+            # 与持久模式共用 rec["annotation_generated"] 标记，保证两条路径语义一致。
+            seeded = bool(rec.get("annotation_generated"))
+            if not seeded:
+                # 先占位再 await：生成最多等 annotation_timeout 秒，期间并发请求
+                # 不应重复生成（代际状态挂在 rec 上，reset 时会重建）。
+                rec["annotation_generated"] = True
+            ann_block = await self._annotation_block_for_inject(
+                sender_id, umo, in_group, diary, names,
+                is_new_generation=not seeded,
+            )
+            inject_diary = diary + ("\n\n" + ann_block if ann_block else "")
+            self._deliver_inject(req, INJECT_TEMPLATE.format(diary=inject_diary))
             logger.info(f"[memory_diary] 已在新会话为用户 {sender_id} 注入日记")
         except Exception as e:
             logger.warning(f"[memory_diary] 注入日记异常: {e}")

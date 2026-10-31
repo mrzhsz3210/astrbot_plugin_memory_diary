@@ -341,6 +341,19 @@ class World:
         "其中的小标题是你按自己的人设起的名字，"
         "依次对应：时间范围 / 用户画像 / 你的评价与感受 / 给未来的叮嘱。\n\n"
     )
+    # v0.6 插图差分豁免：帮助菜单新增的 /形象 一行只存在于 refactor 侧。
+    # 差异由 test_image_present.py 单独钉住（assert "/形象" in help），
+    # 这里归一掉，保证既有差分用例仍能比较 v0.5.5 的语义基线。
+    _HELP_IMAGE_LINE_V06 = (
+        "· /形象 —— 私聊专用：查看/确认/修改/重拟插画里「她」长什么样的形象档案\n"
+    )
+    # v0.6 批注差分豁免：帮助菜单新增的 /查看批注、/写回批注 两行只存在于
+    # refactor 侧（baseline 没有批注功能）。差异由 test_annotation_commands.py
+    # 对 refactor 原始输出单独钉住存在性，这里归一掉以保持既有差分用例可比。
+    _HELP_ANNOTATION_LINES_V06 = (
+        "· /查看批注 —— 私聊专用：查看本轮读日记时留下的批注与所有未解/悬置的批注\n"
+        "· /写回批注 —— 私聊专用：把聊明白的批注写回日记（需确认，可悬置）\n"
+    )
 
     def normalise_text(self, text: str, inst: Instance) -> str:
         replacements = [
@@ -350,6 +363,8 @@ class World:
             (str(self.tmp), "<WORLD_TMP>"),
         ]
         out = text.replace(self._INJECT_TEMPLATE_V055_SENTENCE, "")
+        out = out.replace(self._HELP_IMAGE_LINE_V06, "")
+        out = out.replace(self._HELP_ANNOTATION_LINES_V06, "")
         for needle, marker in replacements:
             out = out.replace(needle, marker)
             out = out.replace(needle.replace("\\", "\\\\"), marker)

@@ -106,6 +106,51 @@ async def test_whitelist_blocks_commands_silently():
         assert any("指令一览" in t for t in allowed_help)
 
 
+async def test_whitelist_denied_command_hints_once_in_private():
+    """附录 A 修复：白名单外用户在内置测试聊天发指令时，私聊回一次性配置提示。
+
+    v0.5.5 的问题：白名单静默拦截，内置测试聊天的 sender_id 不是用户 QQ 号，
+    发 /删除日记 完全没反应，分不清是不在白名单还是插件坏了。
+    """
+    async with World(
+        config={"use_persona": False, "allowed_users": SENDER, "diary_op_interval": 0}
+    ) as world:
+        inst = world.refactor
+        plugin = inst.plugin
+        # 名单外私聊 + 指令形态 → 一次提示（带 UID 与配置页指引）
+        first = _event("/删除日记", sender_id=OTHER)
+        await plugin.on_any_message(first)
+        texts = first.result_texts()
+        assert len(texts) == 1, texts
+        assert OTHER in texts[0]
+        assert "白名单" in texts[0]
+        assert "允许使用插件的用户" in texts[0]
+        # 同一身份再来一条指令：不再提示（一次性，防刷屏）
+        second = _event("/查看日记", sender_id=OTHER)
+        await plugin.on_any_message(second)
+        assert second.result_texts() == []
+        # 名单外普通闲聊：不提示（防打扰、不暴露插件）
+        chat = _event("在吗", sender_id=OTHER)
+        await plugin.on_any_message(chat)
+        assert chat.result_texts() == []
+        # 群聊里的名单外指令：保持静默（不暴露插件、不抢话）
+        group = _event("/删除日记", sender_id=OTHER, group_id="88888")
+        await plugin.on_any_message(group)
+        assert group.result_texts() == []
+        # 名单内用户：不提示（照常由指令 handler 回应，这里只看 on_any_message 无额外输出）
+        allowed = _event("/日记帮助", sender_id=SENDER)
+        await plugin.on_any_message(allowed)
+        assert allowed.result_texts() == []
+        # 取不到 UID（内置测试聊天可能如此）：也提示一次，引导查日志/临时清空白名单
+        blank = _event("/删除日记", sender_id="")
+        await plugin.on_any_message(blank)
+        assert len(blank.result_texts()) == 1, blank.result_texts()
+        assert "允许使用插件的用户" in blank.result_texts()[0]
+        # terminate 清空一次性状态（重载插件后可重新提示）
+        await plugin.terminate()
+        assert plugin._whitelist_hint_sent == set()
+
+
 async def test_whitelist_blocks_injection_and_sentinel():
     async with World(
         config={"use_persona": False, "allowed_users": SENDER}
@@ -616,6 +661,10 @@ def test_schema_keeps_deprecated_context_watch_for_migration():
     cal = schema["token_calibration_enabled"]
     assert cal["default"] is False
     assert "实验性" in cal["description"]
+    # 配置页联动：只有打开「改进版 token 估算」才显示自动校准开关
+    assert cal.get("condition") == {"token_estimation_v2": True}
+    # 配置页最后两项固定为「日记时区」→「已废弃的启用上下文哨兵」（废弃项最后）
+    assert list(schema.keys())[-2:] == ["diary_timezone", "enable_context_watch"]
 
     # 完整日记是质量锚点：默认 1 篇/场景/天，配置说明必须明确不建议多设
     mf = schema["max_full_diaries_per_day"]
@@ -1020,26 +1069,40 @@ async def test_diary_status_hides_personal_stats_and_calibration_in_group():
 # ---------------------------------------------------------------------------
 
 _CONF_README_ORDER = [
-    # 8.1 上下文哨兵
+    # 10.1 上下文哨兵
     "context_token_limit", "remind_ratio", "auto_ratio",
     "token_estimation_v2", "token_calibration_enabled",
-    # 8.5 新会话读日记（注入）
+    # 10.5 新会话读日记（注入）
     "enable_auto_inject", "inject_default_days", "inject_max_chars",
     "group_inject_filter", "persist_inject",
-    # 8.6 写作
+    # 10.6 写作
     "enable_auto_diary", "auto_diary_time", "empty_diary_as_life",
     "max_full_diaries_per_day", "max_history_messages",
     "group_history_multiplier", "write_min_ratio", "extra_instruction",
-    # 8.7 隐私与安全
+    # 10.7 隐私与安全
     "allowed_users", "show_diary_after_write",
-    # 8.8 反馈风格
+    # 10.8 反馈风格
     "use_persona",
-    # 8.9 群聊行为
+    # 10.9 群聊行为
     "group_require_at",
-    # 8.10 限额与防护
+    # 10.10 限额与防护
     "diary_op_interval",
-    # 8.11 杂项（已废弃项按 README 顺序为第一条）
-    "enable_context_watch", "web_diary_brand", "diary_timezone",
+    # 10.11 界面
+    "web_diary_brand",
+    # 10.12 插图配置与形象档案（v0.6，顺序与 README bullet 一致）
+    "image_enabled", "image_mode", "image_local_url", "image_api_base",
+    "image_api_key", "image_model", "image_size_preset",
+    "image_prob_memo", "image_prob_full",
+    "image_limit_memo", "image_limit_full", "image_limit_daily",
+    "image_limit_group", "image_concurrency", "image_timeout",
+    "persona_image_desc", "image_style_prompt",
+    "user_image_enabled", "user_image_limit", "user_ref_photo",
+    "vision_api_base", "vision_api_key", "vision_api_model",
+    # 10.13 批注配置（v0.6，顺序与 README bullet 一致）
+    "annotation_enabled", "annotation_max_per_round",
+    "annotation_question_hint", "annotation_timeout",
+    # 10.16 时区与兼容项（配置页最后，废弃项是最后一个）
+    "diary_timezone", "enable_context_watch",
 ]
 
 _CONF_LABEL_PREFIXES = [
@@ -1069,11 +1132,40 @@ _CONF_LABEL_PREFIXES = [
     ("（已废弃）启用上下文哨兵", "enable_context_watch"),
     ("日记本页面的称呼", "web_diary_brand"),
     ("日记时区", "diary_timezone"),
+    # 10.12 插图配置与形象档案（v0.6）
+    ("插图功能总开关", "image_enabled"),
+    ("生图通道", "image_mode"),
+    ("本地生图服务地址", "image_local_url"),
+    ("云端生图 API 地址", "image_api_base"),
+    ("云端生图 API Key", "image_api_key"),
+    ("云端生图模型", "image_model"),
+    ("插图尺寸档位", "image_size_preset"),
+    ("简记插图触发概率", "image_prob_memo"),
+    ("完整日记插图触发概率", "image_prob_full"),
+    ("单篇简记最多几张插图", "image_limit_memo"),
+    ("单篇完整日记最多几张插图", "image_limit_full"),
+    ("每日插图总量上限", "image_limit_daily"),
+    ("群聊单篇最多几张插图", "image_limit_group"),
+    ("同时生成插图的最大数量", "image_concurrency"),
+    ("单张插图生成超时", "image_timeout"),
+    ("AI 形象描述", "persona_image_desc"),
+    ("画风锚", "image_style_prompt"),
+    ("把用户发来的照片收进日记", "user_image_enabled"),
+    ("单篇日记最多收几张用户照片", "user_image_limit"),
+    ("参考照片路径", "user_ref_photo"),
+    ("可选视觉接口 API 地址", "vision_api_base"),
+    ("可选视觉接口 API Key", "vision_api_key"),
+    ("可选视觉接口模型", "vision_api_model"),
+    # 10.13 批注配置（v0.6）
+    ("批注功能总开关", "annotation_enabled"),
+    ("每轮最多生成几条批注", "annotation_max_per_round"),
+    ("疑问句软引导", "annotation_question_hint"),
+    ("批注生成超时", "annotation_timeout"),
 ]
 
 
 def test_conf_schema_order_matches_readme_sections():
-    """配置页按 schema 键顺序渲染，必须与 README §8 的介绍顺序逐项一致。
+    """配置页按 schema 键顺序渲染，必须与 README §10 的介绍顺序逐项一致。
 
     任何一侧单独重排（schema 或 README）都会让本测试失败——这正是「配置页顺序
     与 README 介绍一致」的回归闸门。
@@ -1090,21 +1182,26 @@ def test_conf_schema_order_matches_readme_sections():
     readme_path = os.path.join(root, "README.md")
     with open(readme_path, encoding="utf-8") as f:
         readme = f.read()
-    start = readme.index("## 8 配置项与多用户隐私")
-    end = readme.index("## 9 标准使用流程")
+    start = readme.index("## 10 配置项与多用户隐私")
+    end = readme.index("## 11 标准使用流程")
     section = readme[start:end]
 
     found = []
     current = ""
     for line in section.splitlines():
-        hm = re.match(r"^### (8\.\d+) ", line)
+        hm = re.match(r"^### (10\.\d+) ", line)
         if hm:
             current = hm.group(1)
             continue
-        # 8.2~8.4 是判读/排障说明，没有对应配置项，不参与比较
-        if current not in {"8.1", "8.5", "8.6", "8.7", "8.8", "8.9", "8.10", "8.11"}:
+        # 10.2~10.4 是判读/排障说明，10.14/10.15 是隐私与人设说明，都没有对应配置项
+        if current not in {
+            "10.1", "10.5", "10.6", "10.7", "10.8", "10.9", "10.10", "10.11",
+            "10.12", "10.13", "10.16",
+        }:
             continue
-        bm = re.match(r"^- \*\*(.+?)\*\*", line)
+        # 允许缩进一层：如「token 估算自动校准」作为「改进版 token 估算」的子项，
+        # 在 README 里就是嵌套 bullet；其余未映射的说明性 bullet 统一跳过。
+        bm = re.match(r"^[ \t]*- \*\*(.+?)\*\*", line)
         if not bm:
             continue
         label = bm.group(1)
@@ -1113,10 +1210,9 @@ def test_conf_schema_order_matches_readme_sections():
                 found.append(key)
                 break
         else:
-            # 8.1 里有一条说明两个实验性开关关系的 bullet，不是配置项本身
-            if label.startswith("两个实验性开关"):
-                continue
-            raise AssertionError(f"README 配置项未映射到 schema key: {label!r}")
+            # 10.1 里说明两个实验性开关关系的 bullet、10.12.x 里的
+            # "填了/没填的区别"/排障 Q&A 等，是说明性文字而不是配置项本身
+            continue
 
     assert found == _CONF_README_ORDER, found
 

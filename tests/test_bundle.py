@@ -59,7 +59,10 @@ async def test_verify_bundle_rejects_bad_inputs():
             def run_case(payload: bytes):
                 path.write_bytes(payload)
                 try:
-                    owner, key, entries = plugin._verify_bundle(path)
+                    # v0.6：refactor 的 _verify_bundle 返回 4 元组
+                    # (owner, key, entries, images)，baseline 仍是 3 元组；
+                    # 差分场景只看前 3 项（图片由 test_image_storage.py 覆盖）。
+                    owner, key, entries = plugin._verify_bundle(path)[:3]
                     return {
                         "ok": True,
                         "owner": owner,
@@ -209,13 +212,14 @@ async def test_install_bundle_same_key_and_resign_modes():
             other_path.write_bytes(other)
 
             # Same key -> same_key, entries verifiable locally.
-            owner, key, entries = plugin._verify_bundle(same_path)
+            # （v0.6：refactor 返回 4 元组，baseline 3 元组；差分只看前 3 项）
+            owner, key, entries = plugin._verify_bundle(same_path)[:3]
             mode_same = plugin._install_bundle(SENDER, owner, key, entries)
             same_content = plugin._load_latest(SENDER)[0]
             plugin._delete_diary(SENDER)
 
             # Different key -> resign; local key re-signs the entries.
-            owner, key, entries = plugin._verify_bundle(other_path)
+            owner, key, entries = plugin._verify_bundle(other_path)[:3]
             mode_other = plugin._install_bundle(SENDER, owner, key, entries)
             other_content = plugin._load_latest(SENDER)[0]
             other_snapshot = plugin._list_entries(SENDER)
@@ -277,9 +281,10 @@ async def test_cross_implementation_bundle_compatibility():
         for inst in (base, new):
             inst.plugin._delete_diary(SENDER)
 
-        owner, key, entries = new.plugin._verify_bundle(base_bundle)
+        # v0.6：refactor 返回 4 元组 / baseline 3 元组，跨实现只比前 3 项
+        owner, key, entries = new.plugin._verify_bundle(base_bundle)[:3]
         new_mode = new.plugin._install_bundle(owner, owner, key, entries)
-        owner, key, entries = base.plugin._verify_bundle(new_bundle)
+        owner, key, entries = base.plugin._verify_bundle(new_bundle)[:3]
         base_mode = base.plugin._install_bundle(owner, owner, key, entries)
 
         for bundle in (base_bundle, new_bundle):

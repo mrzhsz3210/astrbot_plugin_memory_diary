@@ -18,8 +18,8 @@ import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .common import safe_key
-from .constants import TOKEN_CALIBRATION_FILE
+from .common import safe_key, sniff_image_ext, strip_invisible
+from .constants import IMAGE_MAX_BYTES, TOKEN_CALIBRATION_FILE
 from .errors import (
     DiaryCorruptError,
     DiaryKeyUnavailable,
@@ -37,6 +37,8 @@ class StorageMixin:
     # 日记本体按用户存成一个 zip：diary_<用户ID哈希>.zip（按天归档、分文件夹）
     #   ├── diaries/20261023.md    某一天的日记（当天写多篇会追加在同一文件，带时间分隔）
     #   ├── sigs/20261023.sig      当天文件的 HMAC-SHA256 防篡改签名
+    #   ├── images/20261031_1_窗边的黄昏.png   插图（v0.6，日记 zip 的一等公民）
+    #   ├── sigs/images_20261031_1_窗边的黄昏.png.sig  插图二进制的 HMAC 签名
     #   └── 说明.txt               日记结构与使用说明
     # 主密钥 .diary_key 在 zip 外（同目录），绝不入包——否则篡改者可自行重签。
     # 新上下文默认自动读最近 7 天的文件（可配）；更早的日期可按需查询。
@@ -46,6 +48,41 @@ class StorageMixin:
     ENTRY_NAME_RE = re.compile(r"^diaries/\d{8}\.md$")  # 当前格式
     _LEGACY_DAY_RE = re.compile(r"^\d{8}\.md$")  # v3.1~3.3 平铺按天，仅迁移用
     _V3_ENTRY_RE = re.compile(r"^\d{8}_\d{6}(_\d+)?\.md$")  # v3.0 按篇命名，仅迁移用
+
+    # ---- 插图条目（v0.6）----
+    # 文件名允许中文（设计示例 "20261031_1_窗边的黄昏.png"），但禁止路径分隔符、
+    # 控制字符与 ".."；名字只由程序生成（LLM 描述先 sanitize），见 save_image()。
+    IMAGE_NAME_RE = re.compile(
+        r"^images/[^/\\\x00-\x1f\x7f]+\.(?:png|jpg|jpeg|webp|gif)$", re.IGNORECASE
+    )
+    IMAGE_SIG_RE = re.compile(r"^sigs/images_.+\.sig$")
+    IMAGE_EXTS = ("png", "jpg", "jpeg", "webp", "gif")
+    # 用户照片的 alt 前缀（注入时替换成 [用户分享的照片：…]，见 _assemble_inject）
+    USER_PHOTO_ALT_PREFIX = "用户分享的照片："
+
+    # ---- 批注侧车（v0.6，D7）----
+    # 批注是读者留言，独立于日记正文：侧车文件 annotations.json 与正文一样纳入
+    # 签名体系（文件整体 HMAC），防"改批注不告警"。文件放在日记 zip 内，
+    # 导出迁移包时随包天然带走；旧 zip 没有这个条目时按"空批注"优雅兼容。
+    # 验签三态与正文同口径：
+    #   · 条目缺失          → missing（旧数据，不告警，视为空）
+    #   · 签名缺失/不匹配   → tampered（与正文篡改同级：不展示、不重签、写入拒绝）
+    #   · 主密钥不可用      → no_key（验不了 = 不可信）
+    ANNOTATIONS_ENTRY = "annotations.json"
+    ANNOTATIONS_SIG_ENTRY = "sigs/annotations.json.sig"
+    ANNOTATION_STATUSES = ("open", "resolved", "deferred")
+    # 容量上限：长期运行批注只增不减会拖慢注入与展示，超出后先丢最旧的已解批注
+    ANNOTATIONS_MAX_RECORDS = 500
+
+    # ---- 来源侧车（写作时剥离的 <self> 自发挥原文）----
+    # 写作模型把"自己发挥/虚构的拟人内容"用 <self>…</self> 标出，保存前插件
+    # 剥掉标签、把原文子串记进本侧车；批注生成时用它把这些片段从"可锚文本"
+    # 里剔除，防止批注落在 AI 自编内容上。签名/搬运/清理纪律与批注侧车一致：
+    # 整体 HMAC、写日记时原样搬运、删日记时同步清理；旧 zip 没有它时视为空。
+    PROVENANCE_ENTRY = "provenance.json"
+    PROVENANCE_SIG_ENTRY = "sigs/provenance.json.sig"
+    PROVENANCE_MAX_SELF_PER_ENTRY = 50    # 单篇最多记多少条自发挥子串
+    PROVENANCE_MAX_SELF_CHARS = 2000      # 单篇自发挥子串的总字数上限
 
     @staticmethod
     def _md_entry(day: str) -> str:
@@ -298,6 +335,929 @@ class StorageMixin:
             hashlib.sha256,
         ).hexdigest()
         return hmac.compare_digest(legacy, actual)
+
+    # ------------------------- 插图（v0.6，D1） -------------------------
+    # 设计第 6 节：图片是日记 zip 的一等公民。图片存 images/，签名存
+    # sigs/images_<文件名>.sig —— 签名域 = 用户 + 条目名 + 二进制，
+    # 补上"正文引用行有签名、图片二进制没签名"的真空地带：
+    #   · 验签不匹配 → tampered：按篡改处理，与正文篡改同级；
+    #   · 条目缺失   → missing：优雅降级，正文照常读，插图位显示 alt 占位；
+    #   · 正常       → ok。
+    # 命名规则（设计 6.2）：日期 + 当日序号 + AI 描述（sanitize 后 ≤20 字），
+    # 撞名时用内容哈希前 6 位兜底。
+
+    @staticmethod
+    def _image_basename(name: str) -> str:
+        """images/xxx.png 或 xxx.png -> xxx.png（只保留一级文件名）。"""
+        raw = str(name or "").strip()
+        if raw.startswith("images/"):
+            raw = raw[len("images/"):]
+        return raw
+
+    @classmethod
+    def _image_entry(cls, name: str) -> str:
+        return f"images/{cls._image_basename(name)}"
+
+    @classmethod
+    def _image_sig_entry(cls, name: str) -> str:
+        """images/20261031_1_窗边的黄昏.png
+        -> sigs/images_20261031_1_窗边的黄昏.png.sig"""
+        return f"sigs/images_{cls._image_basename(name)}.sig"
+
+    @classmethod
+    def _valid_image_name(cls, name: str) -> bool:
+        """图片条目名白名单校验（防路径穿越/奇怪的扩展名）。"""
+        entry = cls._image_entry(name)
+        if ".." in entry or "\\" in entry:
+            return False
+        if len(entry) > 160:
+            return False
+        return bool(cls.IMAGE_NAME_RE.match(entry))
+
+    @classmethod
+    def _sanitize_image_desc(cls, raw: str, limit: int = 20) -> str:
+        """把 LLM 给的画面描述消毒成安全文件名片段（设计 6.2/隐私红线 3）。
+
+        去路径分隔符、".."、控制/不可见字符、markdown 方括号，空白折成 "_"，
+        截断到 limit 字；空了回退"插图"。
+        """
+        text = strip_invisible(str(raw or ""))
+        text = re.sub(r"[\x00-\x1f\x7f]", "", text)
+        # 方括号/路径分隔符 + URL 保留字符（# % & +）：文件名要能原样放进
+        # Web 图片路由的路径段里，避免个别图名在 bridge 里被截断/解码失败。
+        for ch in (
+            "\\", "/", "|", "｜", "[", "]", "(", ")", "<", ">", ":",
+            "*", "?", '"', "#", "%", "&", "+",
+        ):
+            text = text.replace(ch, "")
+        text = text.replace("..", "")
+        text = re.sub(r"\s+", "_", text.strip())
+        text = text.strip("._-")
+        text = text[: max(1, int(limit))]
+        return text or "插图"
+
+    def _image_sig(self, sender_id: str, name: str, data: bytes) -> str:
+        """图片签名：HMAC-SHA256(用户派生钥匙, 用户 + 条目名 + 二进制)。"""
+        uk = self._user_sign_key(sender_id)
+        if uk is None:
+            raise DiaryKeyUnavailable("签名密钥不可用")
+        entry = self._image_entry(name)
+        return hmac.new(
+            uk,
+            sender_id.encode("utf-8")
+            + b"\n"
+            + entry.encode("utf-8")
+            + b"\n"
+            + bytes(data),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _image_sig_matches(self, sender_id: str, name: str, data: bytes,
+                           actual: str) -> bool:
+        """图片验签；actual 为空视为不匹配（签名缺失 = 篡改）。"""
+        if not actual:
+            return False
+        try:
+            expected = self._image_sig(sender_id, name, data)
+        except DiaryKeyUnavailable:
+            return False
+        return hmac.compare_digest(expected, str(actual).strip())
+
+    def list_images(self, sender_id: str) -> list:
+        """列出该用户 zip 内全部 images/ 条目（升序）。"""
+        path = self._diary_path(sender_id)
+        if not path.exists():
+            return []
+        try:
+            with zipfile.ZipFile(path) as z:
+                return sorted(n for n in z.namelist() if self.IMAGE_NAME_RE.match(n))
+        except zipfile.BadZipFile:
+            logger.error(
+                f"[memory_diary] 日记 zip 已损坏（{path}），无法列出插图"
+            )
+        except Exception as e:
+            logger.warning(f"[memory_diary] 列出插图失败: {e}")
+        return []
+
+    def save_image(self, sender_id: str, data: bytes, day: str, seq: int,
+                   desc: str, ext: str = "") -> str:
+        """把一张图写进日记 zip 的 images/ 并写入签名，返回 zip 内条目名。
+
+        append 模式落盘（设计 6.1：O(1)，不重写整包）。调用方负责保证
+        日记正文已经先落盘（正文引用行与图片条目同包）；这里只追加。
+        day/seq 由调用方给（日期 + 当日序号），desc 是 LLM 画面描述，
+        必须经过 _sanitize_image_desc；撞名用内容哈希前 6 位兜底。
+        """
+        data = bytes(data or b"")
+        if not data:
+            raise ValueError("图片内容为空")
+        if len(data) > IMAGE_MAX_BYTES:
+            raise ValueError(f"图片超过 {IMAGE_MAX_BYTES // (1024 * 1024)}MB 上限")
+        day = re.sub(r"\D", "", str(day or ""))[:8]
+        if len(day) != 8:
+            day = self._now().strftime("%Y%m%d")
+        try:
+            seq = max(1, int(seq))
+        except (TypeError, ValueError):
+            seq = 1
+        ext = str(ext or "").lower().lstrip(".")
+        if ext not in self.IMAGE_EXTS:
+            ext = sniff_image_ext(data)
+        desc = self._sanitize_image_desc(desc)
+        if self._secret_key() is None:
+            raise DiaryKeyUnavailable("签名密钥不可用，已拒绝写入插图")
+
+        path = self._diary_path(sender_id)
+        base = f"{day}_{seq}_{desc}"
+        name = f"images/{base}.{ext}"
+        existing = set(self.list_images(sender_id))
+        if name in existing:
+            digest = hashlib.sha256(data).hexdigest()[:6]
+            name = f"images/{base}_{digest}.{ext}"
+            n = 2
+            while name in existing:  # 极端防御：同一天同描述同内容的重复写入
+                name = f"images/{base}_{digest}_{n}.{ext}"
+                n += 1
+        if not path.exists():
+            # 正常流程不会走到（写日记时已建包）；防御性建一个带说明的空包
+            self._write_zip_atomic(
+                path,
+                {self.README_ZIP_ENTRY: self._readme_text(sender_id, "").encode("utf-8")},
+            )
+        with zipfile.ZipFile(path, "a", zipfile.ZIP_DEFLATED) as z:
+            z.writestr(self._image_entry(name), data)
+            z.writestr(
+                self._image_sig_entry(name),
+                self._image_sig(sender_id, name, data).encode("utf-8"),
+            )
+        logger.info(
+            f"[memory_diary] 用户 {sender_id} 的插图已写入 zip：{name}"
+            f"（{len(data)} 字节）"
+        )
+        return name
+
+    def load_image(self, sender_id: str, name: str):
+        """读取一张插图并验签。返回 (data 或 None, status)。
+
+        status:
+        - "ok"       正常；
+        - "missing"  条目不存在（优雅降级，正文照常读）；
+        - "tampered" 签名缺失/不匹配（按篡改处理）；
+        - "no_key"   主密钥不可用（验签做不了）。
+        读取时 CRC 损坏也按 missing 降级（图片是装饰，不能连累正文）。
+        """
+        name = self._image_entry(name)
+        if not self._valid_image_name(name):
+            return None, "missing"
+        path = self._diary_path(sender_id)
+        if not path.exists():
+            return None, "missing"
+        try:
+            with zipfile.ZipFile(path) as z:
+                names = set(z.namelist())
+                if name not in names:
+                    return None, "missing"
+                data = z.read(name)
+                sig_name = self._image_sig_entry(name)
+                actual = (
+                    z.read(sig_name).decode("utf-8", "ignore").strip()
+                    if sig_name in names
+                    else ""
+                )
+        except Exception as e:
+            logger.error(f"[memory_diary] 读取插图失败（{name}）: {e}")
+            return None, "missing"
+        if self._secret_key() is None:
+            logger.error(f"[memory_diary] 签名密钥不可用，无法验签插图 {name}")
+            return None, "no_key"
+        if not self._image_sig_matches(sender_id, name, data, actual):
+            logger.warning(
+                f"[memory_diary] 用户 {sender_id} 的插图 {name} 验签失败，已拒绝显示"
+            )
+            return None, "tampered"
+        return data, "ok"
+
+    # 兼容别名：调用方（main.py/服务层）用 _load_image 或 load_image 均可
+    _load_image = load_image
+
+    def _delete_images(self, sender_id: str, day: str) -> int:
+        """删除某天日记关联的插图（按文件名前缀 "<day>_" 识别），返回删除张数。"""
+        day = re.sub(r"\D", "", str(day or ""))[:8]
+        path = self._diary_path(sender_id)
+        if not path.exists() or len(day) != 8:
+            return 0
+        try:
+            with zipfile.ZipFile(path) as z:
+                data = {n: z.read(n) for n in z.namelist()}
+        except Exception as e:
+            logger.warning(f"[memory_diary] 读取日记 zip 失败，插图未清理: {e}")
+            return 0
+        remove = set()
+        for n in data:
+            if self.IMAGE_NAME_RE.match(n):
+                base = n.split("/")[-1]
+                if base.startswith(f"{day}_"):
+                    remove.add(n)
+                    remove.add(self._image_sig_entry(n))
+        if not remove:
+            return 0
+        try:
+            self._write_zip_atomic(
+                path, {n: b for n, b in data.items() if n not in remove}
+            )
+        except Exception as e:
+            logger.warning(f"[memory_diary] 清理 {day} 的插图失败: {e}")
+            return 0
+        return len([n for n in remove if n.startswith("images/")])
+
+    def replace_pending_images(self, sender_id: str, entry_name: str,
+                               replacements: dict, remove: list) -> bool:
+        """把某天日记里的 PENDING 占位引用替换成最终图片引用 / 删除失败占位。
+
+        异步生图的落点：日记先落盘（占位），图到了以后由这里改写同一篇。
+        改写前先按现有签名验该条目，验不过就不动（绝不替被改过的正文重签）。
+        返回是否写入成功。
+        """
+        path = self._diary_path(sender_id)
+        if not path.exists():
+            return False
+        try:
+            with zipfile.ZipFile(path) as z:
+                names = set(z.namelist())
+                if entry_name not in names:
+                    return False
+                raw = z.read(entry_name).decode("utf-8")
+                sig_name = self._sig_entry(entry_name)
+                actual = (
+                    z.read(sig_name).decode("utf-8", "ignore").strip()
+                    if sig_name in names
+                    else ""
+                )
+                data = {n: z.read(n) for n in names}
+        except Exception as e:
+            logger.warning(f"[memory_diary] 读取日记失败，占位未替换: {e}")
+            return False
+        if self._secret_key() is None:
+            logger.error("[memory_diary] 签名密钥不可用，占位未替换")
+            return False
+        if not self._entry_sig_matches(sender_id, entry_name, raw, actual):
+            logger.warning(
+                f"[memory_diary] {entry_name} 验签失败，拒绝替换插图占位（疑似被改过）"
+            )
+            return False
+        content = raw
+        for old, new in (replacements or {}).items():
+            if old:
+                content = content.replace(str(old), str(new))
+        # 失败清理：只删除占位标记本身——解析是"原位替换"，AI 可能把标记写在
+        # 句子中间，按整行删除会把整句正文吞掉（审查 P1-1）。删完只剩空白的行才整行去掉。
+        for marker in remove or []:
+            if not marker:
+                continue
+            marker = str(marker)
+            new_lines = []
+            for line in content.split("\n"):
+                if marker not in line:
+                    new_lines.append(line)
+                    continue
+                remainder = line.replace(marker, "")
+                if remainder.strip():
+                    new_lines.append(remainder)
+                # 否则该行只有占位符：整行删掉
+            content = "\n".join(new_lines)
+        # 删行后可能留下连续空行：折成最多两个（保持段落分隔）
+        content = re.sub(r"[ \t]+\n", "\n", content)
+        content = re.sub(r"\n{3,}", "\n\n", content).strip("\n")
+        if content == raw:
+            return True
+        data[entry_name] = content.encode("utf-8")
+        data[self._sig_entry(entry_name)] = self._entry_sig(
+            sender_id, entry_name, content
+        ).encode("utf-8")
+        try:
+            self._write_zip_atomic(path, data)
+        except Exception as e:
+            logger.warning(f"[memory_diary] 插图占位替换写盘失败: {e}")
+            return False
+        return True
+
+    @classmethod
+    def _image_macro_to_placeholder(cls, content: str) -> str:
+        """把日记正文里的图片语法换成注入占位符（设计 6.4）。
+
+        - 用户照片：![用户分享的照片：描述](images/...) → [用户分享的照片：描述]
+        - AI 插图：![描述](images/...)              → [插图：描述]
+        图片绝不以 base64 进上下文；PENDING 占位引用按同样规则替换。
+        """
+        if not content or "![" not in content:
+            return content
+
+        def _user_photo(m):
+            alt = m.group(1).strip()
+            prefix = cls.USER_PHOTO_ALT_PREFIX
+            desc = alt[len(prefix):].strip() if alt.startswith(prefix) else alt
+            return f"[{prefix}{desc or '内容未识别'}]"
+
+        content = re.sub(
+            r"!\[(用户分享的照片[:：][^\]]*)\]\(images/[^)\s]*\)",
+            _user_photo,
+            content,
+        )
+        return re.sub(
+            r"!\[([^\]]*)\]\(images/[^)\s]*\)",
+            lambda m: "[插图：" + (m.group(1).strip() or "一幅画") + "]",
+            content,
+        )
+
+    # ------------------------- 批注侧车（v0.6，D7） -------------------------
+    # 批注独立成文件、不污染日记 md；文件整体 HMAC 签名，读写前验签。
+    # 数据形状见《批注功能接口契约》第 3 节；这里只做存储，不做业务规则。
+
+    @classmethod
+    def _annotations_empty(cls) -> dict:
+        return {
+            "version": 1,
+            "last_round": "",
+            "last_title": "",
+            "updated_at": "",
+            "annotations": [],
+        }
+
+    @staticmethod
+    def _dump_annotations(data: dict) -> bytes:
+        """统一序列化（保存/安装/重签共用）：同一个 dict 得到逐字节一致的 JSON。"""
+        return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+
+    @classmethod
+    def _trim_annotations(cls, items: list) -> list:
+        """超出容量上限时先丢最旧的已解批注，再丢最旧的其余条目（保留最新）。"""
+        cap = cls.ANNOTATIONS_MAX_RECORDS
+        if len(items) <= cap:
+            return list(items)
+        excess = len(items) - cap
+        drop = set()
+        resolved = sorted(
+            (i for i, x in enumerate(items) if str(x.get("status") or "") == "resolved"),
+            key=lambda i: (str(items[i].get("created_at") or ""), i),
+        )
+        drop.update(resolved[:excess])
+        if len(drop) < excess:
+            rest = [i for i in range(len(items)) if i not in drop]
+            rest.sort(key=lambda i: (str(items[i].get("created_at") or ""), i))
+            drop.update(rest[: excess - len(drop)])
+        return [x for i, x in enumerate(items) if i not in drop]
+
+    @classmethod
+    def _normalize_annotations(cls, data) -> dict:
+        """把任意来源的数据清洗成规范 dict（不改入参），坏条目丢弃、状态非法回退 open。"""
+        out = cls._annotations_empty()
+        if not isinstance(data, dict):
+            return out
+        out["last_round"] = str(data.get("last_round") or "")
+        out["last_title"] = str(data.get("last_title") or "")[:50]
+        out["updated_at"] = str(data.get("updated_at") or "")
+        items = data.get("annotations")
+        if not isinstance(items, list):
+            items = []
+        normalized = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            anchor = str(item.get("anchor") or "").strip()
+            note = str(item.get("note") or "").strip()
+            if not anchor or not note:
+                continue
+            status = str(item.get("status") or "open")
+            if status not in cls.ANNOTATION_STATUSES:
+                status = "open"
+            reply = item.get("reply")
+            if not isinstance(reply, dict):
+                reply = None
+            raw_question = item.get("is_question")
+            if isinstance(raw_question, str):
+                is_question = raw_question.strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                )
+            else:
+                is_question = bool(raw_question)
+            normalized.append(
+                {
+                    "id": str(item.get("id") or ""),
+                    "round": str(item.get("round") or ""),
+                    "anchor": anchor,
+                    "entry": str(item.get("entry") or ""),
+                    "created_at": str(item.get("created_at") or ""),
+                    "note": note,
+                    "is_question": is_question,
+                    "status": status,
+                    "reply": reply,
+                }
+            )
+        out["annotations"] = cls._trim_annotations(normalized)
+        return out
+
+    def _annotations_sig(self, sender_id: str, raw: bytes) -> str:
+        """批注文件签名：HMAC-SHA256(用户派生钥匙, 用户 + 条目名 + 文件原始字节)。"""
+        uk = self._user_sign_key(sender_id)
+        if uk is None:
+            raise DiaryKeyUnavailable("签名密钥不可用")
+        return hmac.new(
+            uk,
+            sender_id.encode("utf-8")
+            + b"\n"
+            + self.ANNOTATIONS_ENTRY.encode("utf-8")
+            + b"\n"
+            + bytes(raw),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _annotations_sig_matches(self, sender_id: str, raw: bytes,
+                                 actual: str) -> bool:
+        """验签；actual 为空视为不匹配（签名缺失 = 篡改）。"""
+        if not actual:
+            return False
+        try:
+            expected = self._annotations_sig(sender_id, raw)
+        except DiaryKeyUnavailable:
+            return False
+        return hmac.compare_digest(expected, str(actual).strip())
+
+    def _read_annotations_entry(self, sender_id: str):
+        """从 zip 读出批注原始字节与签名。返回 (raw 或 None, actual, 错误标记)。
+
+        错误标记 "" 成功（raw 可能为 None 表示条目缺失）；"tampered" 读失败。
+        """
+        path = self._diary_path(sender_id)
+        if not path.exists():
+            return None, "", ""
+        try:
+            with zipfile.ZipFile(path) as z:
+                names = set(z.namelist())
+                if self.ANNOTATIONS_ENTRY not in names:
+                    return None, "", ""
+                raw = z.read(self.ANNOTATIONS_ENTRY)
+                actual = (
+                    z.read(self.ANNOTATIONS_SIG_ENTRY).decode("utf-8", "ignore").strip()
+                    if self.ANNOTATIONS_SIG_ENTRY in names
+                    else ""
+                )
+                return raw, actual, ""
+        except Exception as e:
+            logger.error(f"[memory_diary] 读取批注文件失败: {e}")
+            return None, "", "tampered"
+
+    def load_annotations(self, sender_id: str):
+        """读取批注侧车。返回 (规范 dict, status)，status ∈ ok/missing/tampered/no_key。"""
+        raw, actual, err = self._read_annotations_entry(sender_id)
+        if err:
+            return self._annotations_empty(), "tampered"
+        if raw is None:
+            return self._annotations_empty(), "missing"
+        if self._secret_key() is None:
+            logger.error("[memory_diary] 签名密钥不可用，无法验签批注")
+            return self._annotations_empty(), "no_key"
+        if not self._annotations_sig_matches(sender_id, raw, actual):
+            logger.warning(
+                f"[memory_diary] 用户 {sender_id} 的批注文件验签失败，已拒绝读取"
+            )
+            return self._annotations_empty(), "tampered"
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            logger.error(f"[memory_diary] 批注文件无法解析（已按篡改处理）: {e}")
+            return self._annotations_empty(), "tampered"
+        return self._normalize_annotations(data), "ok"
+
+    def annotations_status(self, sender_id: str) -> str:
+        """只验签不解析：返回 ok/missing/tampered/no_key（供指令层给提示）。"""
+        raw, actual, err = self._read_annotations_entry(sender_id)
+        if err:
+            return "tampered"
+        if raw is None:
+            return "missing"
+        if self._secret_key() is None:
+            return "no_key"
+        if not self._annotations_sig_matches(sender_id, raw, actual):
+            return "tampered"
+        try:
+            json.loads(raw.decode("utf-8"))
+        except Exception:
+            return "tampered"
+        return "ok"
+
+    def save_annotations(self, sender_id: str, data: dict) -> bool:
+        """写入批注侧车（原子重写 zip，保留其它全部条目）。
+
+        fail-closed：旧批注文件验签失败时**拒绝写入**，绝不替被改过的批注重签。
+        """
+        if self._secret_key() is None:
+            logger.error("[memory_diary] 签名密钥不可用，已拒绝写入批注")
+            return False
+        path = self._diary_path(sender_id)
+        if path.exists():
+            try:
+                with zipfile.ZipFile(path) as z:
+                    entries = {n: z.read(n) for n in z.namelist()}
+            except Exception as e:
+                logger.warning(f"[memory_diary] 读取日记 zip 失败，批注未写入: {e}")
+                return False
+            if self.ANNOTATIONS_ENTRY in entries:
+                old_raw = entries[self.ANNOTATIONS_ENTRY]
+                old_actual = (
+                    entries.get(self.ANNOTATIONS_SIG_ENTRY, b"")
+                    .decode("utf-8", "ignore")
+                    .strip()
+                )
+                if not self._annotations_sig_matches(
+                    sender_id, old_raw, old_actual
+                ):
+                    logger.warning(
+                        f"[memory_diary] 用户 {sender_id} 的批注文件验签失败，"
+                        "已拒绝覆盖写入"
+                    )
+                    return False
+                # P1-3：签名正确但 JSON 已损坏，同样按 tampered 处理、拒绝覆盖。
+                # 与读取路径 load_annotations 的三态口径保持一致（fail-closed），
+                # 绝不把损坏内容当作"可重签"的旧数据冲掉。
+                try:
+                    json.loads(old_raw.decode("utf-8"))
+                except Exception:
+                    logger.warning(
+                        f"[memory_diary] 用户 {sender_id} 的批注文件无法解析"
+                        "（疑似损坏），已拒绝覆盖写入"
+                    )
+                    return False
+        else:
+            # 正常流程不会走到（批注只写在已有日记之后）；防御性建空包
+            entries = {
+                self.README_ZIP_ENTRY: self._readme_text(sender_id, "").encode("utf-8")
+            }
+        normalized = self._normalize_annotations(data)
+        raw = self._dump_annotations(normalized)
+        entries[self.ANNOTATIONS_ENTRY] = raw
+        entries[self.ANNOTATIONS_SIG_ENTRY] = self._annotations_sig(
+            sender_id, raw
+        ).encode("utf-8")
+        try:
+            self._write_zip_atomic(path, entries)
+        except Exception as e:
+            logger.warning(f"[memory_diary] 批注写入失败: {e}")
+            return False
+        return True
+
+    def update_annotations(self, sender_id: str, mutator):
+        """读-验-改-写。mutator(data) 可就地修改（返回 dict 时替换）。返回 (成功, 规范数据)。"""
+        data, status = self.load_annotations(sender_id)
+        if status not in ("ok", "missing"):
+            return False, self._annotations_empty()
+        try:
+            result = mutator(data)
+        except Exception as e:
+            logger.warning(f"[memory_diary] 修改批注失败: {e}")
+            return False, self._annotations_empty()
+        if isinstance(result, dict):
+            data = result
+        if not self.save_annotations(sender_id, data):
+            return False, self._annotations_empty()
+        return True, self._normalize_annotations(data)
+
+    # ------------------------- 来源侧车（<self> 自发挥原文） -------------------------
+
+    @classmethod
+    def _provenance_empty(cls) -> dict:
+        return {"version": 1, "updated_at": "", "entries": {}}
+
+    @staticmethod
+    def _dump_provenance(data: dict) -> bytes:
+        """统一序列化（保存/重签共用）：同一个 dict 得到逐字节一致的 JSON。"""
+        return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+
+    @classmethod
+    def _normalize_provenance(cls, data) -> dict:
+        """清洗成规范 dict（不改入参）：键是 "YYYYMMDD.md"，值含 self 子串列表。
+
+        容量双保险：单篇条数与总字数超限都从最旧的开始丢（列表按写入先后追加）。
+        """
+        out = cls._provenance_empty()
+        if not isinstance(data, dict):
+            return out
+        out["updated_at"] = str(data.get("updated_at") or "")[:30]
+        entries = data.get("entries")
+        if not isinstance(entries, dict):
+            return out
+        for key, rec in entries.items():
+            name = str(key or "").strip()
+            if not re.fullmatch(r"\d{8}\.md", name):
+                continue
+            subs = rec.get("self") if isinstance(rec, dict) else None
+            if not isinstance(subs, list):
+                continue
+            cleaned, seen, total = [], set(), 0
+            for s in subs:
+                if not isinstance(s, str):
+                    continue
+                s = s.strip()
+                if not s or s in seen:
+                    continue
+                if len(cleaned) >= cls.PROVENANCE_MAX_SELF_PER_ENTRY:
+                    break
+                if total + len(s) > cls.PROVENANCE_MAX_SELF_CHARS:
+                    continue
+                cleaned.append(s)
+                seen.add(s)
+                total += len(s)
+            if cleaned:
+                out["entries"][name] = {"self": cleaned}
+        return out
+
+    def _provenance_sig(self, sender_id: str, raw: bytes) -> str:
+        """来源侧车签名：HMAC-SHA256(用户派生钥匙, 用户 + 条目名 + 文件原始字节)。"""
+        uk = self._user_sign_key(sender_id)
+        if uk is None:
+            raise DiaryKeyUnavailable("签名密钥不可用")
+        return hmac.new(
+            uk,
+            sender_id.encode("utf-8")
+            + b"\n"
+            + self.PROVENANCE_ENTRY.encode("utf-8")
+            + b"\n"
+            + bytes(raw),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _provenance_sig_matches(self, sender_id: str, raw: bytes,
+                                actual: str) -> bool:
+        """验签；actual 为空视为不匹配（签名缺失 = 篡改）。"""
+        if not actual:
+            return False
+        try:
+            expected = self._provenance_sig(sender_id, raw)
+        except DiaryKeyUnavailable:
+            return False
+        return hmac.compare_digest(expected, str(actual).strip())
+
+    def _read_provenance_entry(self, sender_id: str):
+        """从 zip 读出来源侧车原始字节与签名。返回 (raw 或 None, actual, 错误标记)。"""
+        path = self._diary_path(sender_id)
+        if not path.exists():
+            return None, "", ""
+        try:
+            with zipfile.ZipFile(path) as z:
+                names = set(z.namelist())
+                if self.PROVENANCE_ENTRY not in names:
+                    return None, "", ""
+                raw = z.read(self.PROVENANCE_ENTRY)
+                actual = (
+                    z.read(self.PROVENANCE_SIG_ENTRY).decode("utf-8", "ignore").strip()
+                    if self.PROVENANCE_SIG_ENTRY in names
+                    else ""
+                )
+                return raw, actual, ""
+        except Exception as e:
+            logger.error(f"[memory_diary] 读取来源侧车失败: {e}")
+            return None, "", "tampered"
+
+    def load_provenance(self, sender_id: str):
+        """读取来源侧车。返回 (规范 dict, status)，status ∈ ok/missing/tampered/no_key。"""
+        raw, actual, err = self._read_provenance_entry(sender_id)
+        if err:
+            return self._provenance_empty(), "tampered"
+        if raw is None:
+            return self._provenance_empty(), "missing"
+        if self._secret_key() is None:
+            logger.error("[memory_diary] 签名密钥不可用，无法验签来源侧车")
+            return self._provenance_empty(), "no_key"
+        if not self._provenance_sig_matches(sender_id, raw, actual):
+            logger.warning(
+                f"[memory_diary] 用户 {sender_id} 的来源侧车验签失败，已拒绝读取"
+            )
+            return self._provenance_empty(), "tampered"
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            logger.error(f"[memory_diary] 来源侧车无法解析（已按篡改处理）: {e}")
+            return self._provenance_empty(), "tampered"
+        return self._normalize_provenance(data), "ok"
+
+    def save_provenance(self, sender_id: str, data: dict) -> bool:
+        """写入来源侧车（原子重写 zip，保留其它全部条目）。
+
+        fail-closed：旧文件验签失败时**拒绝写入**，绝不替被改过的内容重签。
+        """
+        if self._secret_key() is None:
+            logger.error("[memory_diary] 签名密钥不可用，已拒绝写入来源侧车")
+            return False
+        path = self._diary_path(sender_id)
+        if path.exists():
+            try:
+                with zipfile.ZipFile(path) as z:
+                    entries = {n: z.read(n) for n in z.namelist()}
+            except Exception as e:
+                logger.warning(f"[memory_diary] 读取日记 zip 失败，来源侧车未写入: {e}")
+                return False
+            if self.PROVENANCE_ENTRY in entries:
+                old_raw = entries[self.PROVENANCE_ENTRY]
+                old_actual = (
+                    entries.get(self.PROVENANCE_SIG_ENTRY, b"")
+                    .decode("utf-8", "ignore")
+                    .strip()
+                )
+                if not self._provenance_sig_matches(sender_id, old_raw, old_actual):
+                    logger.warning(
+                        f"[memory_diary] 用户 {sender_id} 的来源侧车验签失败，"
+                        "已拒绝覆盖写入"
+                    )
+                    return False
+                # 与批注侧车同口径：签名正确但 JSON 已损坏，同样拒绝覆盖
+                try:
+                    json.loads(old_raw.decode("utf-8"))
+                except Exception:
+                    logger.warning(
+                        f"[memory_diary] 用户 {sender_id} 的来源侧车无法解析"
+                        "（疑似损坏），已拒绝覆盖写入"
+                    )
+                    return False
+        else:
+            entries = {
+                self.README_ZIP_ENTRY: self._readme_text(sender_id, "").encode("utf-8")
+            }
+        normalized = self._normalize_provenance(data)
+        raw = self._dump_provenance(normalized)
+        entries[self.PROVENANCE_ENTRY] = raw
+        entries[self.PROVENANCE_SIG_ENTRY] = self._provenance_sig(
+            sender_id, raw
+        ).encode("utf-8")
+        try:
+            self._write_zip_atomic(path, entries)
+        except Exception as e:
+            logger.warning(f"[memory_diary] 来源侧车写入失败: {e}")
+            return False
+        return True
+
+    def update_provenance(self, sender_id: str, mutator):
+        """读-验-改-写。mutator(data) 可就地修改（返回 dict 时替换）。返回 (成功, 规范数据)。"""
+        data, status = self.load_provenance(sender_id)
+        if status not in ("ok", "missing"):
+            return False, self._provenance_empty()
+        try:
+            result = mutator(data)
+        except Exception as e:
+            logger.warning(f"[memory_diary] 修改来源侧车失败: {e}")
+            return False, self._provenance_empty()
+        if isinstance(result, dict):
+            data = result
+        if not self.save_provenance(sender_id, data):
+            return False, self._provenance_empty()
+        return True, self._normalize_provenance(data)
+
+    def record_self_provenance(self, sender_id: str, day: str, spans: list) -> bool:
+        """把一篇日记的自发挥子串并入该日的来源记录（读-验-改-写）。
+
+        同一天多篇日记多次调用时增量追加、自动去重；任何失败都只返回 False，
+        由调用方记日志——绝不因为来源标记影响日记写入本身。
+        """
+        name = f"{str(day or '').strip()[:8]}.md"
+        spans = [str(s).strip() for s in (spans or []) if str(s or "").strip()]
+        if not re.fullmatch(r"\d{8}\.md", name) or not spans:
+            return False
+
+        def _mut(data: dict):
+            rec = data["entries"].setdefault(name, {"self": []})
+            have = set(rec.get("self") or [])
+            for s in spans:
+                if s not in have:
+                    rec["self"].append(s)
+                    have.add(s)
+            data["updated_at"] = self._now().strftime("%Y-%m-%dT%H:%M:%S")
+            return data
+
+        ok, _ = self.update_provenance(sender_id, _mut)
+        return ok
+
+    def _prune_provenance_entries(self, sender_id: str, entries: dict,
+                                  days: set) -> int:
+        """在 zip 条目 dict 里就地删除 entry[:8] ∈ days 的来源记录，返回删除条数。
+
+        验签失败/密钥不可用时不改（fail-closed，与批注清理同口径）。
+        """
+        days = {str(d).strip()[:8] for d in (days or set()) if str(d).strip()}
+        if not days or self.PROVENANCE_ENTRY not in entries:
+            return 0
+        raw = entries[self.PROVENANCE_ENTRY]
+        actual = (
+            entries.get(self.PROVENANCE_SIG_ENTRY, b"")
+            .decode("utf-8", "ignore")
+            .strip()
+        )
+        if self._secret_key() is None or not self._provenance_sig_matches(
+            sender_id, raw, actual
+        ):
+            logger.warning("[memory_diary] 来源侧车验签失败，删除日记时未清理")
+            return 0
+        try:
+            data = self._normalize_provenance(json.loads(raw.decode("utf-8")))
+        except Exception:
+            return 0
+        kept = {
+            k: v for k, v in data["entries"].items() if str(k)[:8] not in days
+        }
+        removed = len(data["entries"]) - len(kept)
+        if not removed:
+            return 0
+        data["entries"] = kept
+        data["updated_at"] = self._now().strftime("%Y-%m-%dT%H:%M:%S")
+        out_raw = self._dump_provenance(data)
+        entries[self.PROVENANCE_ENTRY] = out_raw
+        entries[self.PROVENANCE_SIG_ENTRY] = self._provenance_sig(
+            sender_id, out_raw
+        ).encode("utf-8")
+        return removed
+
+    def _prune_annotations_entries(self, sender_id: str, entries: dict,
+                                   days: set) -> int:
+        """在 zip 条目 dict 里就地删除 entry[:8] ∈ days 的批注，返回删除条数。
+
+        验签失败/密钥不可用时不改（fail-closed，交给读取层告警），避免替被改过的
+        批注重签。删空时连 annotations.json 与其签名一起移除。
+        """
+        days = {str(d).strip()[:8] for d in (days or set()) if str(d).strip()}
+        if not days or self.ANNOTATIONS_ENTRY not in entries:
+            return 0
+        raw = entries[self.ANNOTATIONS_ENTRY]
+        actual = (
+            entries.get(self.ANNOTATIONS_SIG_ENTRY, b"")
+            .decode("utf-8", "ignore")
+            .strip()
+        )
+        if self._secret_key() is None or not self._annotations_sig_matches(
+            sender_id, raw, actual
+        ):
+            logger.warning("[memory_diary] 批注验签失败，删除日记时未清理批注")
+            return 0
+        try:
+            data = self._normalize_annotations(json.loads(raw.decode("utf-8")))
+        except Exception:
+            return 0
+        kept = [
+            x
+            for x in data["annotations"]
+            if str(x.get("entry") or "")[:8] not in days
+        ]
+        removed = len(data["annotations"]) - len(kept)
+        if not removed:
+            return 0
+        if kept:
+            data["annotations"] = kept
+            data["updated_at"] = self._now().strftime("%Y-%m-%dT%H:%M:%S")
+            out_raw = self._dump_annotations(data)
+            entries[self.ANNOTATIONS_ENTRY] = out_raw
+            entries[self.ANNOTATIONS_SIG_ENTRY] = self._annotations_sig(
+                sender_id, out_raw
+            ).encode("utf-8")
+        else:
+            entries.pop(self.ANNOTATIONS_ENTRY, None)
+            entries.pop(self.ANNOTATIONS_SIG_ENTRY, None)
+        return removed
+
+    def _delete_annotations_for_days(self, sender_id: str, days: set) -> int:
+        """删除锚定在指定日期的批注，返回删除条数。"""
+        days = {str(d).strip()[:8] for d in (days or set()) if str(d).strip()}
+        path = self._diary_path(sender_id)
+        if not days or not path.exists():
+            return 0
+        try:
+            with zipfile.ZipFile(path) as z:
+                entries = {n: z.read(n) for n in z.namelist()}
+        except Exception as e:
+            logger.warning(f"[memory_diary] 读取日记 zip 失败，批注未清理: {e}")
+            return 0
+        removed = self._prune_annotations_entries(sender_id, entries, days)
+        removed += self._prune_provenance_entries(sender_id, entries, days)
+        if not removed:
+            return 0
+        try:
+            self._write_zip_atomic(path, entries)
+        except Exception as e:
+            logger.warning(f"[memory_diary] 清理批注失败: {e}")
+            return 0
+        return removed
+
+    def annotations_for_day(self, sender_id: str, day: str) -> tuple:
+        """返回 (某天批注列表[按 created_at 升序], status)。status 非 ok 时列表为空。"""
+        data, status = self.load_annotations(sender_id)
+        if status != "ok":
+            return [], status
+        day = str(day or "").strip()[:8]
+        items = [
+            dict(x)
+            for x in data["annotations"]
+            if str(x.get("entry") or "")[:8] == day
+        ]
+        items.sort(key=lambda x: (str(x.get("created_at") or ""), str(x.get("id") or "")))
+        return items, status
 
     def _readme_text(self, sender_id: str, sender_name: str) -> str:
         return (
@@ -755,6 +1715,9 @@ class StorageMixin:
                 if not content.strip():
                     filtered_any = True  # 这一天全是私聊片段，整天跳过
                     continue
+            # 插图占位符化（设计 6.4）：图片语法换成一行文本，绝不 base64 进上下文。
+            # 放在预算计算之前：占位符比 markdown 图片语法短，按占位后长度计预算。
+            content = self._image_macro_to_placeholder(content)
             block = f"【{self._entry_label(name)} 的日记】\n{content}"
             if used + len(block) > budget:
                 marker = "【……该日开头因长度限制被截断】\n"
@@ -857,12 +1820,32 @@ class StorageMixin:
 
         # zip 不支持原地修改，整体重写（日记体量小，开销可忽略）
         existing: dict = {}
+        # 插图与图片签名原样搬运：_save_diary 只重写日记条目，绝不能把插图冲掉
+        # （设计 6.1：图片是日记 zip 的一等公民；图片签名不重签，字节原样保留）
+        image_entries: dict = {}
+        # 批注/来源侧车同样原样搬运：写日记不能把已有的页边批注与来源记录冲掉。
+        # 也不在这里解析/重签——验签交给各自的读取路径。
+        sidecar_entries: dict = {}
         if path.exists():
             try:
                 with zipfile.ZipFile(path) as z:
                     names = set(z.namelist())
                     invalid = []
                     for n in sorted(names):
+                        if n in (
+                            self.ANNOTATIONS_ENTRY,
+                            self.ANNOTATIONS_SIG_ENTRY,
+                            self.PROVENANCE_ENTRY,
+                            self.PROVENANCE_SIG_ENTRY,
+                        ):
+                            sidecar_entries[n] = z.read(n)
+                            continue
+                        if self.IMAGE_NAME_RE.match(n):
+                            image_entries[n] = z.read(n)
+                            sig_name = self._image_sig_entry(n)
+                            if sig_name in names:
+                                image_entries[sig_name] = z.read(sig_name)
+                            continue
                         if not self.ENTRY_NAME_RE.match(n):
                             continue
                         text = z.read(n).decode("utf-8")
@@ -936,6 +1919,8 @@ class StorageMixin:
             out[self._sig_entry(n)] = self._entry_sig(sender_id, n, existing[n]).encode(
                 "utf-8"
             )
+        out.update(image_entries)
+        out.update(sidecar_entries)
         out[self.README_ZIP_ENTRY] = self._readme_text(sender_id, sender_name).encode(
             "utf-8"
         )
@@ -992,11 +1977,12 @@ class StorageMixin:
                     day_map.setdefault(n[:8], []).append(("", text))
                 if not day_map:
                     return "tampered"
-                # 已是新格式的内容（diaries/、sigs/）原样保留
+                # 已是新格式的内容（diaries/、images/、批注侧车、sigs/）原样保留
                 keep = {
                     n2: b
                     for n2, b in data.items()
-                    if n2.startswith(("diaries/", "sigs/"))
+                    if n2.startswith(("diaries/", "images/", "sigs/"))
+                    or n2 == self.ANNOTATIONS_ENTRY
                 }
                 try:
                     out = dict(keep)
@@ -1121,12 +2107,28 @@ class StorageMixin:
             return 0
 
         remove = set()
+        deleted_days = set()
         for n in names:
             if n in data:
                 remove.add(n)
                 remove.add(self._sig_entry(n))
+                deleted_days.add(self._entry_day(n))
         if not remove:
             return 0
+        # 插图和对应日期绑定（文件名词缀 "<日期>_"）：删某天的日记时一并清掉，
+        # 不留孤儿图片占空间；注意"全部删除"走 _delete_diary（整包删除）。
+        if deleted_days:
+            for n in data:
+                if self.IMAGE_NAME_RE.match(n) and n.split("/")[-1][:8] in deleted_days:
+                    remove.add(n)
+                    remove.add(self._image_sig_entry(n))
+
+        # 批注级联：删某天日记时一并清掉锚定该天的批注（与插图同理，不留孤儿批注）。
+        # 与日记删除在同一次原子写入里完成，避免"日记删了、批注没删"的两步状态。
+        if deleted_days:
+            self._prune_annotations_entries(sender_id, data, deleted_days)
+            # 来源级联：该天的 <self> 来源记录一并清理（与批注同纪律）
+            self._prune_provenance_entries(sender_id, data, deleted_days)
 
         remaining_days = [
             n for n in data if self.ENTRY_NAME_RE.match(n) and n not in remove
@@ -1227,14 +2229,20 @@ class StorageMixin:
             "· 必须在两台设备上使用同一个 QQ 号与 bot 对话——签名绑定了你的 QQ 号。\n"
         )
     def _verify_bundle(self, bundle_path: Path):
-        """解析并校验迁移包。返回 (主人QQ, 该用户的派生钥匙bytes, {条目名: 内容})；
-        不可信即抛 ValueError。
+        """解析并校验迁移包。返回
+        (主人QQ, 该用户的派生钥匙bytes, {日记条目名: 内容}, {图片条目名: bytes},
+         批注规范 dict 或 None)；
+        不可信即抛 ValueError。旧包没有 images/ 时第 4 项为 {}；
+        旧包没有 annotations.json 时第 5 项为 None（向后兼容）。
 
         两种格式：
         - memory-diary-export/2（现行）：user_key.txt 是主人这把派生钥匙（hex），
           日记签名直接用它验；
         - memory-diary-export/1（旧版）：diary_key.txt 是源设备的主密钥，
           日记签名用它直签验，导入时换算成主人的派生钥匙再继续。
+
+        v0.6 起图片也逐张验签（设计 6.1：图片跟随日记 zip 全程迁移，CRC 自动覆盖；
+        这里再加 HMAC 防"换图不换文"）；批注文件同样整体验签（设计第二部分第 4 节）。
         """
         with zipfile.ZipFile(bundle_path) as z:
             bad = z.testzip()
@@ -1278,12 +2286,66 @@ class StorageMixin:
             ).digest()
 
         entries = {}
+        images = {}
+        annotations = None
         with zipfile.ZipFile(io.BytesIO(diary_bytes)) as dz:
             bad = dz.testzip()
             if bad is not None:
                 raise ValueError(f"迁移包里的日记文件有损坏（条目 {bad} CRC 校验失败）")
             dnames = set(dz.namelist())
+            # 批注侧车：包内有就必须有签名且验签通过，否则按篡改拒绝整个迁移包
+            if self.ANNOTATIONS_ENTRY in dnames:
+                raw = dz.read(self.ANNOTATIONS_ENTRY)
+                if self.ANNOTATIONS_SIG_ENTRY not in dnames:
+                    raise ValueError("批注文件缺少签名，迁移包可能被改动过")
+                actual = (
+                    dz.read(self.ANNOTATIONS_SIG_ENTRY)
+                    .decode("utf-8", "ignore")
+                    .strip()
+                )
+                expected = hmac.new(
+                    sign_key,
+                    owner_id.encode("utf-8")
+                    + b"\n"
+                    + self.ANNOTATIONS_ENTRY.encode("utf-8")
+                    + b"\n"
+                    + raw,
+                    hashlib.sha256,
+                ).hexdigest()
+                if not hmac.compare_digest(expected, actual):
+                    raise ValueError("批注文件验签失败，迁移包可能被改动过")
+                try:
+                    annotations = self._normalize_annotations(
+                        json.loads(raw.decode("utf-8"))
+                    )
+                except Exception:
+                    raise ValueError("批注文件无法解析，迁移包可能被改动过")
             for n in sorted(dnames):
+                if n in (self.ANNOTATIONS_ENTRY, self.ANNOTATIONS_SIG_ENTRY):
+                    continue
+                if self.IMAGE_NAME_RE.match(n):
+                    sig_name = self._image_sig_entry(n)
+                    if sig_name not in dnames:
+                        raise ValueError(
+                            f"插图 {n.split('/')[-1]} 缺少签名，迁移包可能被改动过"
+                        )
+                    data = dz.read(n)
+                    actual = dz.read(sig_name).decode("utf-8").strip()
+                    expected = hmac.new(
+                        sign_key,
+                        owner_id.encode("utf-8")
+                        + b"\n"
+                        + n.encode("utf-8")
+                        + b"\n"
+                        + data,
+                        hashlib.sha256,
+                    ).hexdigest()
+                    if not hmac.compare_digest(expected, actual):
+                        raise ValueError(
+                            f"插图 {n.split('/')[-1]} 验签失败，迁移包可能被改动过"
+                        )
+                    images[n] = data
+                    continue
                 if not self.ENTRY_NAME_RE.match(n):
                     continue
                 sig_name = self._sig_entry(n)
@@ -1306,16 +2368,20 @@ class StorageMixin:
                 entries[n] = content
         if not entries:
             raise ValueError("迁移包里没有任何日记")
-        return owner_id, user_key, entries
+        return owner_id, user_key, entries, images, annotations
 
     def _install_bundle(self, sender_id: str, owner_id: str, user_key: bytes,
                         entries: dict, sender_name: str = "",
-                        check_owner: bool = True) -> str:
+                        check_owner: bool = True, images: dict = None,
+                        annotations: dict = None) -> str:
         """把验签通过的迁移包安放到位。返回模式：same_key / resign（仅作提示用）。
 
         现行机制不再收养主密钥：日记一律用本机派生的主人钥匙重新签名。
         包内钥匙与本机派生一致（same_key）时重签结果与原签名逐字节相同；
         不一致（resign）时换成本机钥匙的签名，本机其他用户的日记不受影响。
+        images：v0.6 起迁移包里的插图 {条目名: bytes}，安装时同样用本机钥匙重签。
+        annotations：v0.6 起迁移包里的批注侧车（规范 dict，可为 None），
+        安装时用本机钥匙重新签名。
 
         check_owner：QQ 指令侧必须为 True（装进别人账号的日记永远验不过签）；
         Web 日记本页面是管理员操作，安装后仍绑定原主人 QQ，传 False。
@@ -1346,6 +2412,20 @@ class StorageMixin:
             out[n] = content
             # 一律用本机派生钥匙签名：same_key 时与原签名相同，resign 时换签
             out[self._sig_entry(n)] = self._entry_sig(sender_id, n, content)
+        for n, data in (images or {}).items():
+            if not self._valid_image_name(n):
+                continue
+            name = self._image_entry(n)
+            out[name] = data
+            out[self._image_sig_entry(name)] = self._image_sig(sender_id, name, data)
+        if annotations:
+            ann_raw = self._dump_annotations(
+                self._normalize_annotations(annotations)
+            )
+            out[self.ANNOTATIONS_ENTRY] = ann_raw
+            out[self.ANNOTATIONS_SIG_ENTRY] = self._annotations_sig(
+                sender_id, ann_raw
+            ).encode("utf-8")
         self._write_zip_atomic(target, out)
         return mode
 

@@ -304,9 +304,15 @@ async def test_export_import_roundtrip_with_trailing_whitespace_entry():
         )
         try:
             # 修前：_verify_bundle 先 strip 再验签 -> 这里抛“迁移包可能被改动过”
-            owner, key, entries = plugin._verify_bundle(bundle)
+            # v0.6：返回 5 元组 (owner, key, entries, images, annotations)，
+            # 这篇日记没有插图、也没有批注侧车 → images={} / annotations=None
+            owner, key, entries, images, annotations = plugin._verify_bundle(bundle)
             assert owner == SENDER
             assert entries[entry] == raw
+            assert images == {}, f"没有插图的迁移包 images 应为空，实际 {images!r}"
+            assert annotations is None, (
+                f"没有批注侧车的迁移包 annotations 应为 None，实际 {annotations!r}"
+            )
             path.unlink()  # 导入要求本机还没有该用户的日记
             plugin._install_bundle(SENDER, owner, key, entries)
         finally:
