@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "**.py"
+      - "_conf_schema.json"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "**.py"
+      - "_conf_schema.json"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  syntax-check:
+    name: Python 语法检查 (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 语法编译检查 (compileall)
+        run: |
+          python -m compileall -q main.py memory_diary views tests
+          echo "语法检查通过"
+
+      - name: JSON 配置校验
+        run: |
+          python -m json.tool _conf_schema.json > /dev/null
+          echo "JSON 校验通过"
+
+  regression-tests:
+    name: 回归测试 (AstrBot v4.29.3 core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      ASTRBOT_VERSION: v4.29.3
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 准备环境变量
+        run: echo "ASTRBOT_CORE=$RUNNER_TEMP/astrbot-core" >> "$GITHUB_ENV"
+
+      - name: 安装 uv
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install uv
+
+      - name: 拉取 AstrBot core（提供插件 API）
+        run: |
+          git clone --depth 1 --branch "$ASTRBOT_VERSION" \
+            https://github.com/AstrBotDevs/AstrBot.git "$ASTRBOT_CORE"
+
+      - name: 缓存 uv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ env.ASTRBOT_VERSION }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: 安装 AstrBot 依赖
+        run: uv pip install --system -r "$ASTRBOT_CORE/requirements.txt"
+        timeout-minutes: 15
+
+      - name: 运行回归测试
+        run: python tests/run.py -v
