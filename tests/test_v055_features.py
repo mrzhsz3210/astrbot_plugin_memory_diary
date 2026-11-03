@@ -1181,7 +1181,10 @@ def test_conf_schema_order_matches_readme_sections():
         schema = json.load(f)
     assert list(schema.keys()) == _CONF_README_ORDER
 
-    readme_path = os.path.join(root, "README.md")
+    # 完整版 README 是唯一改动源；根目录 README.md 是展示短版。
+    # 文档一致性检查一律针对完整版，优先取 docs/README.md，缺失时回退根目录。
+    full = os.path.join(root, "docs", "README.md")
+    readme_path = full if os.path.exists(full) else os.path.join(root, "README.md")
     with open(readme_path, encoding="utf-8") as f:
         readme = f.read()
     start = readme.index("## 10 配置项与多用户隐私")

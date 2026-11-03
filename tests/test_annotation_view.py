@@ -44,7 +44,10 @@ def _load_schema() -> dict:
 
 
 def _readme() -> str:
-    path = os.path.join(PACKAGE_ROOT, "README.md")
+    # 完整版 README 是唯一改动源（见文件顶部维护者说明）；根目录 README.md 是展示短版。
+    # 文档一致性检查一律针对完整版，优先取 docs/README.md，缺失时回退根目录。
+    full = os.path.join(PACKAGE_ROOT, "docs", "README.md")
+    path = full if os.path.exists(full) else os.path.join(PACKAGE_ROOT, "README.md")
     with open(path, encoding="utf-8") as f:
         return f.read()
 
