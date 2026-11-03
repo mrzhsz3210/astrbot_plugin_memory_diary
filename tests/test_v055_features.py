@@ -1076,7 +1076,8 @@ _CONF_README_ORDER = [
     "enable_auto_inject", "inject_default_days", "inject_max_chars",
     "group_inject_filter", "persist_inject",
     # 10.6 写作
-    "enable_auto_diary", "auto_diary_time", "empty_diary_as_life",
+    "enable_auto_diary", "auto_diary_time", "auto_write_notify",
+    "empty_diary_as_life",
     "max_full_diaries_per_day", "max_history_messages",
     "group_history_multiplier", "write_min_ratio", "extra_instruction",
     # 10.7 隐私与安全
@@ -1118,6 +1119,7 @@ _CONF_LABEL_PREFIXES = [
     ("注入持久化", "persist_inject"),
     ("每天定时自动写完整日记", "enable_auto_diary"),
     ("自动写日记时间", "auto_diary_time"),
+    ("自动写日记完成后告知用户", "auto_write_notify"),
     ("无新素材时写拟人日常", "empty_diary_as_life"),
     ("每个场景每天最多几篇完整日记", "max_full_diaries_per_day"),
     ("写日记时读取的最大消息条数", "max_history_messages"),

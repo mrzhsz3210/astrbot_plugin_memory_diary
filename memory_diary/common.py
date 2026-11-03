@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""共享小工具：文件名 key、不可见字符剥离。"""
+"""共享小工具：文件名 key、不可见字符 / 尾部机器标记剥离。"""
 
 import hashlib
 import re
@@ -13,6 +13,27 @@ INVISIBLE_CHARS_RE = re.compile("[\u200b-\u200f\u202a-\u202e\u2060\ufeff]")
 def strip_invisible(text: str) -> str:
     """剥离零宽与方向控制字符。"""
     return INVISIBLE_CHARS_RE.sub("", text or "")
+
+
+# 尾部装饰剥离：其他插件（如 astrbot_plugin_qq_tools）会往消息文本尾部追加
+# "[MSG_ID:123]" 之类机器标记；/reset 是精确匹配，带上这类后缀就认不出来
+# （issue #2：reset 标记没置位 → 新一轮跳过自动注入）。
+# 只用于判断，绝不回写消息原文（与 strip_invisible 同一条纪律）。
+_TRAILING_DECOR_RE = re.compile(r"\s*\[[A-Za-z_][A-Za-z0-9_]*:[^\[\]]*\]\s*$")
+
+
+def strip_trailing_decorations(text: str) -> str:
+    """反复剥掉尾部 [XXX:...] 机器标记（如 [MSG_ID:-2037476869]）。
+
+    可能连着追加多个标记，所以循环剥到不再变化为止；中间的标记不动
+    （只处理"尾部"，避免误伤正文里合法出现的方括号内容）。
+    """
+    prev = None
+    cur = text or ""
+    while cur != prev:
+        prev = cur
+        cur = _TRAILING_DECOR_RE.sub("", cur)
+    return cur
 
 
 def safe_key(raw: str) -> str:

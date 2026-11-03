@@ -19,6 +19,12 @@ let loading = false;
  * 返回时 token 或当前页不匹配说明用户已经翻页/换人，这张图必须丢弃。 */
 let viewToken = 0;
 
+/* 批量删除（v0.6.1）：目录里勾选的日期，用 d.day（YYYYMMDD）作键。
+ * 勾选只对当前用户/当前目录有意义，切换用户或刷新目录时必须清空。 */
+const selectedDays = new Set();
+/* 批量删除提交中：防重复点击，同时锁住顶栏按钮与目录复选框 */
+let deleting = false;
+
 /* ---------- 界面偏好：字号 / 字体（存后端，按面板账号分开） ---------- */
 const FONT_FAMILIES = [
   { key: "kai", label: "楷体", css: '"STKaiti","KaiTi","楷体","Noto Serif SC",serif' },
@@ -248,13 +254,16 @@ function toast(msg, ms = 3000) {
   toast._timer = setTimeout(() => (t.hidden = true), ms);
 }
 
-/* ---------- 页面内输入对话框 ----------
+/* ---------- 页面内对话框（输入 / 确认） ----------
  * 插件视图 iframe 的 sandbox 是 "allow-scripts allow-forms allow-downloads"，
  * 没有 allow-modals：原生 window.prompt / confirm / alert 会被浏览器直接忽略
- * （返回 null，控制台报 Ignored call to prompt），所以查看密码和
- * 主人 QQ 都必须用页面里的输入框，不能依赖原生弹窗。
+ * （返回 null，控制台报 Ignored call to prompt），所以查看密码、主人 QQ 和
+ * 批量删除确认都必须用页面里的对话框，不能依赖原生弹窗。
  */
 let dialogResolve = null;
+/* 确认型对话框（askConfirm）没有输入框，点「确定」不校验内容；
+ * 每次 askDialog 打开都显式重设，密码 / QQ 输入框不会被上一次确认框影响。 */
+let dialogNeedsInput = true;
 
 function setDialogError(msg) {
   const el = $("dialogError");
@@ -270,6 +279,11 @@ function closeDialog(value) {
 }
 
 function confirmDialog() {
+  // 确认型：没有输入框可校验，点「确定」直接算确认
+  if (!dialogNeedsInput) {
+    closeDialog(true);
+    return;
+  }
   const input = $("dialogInput");
   const value = input.value.trim();
   if (!value) {
@@ -288,26 +302,47 @@ function askDialog({
   okText = "确定",
   error = "",
   inputMode = "",
+  warning = "",
+  confirm = false,
+  danger = false,
 }) {
   // 同时只允许一个对话框；新请求先把旧的按“取消”结束
   if (dialogResolve) closeDialog(null);
   return new Promise((resolve) => {
     dialogResolve = resolve;
+    dialogNeedsInput = !confirm;
     $("dialogTitle").textContent = title;
     $("dialogMsg").textContent = message;
     $("dialogMsg").hidden = !message;
+    $("dialogWarning").textContent = warning;
+    $("dialogWarning").hidden = !warning;
     const input = $("dialogInput");
+    // 确认型对话框必须隐藏输入框（否则用户以为要填内容）；恢复时同样显式
+    // 显示回来，否则随后打开的密码 / QQ 对话框会缺输入框。
+    input.hidden = confirm;
     input.type = password ? "password" : "text";
     input.inputMode = inputMode;
     input.autocomplete = password ? "current-password" : "off";
     input.maxLength = password ? 32 : 20;
     input.placeholder = placeholder;
     input.value = "";
-    $("dialogOk").textContent = okText;
+    const okBtn = $("dialogOk");
+    okBtn.textContent = okText;
+    okBtn.classList.toggle("danger", danger);
     setDialogError(error);
     $("dialogMask").hidden = false;
-    setTimeout(() => input.focus(), 30);
+    // 确认型没有输入框可聚焦：把焦点交给「确定」，回车 / 空格即可确认
+    setTimeout(() => (confirm ? okBtn.focus() : input.focus()), 30);
   });
+}
+
+/* 确认型对话框：true = 用户确认，false = 取消（取消按钮 / Esc / 点遮罩）。
+ * 必须走页面内对话框：插件视图 iframe 的 sandbox 没有 allow-modals，
+ * 原生 confirm() 会被浏览器忽略并直接返回 false。 */
+function askConfirm({ title, message = "", warning = "", okText = "确定", danger = false }) {
+  return askDialog({ title, message, warning, okText, danger, confirm: true }).then(
+    (value) => value === true
+  );
 }
 
 $("dialogOk").addEventListener("click", confirmDialog);
@@ -817,7 +852,31 @@ async function loadDiaryImages(day, token) {
   }
 }
 
+/* 昵称里的不可见字符（零宽 / 方向控制 / 软连字符 / 谚文与盲文填充）：
+ * 有人用纯隐形字符当 QQ 昵称，只显示昵称时下拉框就是一片空白、分不清是谁。
+ * 字符集与插件侧 common.py 的 INVISIBLE_CHARS_RE 对齐，另补几个常见隐形填充。 */
+const INVISIBLE_DISPLAY_RE =
+  /[\u00AD\u115F\u1160\u17B4\u17B5\u200B-\u200F\u202A-\u202E\u2060\u2800\u3164\uFEFF\uFFA0]/g;
+
+function visibleText(s) {
+  return String(s || "").replace(INVISIBLE_DISPLAY_RE, "").trim();
+}
+
+/* 用户下拉框的一行标签：昵称可见时「🔒 昵称（QQ xxx · N 天）」；
+ * 昵称不可见时降级「🔒 QQ xxx（N 天）」；连主人 QQ 都未知时保持旧文案。 */
+function userLabel(u) {
+  const lock = u.protected ? "🔒 " : "";
+  const nick = visibleText(u.nickname);
+  const qq = String(u.owner || "").trim();
+  const days = `${u.day_count} 天`;
+  if (nick && qq) return `${lock}${nick}（QQ ${qq} · ${days}）`;
+  if (qq) return `${lock}QQ ${qq}（${days}）`;
+  return `${lock}${u.nickname}（${days}）`;
+}
+
 async function loadUsers() {
+  // 用户列表刷新可能换人 / 清空：旧勾选不能留到新用户的目录上
+  clearSelectedDays();
   const r = await bridge.apiGet("users");
   users = r.users || [];
   const sel = $("userSelect");
@@ -825,8 +884,7 @@ async function loadUsers() {
   for (const u of users) {
     const opt = document.createElement("option");
     opt.value = u.file_key;
-    opt.textContent =
-      `${u.protected ? "🔒 " : ""}${u.nickname}（${u.day_count} 天）`;
+    opt.textContent = userLabel(u);
     sel.appendChild(opt);
   }
   const has = users.length > 0;
@@ -850,6 +908,8 @@ async function loadUsers() {
 }
 
 async function loadDays() {
+  // 目录整体刷新（切用户 / 刷新 / 删除成功）：勾选只对旧目录有意义，先清空
+  clearSelectedDays();
   updateLockUI();
   const u = users.find((x) => x.file_key === currentKey);
   $("ownerHint").hidden = !u || u.owner_known;
@@ -877,12 +937,25 @@ function renderDayList() {
   days.forEach((d, i) => {
     const li = document.createElement("li");
     li.dataset.i = i;
-    li.innerHTML = `<span>${escapeHtml(d.label)}</span><span class="idx">第 ${i + 1} 页</span>`;
+    const checked = selectedDays.has(d.day);
+    // 复选框用 title/aria-label 带上日期：图标本身没有文字，读屏只能靠它
+    li.innerHTML =
+      `<input type="checkbox" class="day-check"` +
+      ` title="选择 ${escapeAttr(d.label)}" aria-label="选择 ${escapeAttr(d.label)}"` +
+      `${checked ? " checked" : ""}>` +
+      `<span>${escapeHtml(d.label)}</span><span class="idx">第 ${i + 1} 页</span>`;
     if (i === dayIdx) li.classList.add("active");
+    if (checked) li.classList.add("selected");
     li.addEventListener("click", () => showDay(i, true));
     ul.appendChild(li);
   });
+  // 复选框只负责勾选，不能顺带翻页：click 事件拦住冒泡，点 li 其它区域照旧翻页
+  for (const cb of ul.querySelectorAll(".day-check")) {
+    cb.addEventListener("click", (e) => e.stopPropagation());
+    cb.addEventListener("change", onDayCheckChange);
+  }
   ul.scrollTop = ul.scrollHeight;
+  updateBatchDeleteUI();
 }
 
 /* 依次处理两道闸门：先绑定主人 QQ（旧 zip），再过查看密码。返回响应或 null。 */
@@ -1027,6 +1100,202 @@ async function showDay(i, animate = true) {
 function renderDayListActive() {
   for (const li of $("dayList").children) {
     li.classList.toggle("active", Number(li.dataset.i) === dayIdx);
+  }
+}
+
+/* ---------- 批量删除（v0.6.1） ----------
+ * 目录左页勾选多个日期，顶栏一次删掉（不可恢复）。原生 confirm 在插件视图
+ * iframe 里会被忽略（sandbox 没有 allow-modals），确认框必须走页面内的
+ * askConfirm；删除接口的两道闸门（主人 QQ / 查看密码）与翻阅、导出同一口径。
+ */
+function updateBatchDeleteUI() {
+  const btn = $("btnBatchDelete");
+  const n = selectedDays.size;
+  btn.disabled = deleting || n === 0;
+  btn.textContent = deleting
+    ? "🗑 正在删除…"
+    : n > 0
+      ? `🗑 批量删除（${n}）`
+      : "🗑 批量删除";
+  // 提交期间锁住复选框：否则用户会以为还能改所选日期
+  for (const cb of $("dayList").querySelectorAll(".day-check")) {
+    cb.disabled = deleting;
+  }
+}
+
+function clearSelectedDays() {
+  selectedDays.clear();
+  for (const cb of $("dayList").querySelectorAll(".day-check")) {
+    cb.checked = false;
+    const li = cb.closest("li");
+    if (li) li.classList.remove("selected");
+  }
+  updateBatchDeleteUI();
+}
+
+/* 复选框 change：只改选中集合与视觉，不翻页（click 冒泡已在 renderDayList 拦住） */
+function onDayCheckChange(e) {
+  const cb = e.target;
+  const li = cb.closest("li");
+  const i = li ? Number(li.dataset.i) : -1;
+  const d = Number.isInteger(i) ? days[i] : null;
+  if (!d) return;
+  if (cb.checked) selectedDays.add(d.day);
+  else selectedDays.delete(d.day);
+  li.classList.toggle("selected", cb.checked);
+  updateBatchDeleteUI();
+}
+
+/* 发删除请求并处理两道闸门：need_owner（旧 zip 无主人信息）先要主人 QQ，
+ * need_password / PASSWORD_WRONG 再要查看密码。成功返回响应；用户取消或失败
+ * 返回 null（提示已在本函数内给出，页面数据保持不变）。 */
+async function deleteDaysRequest(daysToDelete) {
+  const body = { file_key: currentKey, days: daysToDelete };
+  if (sessionPw[currentKey]) body.pw = sessionPw[currentKey];
+
+  async function askOwner(error) {
+    return askDialog({
+      title: "确认日记主人",
+      message:
+        "这份旧日记的说明里没有主人 QQ（文件名是加密的、反推不出）。\n" +
+        "请输入日记主人的 QQ 号：会用它全量验签，通过才会删除。",
+      error,
+      inputMode: "numeric",
+      placeholder: "日记主人的 QQ 号",
+      okText: "验证并删除",
+    });
+  }
+
+  async function askPassword(message, error = "") {
+    return askDialog({
+      title: "这份日记已上锁",
+      message,
+      error,
+      password: true,
+      placeholder: "4~32 位、不含空格",
+      okText: "解锁并删除",
+    });
+  }
+
+  for (;;) {
+    let r;
+    try {
+      r = await bridge.apiPost("delete_days", body);
+    } catch (e) {
+      const msg = e.message || "";
+      if (msg.includes("PASSWORD_WRONG") || msg.includes("PASSWORD_REQUIRED")) {
+        // 主人改过密码：缓存作废，重新询问（与 doExport 同一口径）
+        delete sessionPw[currentKey];
+        delete body.pw;
+        updateLockUI();
+        const pw = await askPassword(
+          "删除日记需要查看密码，请输入。",
+          msg.includes("PASSWORD_WRONG") ? "密码不对，请重新输入。" : ""
+        );
+        if (pw === null) {
+          toast("已取消删除");
+          return null;
+        }
+        body.pw = pw;
+        continue;
+      }
+      if (
+        msg.includes("OWNER_UNKNOWN") ||
+        msg.includes("无法确认日记主人") ||
+        msg.includes("QQ 号与日记签名")
+      ) {
+        const qq = await askOwner(
+          msg.includes("OWNER_UNKNOWN")
+            ? ""
+            : "QQ 号与日记签名对不上，请重新输入。"
+        );
+        if (qq === null) {
+          toast("已取消删除");
+          return null;
+        }
+        body.qq = qq;
+        continue;
+      }
+      toast(msg || "删除失败", 4500);
+      return null;
+    }
+    // 闸门响应是 HTTP 200（need_owner / need_password），不是错误：问完再重试
+    if (r.need_owner) {
+      const qq = await askOwner("");
+      if (qq === null) {
+        toast("已取消删除");
+        return null;
+      }
+      body.qq = qq;
+      continue;
+    }
+    if (r.need_password) {
+      const pw = await askPassword("删除日记需要查看密码，请输入。");
+      if (pw === null) {
+        toast("已取消删除");
+        return null;
+      }
+      body.pw = pw;
+      continue;
+    }
+    // 成功：记住密码 / 主人信息，后续翻阅、导出不再重复输入
+    if (body.pw) sessionPw[currentKey] = body.pw;
+    if (body.qq) {
+      const u = users.find((x) => x.file_key === currentKey);
+      if (u) u.owner_known = true;
+      $("ownerHint").hidden = true;
+    }
+    updateLockUI();
+    return r;
+  }
+}
+
+async function onBatchDelete() {
+  if (deleting || !currentKey) return;
+  // 只取当前目录里仍勾选的日期；顺序沿用 days（升序）
+  const picked = days.filter((d) => selectedDays.has(d.day));
+  if (picked.length === 0) return;
+  const latest = picked[picked.length - 1]; // days 升序，最后一项即最大日期
+  const ok = await askConfirm({
+    title: "确认批量删除",
+    message:
+      `将删除 ${picked.length} 天日记（最新一天：${latest.label}）。\n` +
+      "删除后这些日期会从这本日记里彻底消失。",
+    warning: "⚠ 删除不可恢复，建议先「⬇ 导出日记」备份。",
+    okText: "确认删除",
+    danger: true,
+  });
+  if (!ok) {
+    toast("已取消删除");
+    return;
+  }
+  const daysToDelete = picked.map((d) => d.day);
+  deleting = true;
+  updateBatchDeleteUI();
+  try {
+    toast(`正在删除 ${daysToDelete.length} 天日记…`);
+    const r = await deleteDaysRequest(daysToDelete);
+    if (!r) return; // 取消或失败：提示已给出，页面数据不动
+    // 先清空选中再刷新：loadUsers / loadDays 会按 Set 回填勾选，避免删完又勾上
+    clearSelectedDays();
+    const deleted = Number(r.deleted) || 0;
+    const remaining = Number(r.remaining) || 0;
+    if (deleted === 0) {
+      toast("所选日期没有日记，未做任何改动");
+    } else {
+      toast(`已删除 ${deleted} 天日记（剩余 ${remaining} 天）`, 4500);
+    }
+    // 与「⟳ 刷新」同一顺序：先刷新用户列表（可能换人 / 用户整体消失），
+    // 再按刷新后的 currentKey 拉目录；全部删光时 loadUsers 已切到空状态。
+    try {
+      await loadUsers();
+      if (currentKey) await loadDays();
+    } catch (e) {
+      toast(e.message || "删除成功，但刷新列表失败，请点「⟳ 刷新」重试", 5000);
+    }
+  } finally {
+    deleting = false;
+    updateBatchDeleteUI();
   }
 }
 
@@ -1244,6 +1513,7 @@ $("btnRefresh").addEventListener("click", async () => {
   if (currentKey) await loadDays();
   toast("已刷新");
 });
+$("btnBatchDelete").addEventListener("click", onBatchDelete);
 $("btnExport").addEventListener("click", (e) => {
   e.stopPropagation();
   if ($("btnExport").disabled) return;
@@ -1270,6 +1540,14 @@ document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       e.preventDefault();
       closeDialog(null);
+    } else if (
+      e.key === "Enter" &&
+      !dialogNeedsInput &&
+      document.activeElement !== $("dialogCancel")
+    ) {
+      // 确认型没有输入框：焦点不在「取消」上时，回车等价于点「确定」
+      e.preventDefault();
+      confirmDialog();
     }
     return; // 对话框打开时不响应翻页快捷键
   }

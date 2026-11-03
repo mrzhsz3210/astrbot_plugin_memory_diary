@@ -23,7 +23,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Star, register
 
-from .memory_diary.common import sniff_image_mime
+from .memory_diary.common import sniff_image_mime, strip_trailing_decorations
 from .memory_diary.constants import INJECT_TEMPLATE, PLUGIN_NAME
 from .memory_diary.core import MemoryDiaryCore
 from .memory_diary.errors import DiaryKeyUnavailable
@@ -98,7 +98,7 @@ def resolve_data_dir() -> Path:
     "astrbot_plugin_memory_diary",
     "mrzhsz3210",
     "指令/定时自动触发写日记（用户画像 / 对用户的评价 / 给未来自己的叮嘱），新上下文自动读取日记，上下文将满时自动提醒，支持每天定时自动写完整日记。",
-    "v0.6.0",
+    "v0.6.1",
 )
 
 class MemoryDiaryPlugin(MemoryDiaryCore, Star):
@@ -1937,6 +1937,8 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             "日记本：导出迁移包到本机下载文件夹并打开位置")
         reg(f"/{PLUGIN_NAME}/import", self.web_import, ["POST"],
             "日记本：导入迁移包")
+        reg(f"/{PLUGIN_NAME}/delete_days", self.web_delete_days, ["POST"],
+            "日记本：批量删除某用户若干天的日记（不可恢复）")
         reg(f"/{PLUGIN_NAME}/prefs", self.web_get_prefs, ["GET"],
             "日记本：读取界面偏好")
         reg(f"/{PLUGIN_NAME}/prefs/save", self.web_save_prefs, ["POST"],
@@ -1955,13 +1957,20 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
     @staticmethod
     def _valid_file_key(file_key: str) -> bool:
         return bool(re.fullmatch(r"[0-9a-f]{16}", file_key or ""))
-    def _check_web_password(self, owner_id: str, for_download: bool = False):
-        """Web 翻阅/导出的密码闸。返回 None 放行；否则返回给前端的响应。
-        for_download=True 时（bridge.download 期望文件响应）用错误而非 JSON 表达。"""
+    def _check_web_password(self, owner_id: str, for_download: bool = False,
+                            pw: str = None):
+        """Web 翻阅 / 导出 / 删除的密码闸。返回 None 放行；否则返回给前端的响应。
+
+        for_download=True 时（bridge.download 期望文件响应）用错误而非 JSON 表达。
+        GET 接口从 query 取 pw；POST 接口（批量删除）把密码放在请求体里，由调用方
+        通过 pw 参数传入（pw=None 时沿用 query，保证原有 GET 行为逐字节不变）。
+        """
         rec = self._view_password_rec(owner_id)
         if rec is None:
             return None
-        pw = (_web_request.query.get("pw", "") or "").strip()
+        if pw is None:
+            pw = _web_request.query.get("pw", "") or ""
+        pw = str(pw).strip()
         if not pw:
             if for_download:
                 return _web_error("PASSWORD_REQUIRED", status_code=403)
@@ -2001,6 +2010,10 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
             users.append({
                 "file_key": file_key,
                 "nickname": nick or "（未知昵称）",
+                # 主人 QQ 给界面显示用（v0.6.1）：昵称可以是纯不可见字符，
+                # 只显示昵称时用户在下拉框里分不清谁是谁；日记本是管理面板
+                # 页面，QQ 号本就出现在导出/验签流程里，不构成额外暴露。
+                "owner": owner,
                 "owner_known": bool(owner),
                 "protected": bool(owner and self._view_password_rec(owner)),
                 "day_count": day_count,
@@ -2370,6 +2383,92 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         finally:
             # 上传的迁移包含签名钥匙，用完即删
             tmp.unlink(missing_ok=True)
+
+    # ---- 日记本：批量删除（v0.6.1，用户建议） ----
+    #
+    # 复用 storage._delete_entries：签名、插图、批注、来源的级联清理与原子重写
+    # 都在那一层，本接口只做参数校验、主人解析、密码闸与结果统计。
+    # Web 侧是管理员在服务器上的操作，**不走** diary_op_interval 冷却（那是 QQ
+    # 用户防刷用的）；但删除不可逆，前端必须二次确认并在文案里提示先导出备份。
+
+    # 一次最多删多少天：保险丝，防止构造超大请求把事件循环占住（一年 366 天）。
+    _WEB_BATCH_DELETE_MAX_DAYS = 366
+
+    @staticmethod
+    def _web_normalize_day(value) -> str:
+        """把前端传来的日期归一化成内部 YYYYMMDD；不合法返回空串。
+
+        页面日期列表给的是 ``web_list_days`` 的 ``day``（YYYYMMDD），也接受
+        YYYY-MM-DD（脚本/手写调用更自然）。只校验格式与月日范围，不校验闰年——
+        日历上不存在的那天本来就不会有日记条目。
+        """
+        raw = str(value or "").strip()
+        m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", raw)
+        if m:
+            raw = "".join(m.groups())
+        if not re.fullmatch(r"\d{8}", raw):
+            return ""
+        month, day = int(raw[4:6]), int(raw[6:8])
+        if not (1 <= month <= 12 and 1 <= day <= 31):
+            return ""
+        return raw
+
+    async def web_delete_days(self):
+        """批量删除某用户若干天的日记（不可恢复）。返回 deleted/remaining/missing。"""
+        payload = await _web_request.json(default={})
+        if not isinstance(payload, dict):
+            return _web_error("无效的请求内容", status_code=400)
+        file_key = str(payload.get("file_key") or "").strip()
+        if not self._valid_file_key(file_key):
+            return _web_error("无效的用户标识", status_code=400)
+        path = self.data_dir / f"diary_{file_key}.zip"
+        if not path.exists():
+            return _web_error("日记文件不存在", status_code=404)
+
+        raw_days = payload.get("days")
+        if not isinstance(raw_days, list) or not raw_days:
+            return _web_error("没有选择要删除的日期", status_code=400)
+        if len(raw_days) > self._WEB_BATCH_DELETE_MAX_DAYS:
+            return _web_error(
+                f"一次最多删除 {self._WEB_BATCH_DELETE_MAX_DAYS} 天",
+                status_code=400,
+            )
+        days = []
+        for item in raw_days:
+            day = self._web_normalize_day(item)
+            if not day:
+                return _web_error(f"无效的日期：{item}", status_code=400)
+            if day not in days:  # 去重：重复日期只删一次，也不虚报 deleted
+                days.append(day)
+
+        # 主人解析与读/导出口径一致：旧 zip 的说明.txt 没有「用户ID」行时，
+        # 要求管理员输入一次主人 QQ（全量验签通过才接受，并记入 owner_map）。
+        qq_hint = str(payload.get("qq") or "").strip()
+        if not qq_hint:
+            qq_hint = (_web_request.query.get("qq", "") or "").strip()
+        owner, err = self._resolve_zip_owner(path, file_key, qq_hint)
+        if not owner:
+            if err == "OWNER_UNKNOWN":
+                return _web_json({"need_owner": True})
+            return _web_error(f"无法确认日记主人：{err}", status_code=400)
+        # 删除比翻阅更敏感：设了查看密码的日记，删除也必须先过密码闸。
+        # 密码在 POST 请求体里（GET 接口才用 query），见 _check_web_password 的 pw 参数。
+        gate = self._check_web_password(owner, pw=payload.get("pw"))
+        if gate is not None:
+            return gate
+
+        deleted = self._delete_entries(owner, [self._md_entry(d) for d in days])
+        remaining = len(self._list_entries(owner))
+        logger.info(
+            f"[memory_diary] Web 批量删除日记：主人 {owner} 删除 {deleted} 天，"
+            f"剩余 {remaining} 天"
+        )
+        return _web_json({
+            "deleted": deleted,
+            "remaining": remaining,
+            # 选了但 zip 里不存在的天数（前端用于提示「部分日期没有日记」）
+            "missing": max(0, len(days) - deleted),
+        })
 
     # 界面偏好（字号/字体）：iframe 沙箱没有 localStorage，
     # 存到数据目录、按管理面板账号分开；视图加载时读取，改动即保存。
@@ -3012,7 +3111,11 @@ class MemoryDiaryPlugin(MemoryDiaryCore, Star):
         if not getattr(self, "_terminated", False) and (task is None or task.done()):
             self._start_auto_diary_task()
         # P3-14：/reset 识别前先剥不可见字符（只用于判断，不回写消息内容）
-        text = self._strip_invisible(event.message_str or "").strip().lower()
+        # v0.6.1：部分插件（qq_tools 的 show_message_id）会往消息尾部追加
+        # [MSG_ID:...] 机器标记，重置标记会认不出来 → 这里再剥一层尾部装饰，
+        # 同样只用于判断、不回写 event.message_str。
+        text = self._strip_invisible(event.message_str or "")
+        text = strip_trailing_decorations(text).strip().lower()
         if text in ("/reset", "reset", "/重置", "重置"):
             self._reset_pending.add(event.unified_msg_origin)
             self._cap_state(self._reset_pending)

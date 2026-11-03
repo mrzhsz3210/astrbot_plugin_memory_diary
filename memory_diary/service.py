@@ -1007,6 +1007,16 @@ class ServiceMixin:
             remind = auto
         return remind, auto
 
+    def _auto_write_notify_enabled(self) -> bool:
+        """自动写日记完成后是否主动告知用户（v0.6.1，默认开启 = 旧行为）。
+
+        只控制「写完告知」这一条消息：关闭后两条自动写路径（哨兵自动写、
+        每天定时自动写）都静默写，日记照常保存、照常注入，只是不再主动
+        打扰用户。自动写失败通知、「没有新素材」的 /reset 提示以及手动
+        /日记 的告知都与本开关无关。
+        """
+        return bool(self.config.get("auto_write_notify", True))
+
     async def _watch_context(self, event: AstrMessageEvent, req: ProviderRequest):
         """估算上下文占用，触发提醒 / 自动写日记。"""
         limit = self._context_limit()
@@ -1097,32 +1107,37 @@ class ServiceMixin:
                 )
                 return
             if diary:
-                # 关闭「按人设口吻」时不额外调用 LLM，直接用固定文案
-                notice = ""
-                if bool(self.config.get("use_persona", True)):
-                    notice = await self._in_character_notice(
-                        umo,
-                        "上下文快满了，你刚刚悄悄把给未来自己的日记写好存起来了。"
-                        "请用你自己的口吻提醒用户：日记已经写好，请 ta 发送 /reset 开启新的上下文，"
-                        "你会先读一遍日记再继续陪 ta。不要复述日记内容。",
+                # v0.6.1：关闭「自动写日记完成后告知用户」时静默写——日记已经
+                # 保存、照常注入，只是不再发这条「写完告知」。失败通知与
+                # ERR_NO_NEW_MATERIAL 的 /reset 提示不静默（用户需要知道该 /reset）。
+                if self._auto_write_notify_enabled():
+                    # 关闭「按人设口吻」时不额外调用 LLM，直接用固定文案
+                    notice = ""
+                    if bool(self.config.get("use_persona", True)):
+                        notice = await self._in_character_notice(
+                            umo,
+                            "上下文快满了，你刚刚悄悄把给未来自己的日记写好存起来了。"
+                            "请用你自己的口吻提醒用户：日记已经写好，请 ta 发送 /reset 开启新的上下文，"
+                            "你会先读一遍日记再继续陪 ta。不要复述日记内容。",
+                        )
+                    if not notice:
+                        notice = "我已经把日记写好存起来啦 📖 发送 /reset 后，我会先读一遍日记，再继续陪你。"
+                    notice += (
+                        f"\n\n（本篇约 {len(diary)} 字，/reset 后的第一轮会一次性读入，"
+                        "不会每轮重复消耗 token）"
                     )
-                if not notice:
-                    notice = "我已经把日记写好存起来啦 📖 发送 /reset 后，我会先读一遍日记，再继续陪你。"
-                notice += (
-                    f"\n\n（本篇约 {len(diary)} 字，/reset 后的第一轮会一次性读入，"
-                    "不会每轮重复消耗 token）"
-                )
-                if (
-                    bool(self.config.get("show_diary_after_write", False))
-                    and not event.get_group_id()
-                ):
-                    # 日记全文只在私聊展示，群聊不展示
-                    notice += f"\n\n—— 日记全文 ——\n{diary}"
-                await event.send(
-                    event.plain_result(
-                        f"⚠️ 上下文已用约 {pct}%（估算 {used}/{limit} tokens），快到极限啦。\n\n{notice}"
+                    if (
+                        bool(self.config.get("show_diary_after_write", False))
+                        and not event.get_group_id()
+                    ):
+                        # 日记全文只在私聊展示，群聊不展示
+                        notice += f"\n\n—— 日记全文 ——\n{diary}"
+                    await event.send(
+                        event.plain_result(
+                            f"⚠️ 上下文已用约 {pct}%（估算 {used}/{limit} tokens），"
+                            f"快到极限啦。\n\n{notice}"
+                        )
                     )
-                )
             else:
                 await event.send(
                     event.plain_result(
@@ -1489,6 +1504,9 @@ class ServiceMixin:
 
     async def _notify_auto_diary_success(self, umo: str, diary: str):
         """写完后主动私聊告知；语气走人设，失败回退固定文案。"""
+        if not self._auto_write_notify_enabled():
+            # v0.6.1 静默模式：日记已保存、照常注入，不再主动告知用户
+            return
         notice = ""
         if bool(self.config.get("use_persona", True)):
             try:

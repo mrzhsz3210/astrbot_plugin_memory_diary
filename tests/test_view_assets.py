@@ -108,3 +108,58 @@ def test_diary_book_view_ships_backup_all_entry():
     assert "doBackupAllLocal" in js
 
 
+def test_diary_book_view_ships_batch_delete_ui():
+    """v0.6.1 第②节：目录多选 + 顶栏「批量删除」入口必须存在。
+
+    后端有了 ``delete_days`` 路由、前端却没有入口时，这个功能对用户等于不存在。
+    这里把 HTML 按钮、JS 接口调用、目录复选框与危险按钮样式一起固定下来。
+    """
+    html = _read("index.html")
+    assert 'id="btnBatchDelete"' in html, "顶栏缺少「批量删除」按钮"
+    assert 'id="dialogWarning"' in html, "确认框缺少醒目警告区"
+    js = _read("app.js")
+    assert "delete_days" in js, "缺少 delete_days 接口调用"
+    assert "bridge.apiPost(" in js, "缺少 bridge.apiPost 调用"
+    assert "askConfirm" in js, "确认框应走页面内 askConfirm"
+    assert "day-check" in js, "目录项缺少选择复选框"
+    css = _read("style.css")
+    assert ".ctl.danger" in css, "缺少危险操作按钮样式"
+    assert ".day-check" in css, "缺少目录复选框样式"
+
+
+def test_diary_book_view_batch_delete_confirm_is_destructive_and_safe():
+    """删除不可恢复：确认框必须给出「不可恢复 + 先导出备份」的醒目提示，
+    且不能退回原生弹窗（sandbox iframe 没有 allow-modals，会被静默忽略）。
+
+    注意确认框是自定义的 confirmDialog / askConfirm，这里只查原生
+    ``window.confirm(``，不要误伤自定义实现。
+    """
+    js = _read("app.js")
+    # 确认文案：天数与最新一天由模板拼出，静态检查关键词
+    assert "不可恢复" in js, "确认文案缺少「不可恢复」警告"
+    assert "导出" in js, "确认文案缺少「先导出备份」的建议"
+    assert "最新一天" in js, "确认文案未标出所选日期里最新的一天"
+    # 原生弹窗一律禁止（window.prompt( 已由上面的既有测试覆盖）
+    assert "window.confirm(" not in js, "不能用原生 confirm（iframe 无 allow-modals）"
+    assert "window.alert(" not in js, "不能用原生 alert（iframe 无 allow-modals）"
+    # 提交前必须真的弹确认框，不能直接发请求
+    assert "askConfirm(" in js
+
+
+def test_diary_book_view_user_label_shows_owner_qq():
+    """v0.6.1：用户下拉框必须显示主人 QQ，且隐形昵称有降级。
+
+    昵称可以是纯不可见字符（零宽/填充字符当 QQ 昵称），只显示昵称时下拉框
+    一片空白、分不清谁是谁。后端 ``web_list_users`` 返回 ``owner``，前端
+    ``visibleText`` 剥掉不可见字符后为空就降级成「QQ xxx（N 天）」。
+    """
+    js = _read("app.js")
+    assert "INVISIBLE_DISPLAY_RE" in js, "缺少不可见字符正则"
+    assert "function visibleText(" in js, "缺少 visibleText 过滤函数"
+    assert "function userLabel(" in js, "缺少 userLabel 标签函数"
+    assert "opt.textContent = userLabel(u)" in js, (
+        "下拉框 option 必须走 userLabel（含 QQ 与降级逻辑），不能直接拼 nickname"
+    )
+    assert "u.owner" in js, "标签函数未使用后端返回的 owner 字段"
+
+

@@ -666,3 +666,301 @@ async def test_web_export_all_backup_bundle():
         # 路由已注册（否则前端按钮点了没反应）
         routes = [r[0] for r in inst.ctx.registered_web_apis]
         assert any(r.endswith("/export_all") for r in routes)
+
+
+# ---------------------------------------------------------------------------
+# v0.6.1 ②：Web 日记本批量删除（delete_days）
+#   新接口只存在于 refactor 侧，因此只驱动 refactor；删除本身的级联/原子语义
+#   由 storage 的差分测试兜底，这里验"接口把参数、主人、密码闸接对了"。
+# ---------------------------------------------------------------------------
+
+_PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+
+
+def _post(payload, query=None):
+    return FakeWebRequest(method="POST", payload=payload, query=query)
+
+
+def _seed_days(inst, days, sender: str = SENDER):
+    for day in days:
+        inst.plugin._save_diary(
+            sender,
+            f"{day} 的日记。",
+            sender_name=SENDER_NAME,
+            entry_name_hint=day,
+            origin="private",
+            mode="full",
+        )
+
+
+async def test_web_delete_days_batch_and_cascade():
+    """删 2 天：这两天及其插图/批注/签名全消失，其余天验签通过；删光后 zip 消失。"""
+    if env.is_baseline_only():
+        return  # 新接口只存在于 refactor 侧
+    async with World(config={"use_persona": False, "annotation_enabled": True}) as world:
+        inst = world.refactor
+        plugin = inst.plugin
+        _seed_days(inst, ["20261021", "20261022", "20261023"])
+        # 插图与批注都锚在 20261021/20261022：删除时要级联清掉，不留孤儿
+        plugin.save_image(SENDER, _PNG, day="20261021", seq=1, desc="江边")
+        plugin.save_image(SENDER, _PNG, day="20261023", seq=1, desc="路灯")
+        plugin.save_annotations(
+            SENDER,
+            {
+                "version": 1,
+                "last_round": "r_20261023_203000_ab12",
+                "last_title": "页边的话",
+                "updated_at": "2026-10-23T20:30:00",
+                "annotations": [
+                    {
+                        "id": "ann_20261021_1",
+                        "round": "r_20261023_203000_ab12",
+                        "anchor": "20261021 的日记",
+                        "entry": "20261021.md",
+                        "created_at": "2026-10-23T20:30:00",
+                        "note": "第一天的批注。",
+                        "is_question": False,
+                        "status": "open",
+                        "reply": None,
+                    },
+                    {
+                        "id": "ann_20261022_2",
+                        "round": "r_20261023_203000_ab12",
+                        "anchor": "20261022 的日记",
+                        "entry": "20261022.md",
+                        "created_at": "2026-10-23T20:30:00",
+                        "note": "第二天的批注。",
+                        "is_question": False,
+                        "status": "open",
+                        "reply": None,
+                    },
+                ],
+            },
+        )
+        file_key = plugin._diary_file_key(SENDER)
+
+        # 同时接受 YYYY-MM-DD 与 YYYYMMDD；重复日期去重（deleted 不虚报）
+        resp = await _call(
+            plugin.web_delete_days,
+            _post({
+                "file_key": file_key,
+                "days": ["2026-10-21", "20261021", "20261022"],
+            }),
+        )
+
+        path = plugin._diary_path(SENDER)
+        entries = compare.zip_entries(path)
+        remaining_entries = sorted(
+            n for n in entries if plugin.ENTRY_NAME_RE.match(n)
+        )
+        images = plugin.list_images(SENDER)
+        ann_21 = plugin.annotations_web_payload(SENDER, "20261021")
+        ann_22 = plugin.annotations_web_payload(SENDER, "20261022")
+        content_23, tampered_23 = plugin._load_entry(
+            SENDER, plugin._md_entry("20261023")
+        )
+        days_resp = await _call(plugin.web_list_days, FakeWebRequest(), file_key)
+
+        assert resp["status"] == 200
+        assert resp["body"] == {"deleted": 2, "remaining": 1, "missing": 0}
+        assert remaining_entries == ["diaries/20261023.md"]
+        assert not any("20261021" in n or "20261022" in n for n in entries), (
+            "被删两天的签名/插图/批注条目必须一起消失"
+        )
+        assert images == ["images/20261023_1_路灯.png"]
+        assert ann_21 == ([], False) and ann_22 == ([], False)
+        assert "20261023 的日记" in content_23 and tampered_23 is False
+        assert days_resp["body"]["days"] == [
+            {"day": "20261023", "label": "2026-10-23"}
+        ]
+
+        # 删除最后一天：用户日记 zip 整体删除，用户列表里不再出现
+        last = await _call(
+            plugin.web_delete_days,
+            _post({"file_key": file_key, "days": ["20261023"]}),
+        )
+        users = await _call(plugin.web_list_users, FakeWebRequest())
+        assert last["body"] == {"deleted": 1, "remaining": 0, "missing": 0}
+        assert not path.exists()
+        assert users["body"] == {"users": []}
+
+        # 路由已注册（否则前端按钮点了没反应）
+        routes = [r[0] for r in inst.ctx.registered_web_apis]
+        assert any(r.endswith("/delete_days") for r in routes)
+
+
+async def test_web_list_users_exposes_owner_qq():
+    """v0.6.1：用户列表返回主人 QQ（界面下拉框显示用，baseline 无此字段）。
+
+    昵称可以是纯不可见字符，只显示昵称时下拉框一片空白、分不清谁是谁；
+    前端拿到 owner 后显示「昵称（QQ xxx · N 天）」，隐形昵称降级成「QQ xxx」。
+    """
+    if env.is_baseline_only():
+        return  # owner 字段只存在于 refactor 侧
+    from image_testkit import rewrite_zip, zip_entries
+    async with World(config={"use_persona": False}) as world:
+        inst = world.refactor
+        plugin = inst.plugin
+        _seed_diary(inst)
+        users = await _call(plugin.web_list_users, FakeWebRequest())
+        u = users["body"]["users"][0]
+        assert u["owner"] == SENDER
+        assert u["owner_known"] is True
+        # 旧 zip（无 说明.txt）未解析出主人时 owner 为空串而不是缺键，
+        # 前端按空串走「（未知昵称）（N 天）」旧文案
+        _seed_diary(inst, sender=OTHER)
+        path = plugin._diary_path(OTHER)
+        entries = zip_entries(path)
+        del entries[plugin.README_ZIP_ENTRY]
+        rewrite_zip(path, entries)
+        users2 = await _call(plugin.web_list_users, FakeWebRequest())
+        u2 = next(x for x in users2["body"]["users"]
+                  if x["file_key"] == plugin._diary_file_key(OTHER))
+        assert u2["owner"] == "" and u2["owner_known"] is False
+
+
+async def test_web_delete_days_validation_owner_and_password():
+    """参数校验、旧 zip 主人解析、查看密码闸，以及"选了不存在的日期"的口径。"""
+    if env.is_baseline_only():
+        return  # 新接口只存在于 refactor 侧
+    async with World(config={"use_persona": False}) as world:
+        inst = world.refactor
+        plugin = inst.plugin
+        _seed_days(inst, ["20261021", "20261022", "20261023"])
+        file_key = plugin._diary_file_key(SENDER)
+
+        async def call(payload):
+            return await _call(plugin.web_delete_days, _post(payload))
+
+        bad_key = await call({"file_key": "../../etc", "days": ["20261023"]})
+        missing_file = await call({
+            "file_key": plugin._diary_file_key(OTHER),
+            "days": ["20261023"],
+        })
+        no_days = await call({"file_key": file_key})
+        not_list = await call({"file_key": file_key, "days": "20261023"})
+        bad_date = await call({"file_key": file_key, "days": ["2026-13-01"]})
+        junk_date = await call({"file_key": file_key, "days": ["not-a-date"]})
+        too_many = await call({
+            "file_key": file_key,
+            "days": [f"2026{i // 280 + 1:02d}{i % 28 + 1:02d}" for i in range(367)],
+        })
+        unknown_day = await call({
+            "file_key": file_key,
+            "days": ["20260101"],
+        })
+        assert bad_key["status"] == 400
+        assert missing_file["status"] == 404
+        assert no_days["status"] == 400
+        assert not_list["status"] == 400
+        assert bad_date["status"] == 400
+        assert junk_date["status"] == 400
+        assert too_many["status"] == 400
+        assert unknown_day["body"] == {"deleted": 0, "remaining": 3, "missing": 1}
+
+        # 查看密码闸：POST 的密码放在请求体里
+        plugin._save_pref_data(
+            SENDER, {"view_password": plugin._make_view_password("secret123")}
+        )
+        need_pw = await call({"file_key": file_key, "days": ["20261021"]})
+        wrong_pw = await call({
+            "file_key": file_key,
+            "days": ["20261021"],
+            "pw": "nope",
+        })
+        right_pw = await call({
+            "file_key": file_key,
+            "days": ["20261021"],
+            "pw": "secret123",
+        })
+        assert need_pw["body"] == {"need_password": True}
+        assert wrong_pw["status"] == 403
+        assert right_pw["body"] == {"deleted": 1, "remaining": 2, "missing": 0}
+
+        # 旧 zip（说明.txt 没有主人 ID）：先要 QQ 提示，验签通过才删
+        path = plugin._diary_path(SENDER)
+        entries = compare.zip_entries(path)
+        entries["说明.txt"] = entries["说明.txt"].replace(
+            f"用户ID：{SENDER}\n".encode("utf-8"), b""
+        )
+        plugin._write_zip_atomic(path, entries)
+        need_owner = await call({
+            "file_key": file_key,
+            "days": ["20261022"],
+            "pw": "secret123",
+        })
+        wrong_qq = await call({
+            "file_key": file_key,
+            "days": ["20261022"],
+            "pw": "secret123",
+            "qq": "99999",
+        })
+        right_qq = await call({
+            "file_key": file_key,
+            "days": ["20261022"],
+            "pw": "secret123",
+            "qq": SENDER,
+        })
+        assert need_owner["body"] == {"need_owner": True}
+        assert wrong_qq["status"] == 400
+        assert right_qq["body"] == {"deleted": 1, "remaining": 1, "missing": 0}
+        assert plugin._load_owner_map().get(file_key) == SENDER
+        # 剩下那天仍能正常验签读取
+        content, tampered = plugin._load_entry(
+            SENDER, plugin._md_entry("20261023")
+        )
+        assert "20261023 的日记" in content and tampered is False
+
+
+async def test_web_delete_days_export_delete_import_round_trip():
+    """验收项：导出备份 → 全部删除 → 重新导入，数据与图片逐字节回到原样。"""
+    if env.is_baseline_only():
+        return  # 新接口只存在于 refactor 侧
+    async with World(config={"use_persona": False}) as world:
+        inst = world.refactor
+        plugin = inst.plugin
+        days = ["20261021", "20261022"]
+        _seed_days(inst, days)
+        plugin.save_image(SENDER, _PNG, day="20261022", seq=1, desc="江边")
+        image_name = plugin.list_images(SENDER)[0]
+        before = {
+            day: plugin._load_entry(SENDER, plugin._md_entry(day))[0]
+            for day in days
+        }
+        bundle = plugin._build_export_bundle(
+            SENDER, plugin._diary_path(SENDER), inst.entries(SENDER)
+        )
+        bundle_bytes = bundle.read_bytes()
+        bundle.unlink(missing_ok=True)
+
+        file_key = plugin._diary_file_key(SENDER)
+        deleted = await _call(
+            plugin.web_delete_days,
+            _post({"file_key": file_key, "days": days}),
+        )
+        assert deleted["body"] == {"deleted": 2, "remaining": 0, "missing": 0}
+        assert not plugin._diary_path(SENDER).exists()
+
+        imported = await _call(
+            plugin.web_import,
+            FakeWebRequest(
+                uploads={"file": make_upload(bundle_bytes, "bundle.zip")}
+            ),
+        )
+        after = {
+            day: plugin._load_entry(SENDER, plugin._md_entry(day))
+            for day in days
+        }
+        image_data, image_status = plugin.load_image(SENDER, image_name)
+        assert imported["status"] == 200
+        assert imported["body"]["imported"] == len(days)
+        assert sorted(plugin._list_entries(SENDER)) == [
+            plugin._md_entry(day) for day in days
+        ]
+        for day in days:
+            content, tampered = after[day]
+            assert content == before[day], "删除后重新导入的正文必须与原文件一致"
+            assert tampered is False, "重新导入的日记必须能通过验签"
+        assert image_data == _PNG and image_status == "ok"
+
+

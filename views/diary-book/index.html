@@ -41,6 +41,7 @@
           <button data-export="backup_all_local" class="paper-item">备份全部日记并打开位置（管理员）</button>
         </div>
       </div>
+      <button id="btnBatchDelete" class="ctl danger" title="删除目录里勾选的日期（不可恢复，建议先导出备份）" disabled>🗑 批量删除</button>
       <button id="btnRefresh" class="ctl">⟳ 刷新</button>
     </header>
 
@@ -85,15 +86,16 @@
     <input type="file" id="backdropInput" accept="image/png,image/jpeg,image/webp" hidden />
 
     <!--
-      页面内输入框（查看密码 / 主人 QQ）。
+      页面内对话框（查看密码 / 主人 QQ / 批量删除确认）。
       插件视图跑在 sandbox="allow-scripts allow-forms allow-downloads" 的 iframe 里，
       没有 allow-modals，window.prompt()/confirm()/alert() 会被浏览器直接忽略并返回 null，
-      所以这里必须用页面内对话框，不能依赖原生 prompt。
+      所以这里必须用页面内对话框，不能依赖原生 prompt / confirm。
     -->
     <div id="dialogMask" class="dialog-mask" hidden>
       <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialogTitle">
         <div id="dialogTitle" class="dialog-title">输入查看密码</div>
         <div id="dialogMsg" class="dialog-msg"></div>
+        <div id="dialogWarning" class="dialog-warning" hidden></div>
         <input
           id="dialogInput"
           class="dialog-input"

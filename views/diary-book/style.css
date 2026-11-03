@@ -17,6 +17,9 @@
   --btn-text: #f8f2e3;
   --badge-bg: rgba(168, 82, 63, 0.12);
   --badge-bg-strong: rgba(168, 82, 63, 0.26);
+  /* 危险操作（批量删除不可恢复）用独立的红，不跟正面强调色 --accent 混用 */
+  --danger: #b23b2e;
+  --danger-hover: #982f24;
 }
 
 [data-theme="dark"] {
@@ -36,6 +39,8 @@
   --btn-text: #e8dfc9;
   --badge-bg: rgba(207, 122, 99, 0.18);
   --badge-bg-strong: rgba(207, 122, 99, 0.34);
+  --danger: #c8574a;
+  --danger-hover: #d96a58;
 }
 
 * { box-sizing: border-box; }
@@ -61,6 +66,8 @@ body {
 #topbar {
   display: flex;
   align-items: center;
+  /* 按钮变多（v0.6.1 批量删除）：窄面板下允许换行，避免右侧按钮被裁掉 */
+  flex-wrap: wrap;
   gap: 10px;
   padding: 10px 18px;
   background: var(--topbar);
@@ -84,6 +91,10 @@ body {
 }
 .ctl:hover { transform: translateY(-1px); opacity: 0.92; }
 .ctl:disabled { opacity: 0.4; cursor: default; transform: none; }
+
+/* 危险操作（批量删除）：顶栏按钮与确认框的「确认删除」共用，红色系 */
+.ctl.danger { background: var(--danger); color: #fff; }
+.ctl.danger:hover:not(:disabled) { background: var(--danger-hover); opacity: 1; }
 
 select.ctl { max-width: 220px; }
 
@@ -194,6 +205,7 @@ select.ctl { max-width: 220px; }
   border-bottom: 1px dashed var(--line);
   cursor: pointer;
   display: flex;
+  align-items: center;
   justify-content: space-between;
   border-radius: 6px;
   transition: background 0.12s ease;
@@ -206,6 +218,21 @@ select.ctl { max-width: 220px; }
   font-weight: bold;
 }
 .day-list .idx { color: var(--ink-soft); font-size: 12px; align-self: center; }
+
+/* 批量删除：目录每项前的复选框。点它只切换选中、不翻页（app.js 里拦了
+ * click 冒泡），选中态用 li.selected 标出，与当前阅读页的 li.active 区分。 */
+.day-list li > span:first-of-type { flex: 1; }
+.day-check {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin: 0 8px 0 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+.day-check:disabled { cursor: default; }
+.day-list li.selected { background: var(--badge-bg); }
+.day-list li.selected:hover { background: var(--badge-bg-strong); }
 
 /* ---------- 日记页 ---------- */
 .diary-header {
@@ -566,6 +593,19 @@ body.custom-backdrop {
   white-space: pre-wrap;
 }
 .dialog-msg[hidden] { display: none; }
+/* 危险操作确认框的醒目警告（批量删除不可恢复）：单独一块红框，别混进灰色正文 */
+.dialog-warning {
+  margin-bottom: 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: var(--badge-bg);
+  color: var(--danger);
+  font-size: 14px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+.dialog-warning[hidden] { display: none; }
 .dialog-input {
   width: 100%;
   padding: 9px 12px;
@@ -578,6 +618,8 @@ body.custom-backdrop {
   outline: none;
 }
 .dialog-input:focus { border-color: var(--accent); }
+/* 确认型对话框用 hidden 属性隐藏输入框；显式补一条，防止别的 display 规则把它顶出来 */
+.dialog-input[hidden] { display: none; }
 .dialog-error {
   min-height: 18px;
   margin-top: 8px;

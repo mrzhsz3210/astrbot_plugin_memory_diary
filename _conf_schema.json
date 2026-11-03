@@ -84,6 +84,15 @@
     "hint": "24 小时制 HH:MM（例如 22:30），按「日记时区」计算；仅在开启上一项后生效。留空按默认 22:00；格式不对时不会自动写，并记一条日志。启动/重启晚于该时间超过 2 分钟不补写，等第二天",
     "default": "22:00"
   },
+  "auto_write_notify": {
+    "description": "自动写日记完成后告知用户",
+    "type": "bool",
+    "hint": "默认开启：哨兵自动写、每天定时自动写完成后，按人设口吻私聊告知「日记写好了」。关闭后静默写、不打扰（日记照常保存、照常注入）。手动 /日记 的告知不受此开关影响",
+    "default": true,
+    "condition": {
+      "enable_auto_diary": true
+    }
+  },
   "empty_diary_as_life": {
     "description": "无新素材时写拟人日常",
     "type": "bool",
