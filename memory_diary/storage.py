@@ -83,6 +83,15 @@ class StorageMixin:
     PROVENANCE_SIG_ENTRY = "sigs/provenance.json.sig"
     PROVENANCE_MAX_SELF_PER_ENTRY = 50    # 单篇最多记多少条自发挥子串
     PROVENANCE_MAX_SELF_CHARS = 2000      # 单篇自发挥子串的总字数上限
+    # v0.6.2 外部写入：幂等索引也放本侧车——随包 HMAC 签名、重启不丢、与 zip
+    # 重写原子同步。条目级记录 {source, ext_id, at}，双容量上限，超了从最旧的丢。
+    PROVENANCE_MAX_EXTERNAL_PER_ENTRY = 100   # 单日最多记多少条外部写入
+    PROVENANCE_MAX_EXTERNAL_TOTAL = 2000      # 全 zip 外部写入记录总上限
+
+    # 外部写入 API（v0.6.2，issue #3）的请求形状上限
+    EXTERNAL_NOTE_MAX_BYTES = 8192   # 单条 text 的 UTF-8 字节上限（8 KB）
+    EXTERNAL_EXT_ID_MAX = 64         # ext_id 长度上限（可打印 ASCII）
+    EXTERNAL_SOURCE_MAX = 32         # source 标识长度上限
 
     @staticmethod
     def _md_entry(day: str) -> str:
@@ -936,8 +945,30 @@ class StorageMixin:
         return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
 
     @classmethod
+    def _normalize_external_records(cls, records) -> list:
+        """清洗外部写入记录：{source, ext_id, at}，按写入先后保留，超限丢最旧。"""
+        out = []
+        if not isinstance(records, list):
+            return out
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            source = str(rec.get("source") or "").strip()
+            ext_id = str(rec.get("ext_id") or "").strip()
+            at = str(rec.get("at") or "").strip()[:30]
+            if not source or len(source) > cls.EXTERNAL_SOURCE_MAX:
+                continue
+            if not ext_id or len(ext_id) > cls.EXTERNAL_EXT_ID_MAX:
+                continue
+            out.append({"source": source, "ext_id": ext_id, "at": at})
+            if len(out) >= cls.PROVENANCE_MAX_EXTERNAL_PER_ENTRY:
+                break
+        return out
+
+    @classmethod
     def _normalize_provenance(cls, data) -> dict:
-        """清洗成规范 dict（不改入参）：键是 "YYYYMMDD.md"，值含 self 子串列表。
+        """清洗成规范 dict（不改入参）：键是 "YYYYMMDD.md"，值含 self 子串列表
+        与 external 外部写入记录（v0.6.2，幂等索引）。
 
         容量双保险：单篇条数与总字数超限都从最旧的开始丢（列表按写入先后追加）。
         """
@@ -953,24 +984,52 @@ class StorageMixin:
             if not re.fullmatch(r"\d{8}\.md", name):
                 continue
             subs = rec.get("self") if isinstance(rec, dict) else None
-            if not isinstance(subs, list):
-                continue
             cleaned, seen, total = [], set(), 0
-            for s in subs:
-                if not isinstance(s, str):
-                    continue
-                s = s.strip()
-                if not s or s in seen:
-                    continue
-                if len(cleaned) >= cls.PROVENANCE_MAX_SELF_PER_ENTRY:
-                    break
-                if total + len(s) > cls.PROVENANCE_MAX_SELF_CHARS:
-                    continue
-                cleaned.append(s)
-                seen.add(s)
-                total += len(s)
-            if cleaned:
-                out["entries"][name] = {"self": cleaned}
+            if isinstance(subs, list):
+                for s in subs:
+                    if not isinstance(s, str):
+                        continue
+                    s = s.strip()
+                    if not s or s in seen:
+                        continue
+                    if len(cleaned) >= cls.PROVENANCE_MAX_SELF_PER_ENTRY:
+                        break
+                    if total + len(s) > cls.PROVENANCE_MAX_SELF_CHARS:
+                        continue
+                    cleaned.append(s)
+                    seen.add(s)
+                    total += len(s)
+            ext = cls._normalize_external_records(
+                rec.get("external") if isinstance(rec, dict) else None
+            )
+            if cleaned or ext:
+                entry = {}
+                if cleaned:
+                    entry["self"] = cleaned
+                if ext:
+                    entry["external"] = ext
+                out["entries"][name] = entry
+        # 外部记录总上限：跨条目从最旧的丢（at 是 ISO 串，字典序即时间序）
+        all_ext = [
+            (rec["at"], name, i)
+            for name, entry in out["entries"].items()
+            for i, rec in enumerate(entry.get("external") or [])
+        ]
+        overflow = len(all_ext) - cls.PROVENANCE_MAX_EXTERNAL_TOTAL
+        if overflow > 0:
+            all_ext.sort()
+            drop = {}
+            for _, name, idx in all_ext[:overflow]:
+                drop.setdefault(name, set()).add(idx)
+            for name, idxs in drop.items():
+                entry = out["entries"][name]
+                entry["external"] = [
+                    r for i, r in enumerate(entry["external"]) if i not in idxs
+                ]
+                if not entry["external"]:
+                    del entry["external"]
+                    if not entry:
+                        del out["entries"][name]
         return out
 
     def _provenance_sig(self, sender_id: str, raw: bytes) -> str:
@@ -1799,6 +1858,7 @@ class StorageMixin:
         origin: str = "",
         mode: str = "",
         absorb_headers: list = None,
+        provenance_mutator=None,
     ):
         """把一篇日记写入"当天"的文件；当天已有内容则追加（带时间分隔）。返回文件名。
 
@@ -1806,6 +1866,10 @@ class StorageMixin:
         供"群聊注入过滤"识别；旧格式迁移时不传，保持无标记。
         mode 为 "full" / "brief" / "life"，写入分隔条供后续判断模式；
         absorb_headers 是本次完整篇吸收的简记分隔条，原文保留但标记（已吸收）。
+        provenance_mutator（v0.6.2 外部写入）：可选回调，在**同一次原子重写**里
+        更新来源侧车（读-验-改-签），保证"日记段落 + 幂等索引"要么一起落盘、
+        要么一起不落——客户端中途失败重试不会产生重复条目。旧侧车验签不过时
+        整次保存拒绝（fail-closed，不替被改过的内容重签）。
         """
         path = self._diary_path(sender_id)
         day = entry_name_hint or self._now().strftime("%Y%m%d")
@@ -1910,6 +1974,12 @@ class StorageMixin:
                 else:
                     header = f"—— {now_hm}{separator_note}{scene_tag} ——"
                 existing[entry_name] = f"{header}\n\n{content}"
+            elif separator_note:
+                # v0.6.2 外部写入：无会话场景但带来源备注时，首篇同样写分隔条——
+                # 否则当天首条外部段落没有任何标记，分段解析也归不了类。
+                now_hm = self._now().strftime("%H:%M")
+                header = f"—— {now_hm} 补记{separator_note} ——"
+                existing[entry_name] = f"{header}\n\n{content}"
             else:
                 existing[entry_name] = content
 
@@ -1921,6 +1991,34 @@ class StorageMixin:
             )
         out.update(image_entries)
         out.update(sidecar_entries)
+        if provenance_mutator is not None:
+            # 与日记段落同一次原子重写里更新来源侧车（读-验-改-签）：
+            # 外部写入的幂等索引随条目一起落盘，中途失败重试不会重复追加。
+            raw = sidecar_entries.get(self.PROVENANCE_ENTRY)
+            if raw is not None:
+                actual = (
+                    sidecar_entries.get(self.PROVENANCE_SIG_ENTRY, b"")
+                    .decode("utf-8", "ignore")
+                    .strip()
+                )
+                if not self._provenance_sig_matches(sender_id, raw, actual):
+                    raise DiaryTamperedError("来源侧车")
+                try:
+                    pdata = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    raise DiaryTamperedError("来源侧车（无法解析）")
+            else:
+                pdata = self._provenance_empty()
+            pdata = self._normalize_provenance(pdata)
+            result = provenance_mutator(pdata)
+            if isinstance(result, dict):
+                pdata = result
+            pdata = self._normalize_provenance(pdata)
+            praw = self._dump_provenance(pdata)
+            out[self.PROVENANCE_ENTRY] = praw
+            out[self.PROVENANCE_SIG_ENTRY] = self._provenance_sig(
+                sender_id, praw
+            ).encode("utf-8")
         out[self.README_ZIP_ENTRY] = self._readme_text(sender_id, sender_name).encode(
             "utf-8"
         )
@@ -2465,6 +2563,116 @@ class StorageMixin:
             os.replace(tmp, p)
         except Exception as e:
             logger.warning(f"[memory_diary] 保存 Web 侧主人映射失败: {e}")
+
+    # ------------------------- 外部写入凭证（v0.6.2，issue #3） -------------------------
+    #
+    # 「凭证即定位主人」：每个主人 × 每个来源一枚 token，插件凭 token 反查 owner
+    # 并派生 file_key——外部客户端天然知道的是"给谁写"，推不出也不应携带 file_key。
+    # 纪律：
+    #   - 文件只存 token 的 SHA-256 哈希，明文只在新办时回复一次；
+    #   - 放在数据目录根（与 web_owner_map.json 同层）——迁移包/一键备份只打包
+    #     diary_*.zip，凭证天然不随导出外流；
+    #   - 日志只记来源与主人，绝不记 token 本体；
+    #   - 未配置任何凭证的主人默认拒绝写入（fail-closed）。
+
+    EXTERNAL_TOKENS_MAX_PER_OWNER = 10  # 每个主人同时在用的凭证上限
+
+    def _external_tokens_path(self) -> Path:
+        return self.data_dir / "external_write_tokens.json"
+
+    def _load_external_tokens(self) -> list:
+        try:
+            d = json.loads(self._external_tokens_path().read_text(encoding="utf-8"))
+            recs = d.get("tokens") if isinstance(d, dict) else None
+            return recs if isinstance(recs, list) else []
+        except Exception:
+            return []
+
+    def _save_external_tokens(self, recs: list) -> bool:
+        try:
+            payload = {"version": 1, "tokens": recs}
+            p = self._external_tokens_path()
+            tmp = p.with_name(f"{p.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(tmp, p)
+            return True
+        except Exception as e:
+            logger.warning(f"[memory_diary] 保存外部写入凭证失败: {e}")
+            return False
+
+    @staticmethod
+    def _external_token_hash(token: str) -> str:
+        return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+    def resolve_external_token(self, token: str):
+        """按明文 token 反查凭证记录（哈希比对）。无效/已吊销返回 None。"""
+        token = str(token or "").strip()
+        if not token:
+            return None
+        want = self._external_token_hash(token)
+        for rec in self._load_external_tokens():
+            if (
+                isinstance(rec, dict)
+                and rec.get("enabled")
+                and hmac.compare_digest(str(rec.get("hash") or ""), want)
+            ):
+                return rec
+        return None
+
+    def create_external_token(self, sender_id: str, source: str, label: str = ""):
+        """新办一枚写入凭证。返回明文 token（仅此处出现一次），失败返回 None。"""
+        recs = self._load_external_tokens()
+        active = [
+            r
+            for r in recs
+            if isinstance(r, dict) and r.get("enabled") and r.get("owner") == sender_id
+        ]
+        if len(active) >= self.EXTERNAL_TOKENS_MAX_PER_OWNER:
+            return None
+        token = "mdw_" + secrets.token_urlsafe(24)
+        recs.append(
+            {
+                "hash": self._external_token_hash(token),
+                "owner": str(sender_id),
+                "source": str(source).strip(),
+                "label": str(label or "").strip()[:32],
+                "created_at": self._now().strftime("%Y-%m-%dT%H:%M:%S"),
+                "enabled": True,
+            }
+        )
+        if not self._save_external_tokens(recs):
+            return None
+        return token
+
+    def list_external_tokens(self, sender_id: str) -> list:
+        """列出主人的全部凭证（不含哈希本体，供 /日记凭证 列表展示）。"""
+        out = []
+        for rec in self._load_external_tokens():
+            if isinstance(rec, dict) and rec.get("owner") == sender_id:
+                out.append(
+                    {
+                        "source": rec.get("source", ""),
+                        "label": rec.get("label", ""),
+                        "created_at": rec.get("created_at", ""),
+                        "enabled": bool(rec.get("enabled")),
+                    }
+                )
+        return out
+
+    def revoke_external_token(self, sender_id: str, index: int) -> bool:
+        """按主人在列表中的序号（1 起）吊销凭证。返回是否吊销成功。"""
+        recs = self._load_external_tokens()
+        mine = [
+            i
+            for i, r in enumerate(recs)
+            if isinstance(r, dict) and r.get("owner") == sender_id
+        ]
+        if not (1 <= index <= len(mine)):
+            return False
+        recs[mine[index - 1]]["enabled"] = False
+        return self._save_external_tokens(recs)
 
     def _resolve_zip_owner(self, path: Path, file_key: str, qq_hint: str = ""):
         """确定 zip 的主人 QQ。返回 (owner_id, 错误信息)；无法确定且未给 qq 时

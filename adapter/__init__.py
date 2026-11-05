@@ -19,6 +19,7 @@ from .hooks import EventHooksMixin
 from .lifecycle import LifecycleMixin
 from .web_diary import WebDiaryApiMixin
 from .web_export import WebExportApiMixin
+from .web_note import WebNoteApiMixin
 from .web_prefs import WebPrefsApiMixin
 
 # 组合顺序：都排在 MemoryDiaryCore 之前（与拆分前"方法定义在主类上"的覆盖关系一致）。
@@ -38,6 +39,7 @@ AdapterMixins = (
     WebDiaryApiMixin,
     WebExportApiMixin,
     WebPrefsApiMixin,
+    WebNoteApiMixin,
 )
 
 __all__ = ["AdapterMixins"]

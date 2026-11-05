@@ -72,6 +72,10 @@ class WebDiaryApiMixin:
             "日记本：上传自定义背景板")
         reg(f"/{PLUGIN_NAME}/image/<file_key>/<name>", self.web_get_diary_image,
             ["GET"], "日记本：读取日记插图")
+        # 外部写入（v0.6.2，issue #3）：面向无面板会话的本地程序，走 AstrBot
+        # v1 API key + 插件写入凭证双闸，实现见 adapter/web_note.py
+        reg(f"/{PLUGIN_NAME}/note", self.web_external_note, ["POST"],
+            "外部写入：凭写入凭证给日记追加段落（幂等、只追加、fail-closed）")
 
     @staticmethod
     def _valid_file_key(file_key: str) -> bool:

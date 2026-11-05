@@ -147,6 +147,15 @@ class MemoryDiaryPlugin(*AdapterMixins, MemoryDiaryCore, Star):
         async for result in self._handle_diary_password(event):
             yield result
 
+    @filter.command("日记凭证", alias={"diary_token"})
+    async def diary_token(self, event: AstrMessageEvent):
+        """管理外部写入凭证（仅私聊、仅本人）。
+
+        用法：/日记凭证 新办 <来源标识> ｜ /日记凭证 列表 ｜ /日记凭证 吊销 <序号>
+        """
+        async for result in self._handle_diary_token(event):
+            yield result
+
     @filter.command("日记状态", alias={"diary_status"})
     async def diary_status(self, event: AstrMessageEvent):
         """查看当前上下文占用、日记更新时间和哨兵状态。"""

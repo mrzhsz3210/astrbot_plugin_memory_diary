@@ -177,6 +177,110 @@ class SettingsCommandsMixin:
         )
         yield event.plain_result(usage)
 
+    async def _handle_diary_token(self, event: AstrMessageEvent):
+        """管理外部写入凭证（仅私聊、仅本人）。（``main.diary_token`` 的实现）
+
+        凭证明文只在新办时回复一次，插件只存 SHA-256 哈希；回复不走 _say——
+        凭证必须逐字符原样送达，不能过 LLM 改写。
+        """
+        if not self._should_respond(event):
+            return
+        if event.get_group_id():
+            yield event.plain_result(
+                await self._say(
+                    event.unified_msg_origin,
+                    "🔑 凭证管理只能私聊操作哦。",
+                    "用户在群里想管理日记写入凭证。请用你自己的口吻委婉拒绝："
+                    "凭证是私密信息，请他来私聊操作。",
+                )
+            )
+            return
+        sender_id = event.get_sender_id()
+        tokens = self._strip_invisible(event.message_str or "").strip().split()
+        parts = tokens[1:]
+
+        usage = (
+            "🔑 写入凭证用法：\n"
+            "· /日记凭证 新办 来源标识 —— 给本地程序新办一枚写入凭证\n"
+            "· /日记凭证 列表 —— 查看你的凭证（不含凭证本体）\n"
+            "· /日记凭证 吊销 序号 —— 吊销列表里对应序号的凭证\n"
+            "（来源标识用小写字母/数字/下划线/连字符，如 dsh；"
+            "凭证只在新办时显示一次，请立即抄收）"
+        )
+        if not parts:
+            yield event.plain_result(usage)
+            return
+
+        action = parts[0]
+        if action == "新办" and len(parts) == 2:
+            source = parts[1].strip()
+            if not self._EXT_SOURCE_RE.match(source):
+                yield event.plain_result(
+                    "🔑 来源标识要用小写字母/数字/下划线/连字符，1~32 位，例如 dsh。"
+                )
+                return
+            mine = [
+                t for t in self.list_external_tokens(sender_id) if t["enabled"]
+            ]
+            if len(mine) >= self.EXTERNAL_TOKENS_MAX_PER_OWNER:
+                yield event.plain_result(
+                    f"🔑 你已有 {len(mine)} 枚在用凭证（上限 "
+                    f"{self.EXTERNAL_TOKENS_MAX_PER_OWNER}），先吊销不用的再新办。"
+                )
+                return
+            token = self.create_external_token(sender_id, source)
+            if token is None:
+                yield event.plain_result(
+                    "🔑 新办失败（数据目录不可写），凭证未生成。"
+                )
+                return
+            yield event.plain_result(
+                "🔑 写入凭证已新办（只显示这一次，请立即抄收）：\n"
+                f"{token}\n\n"
+                f"· 绑定来源：{source}\n"
+                "· 调用方同时需要 AstrBot 面板的 API key（plugin 权限），"
+                "详见 README「外部写入 API」章节\n"
+                "· 泄露了就用 /日记凭证 列表 + 吊销 处理"
+            )
+            logger.info(
+                f"[memory_diary] 用户 {sender_id} 新办了外部写入凭证（来源 {source}）"
+            )
+            return
+
+        if action == "列表" and len(parts) == 1:
+            mine = self.list_external_tokens(sender_id)
+            if not mine:
+                yield event.plain_result(
+                    "🔑 你还没有写入凭证。用 /日记凭证 新办 来源标识 办一枚。"
+                )
+                return
+            lines = ["🔑 你的写入凭证："]
+            for i, t in enumerate(mine, 1):
+                state = "在用" if t["enabled"] else "已吊销"
+                lines.append(
+                    f"{i}. 来源 {t['source']}（{state}，办于 {t['created_at']}）"
+                )
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if action == "吊销" and len(parts) == 2 and parts[1].isdigit():
+            if self.revoke_external_token(sender_id, int(parts[1])):
+                yield event.plain_result(f"🔑 第 {parts[1]} 号凭证已吊销。")
+                logger.info(
+                    f"[memory_diary] 用户 {sender_id} 吊销了第 {parts[1]} 号写入凭证"
+                )
+            else:
+                yield event.plain_result(
+                    "🔑 没有这个序号，先用 /日记凭证 列表 确认一下。"
+                )
+            return
+
+        logger.warning(
+            f"[memory_diary] 无法识别的日记凭证参数，原始消息："
+            f"{(event.message_str or '')!r}"
+        )
+        yield event.plain_result(usage)
+
     async def _handle_diary_status(self, event: AstrMessageEvent):
         """查看当前上下文占用、日记更新时间和哨兵状态。（``main.diary_status`` 的实现）"""
         if not self._should_respond(event):
