@@ -1,0 +1,131 @@
+name: 🐛 问题反馈
+description: 插件出现异常行为或报错，请通过本表单反馈
+title: "【Bug】"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈「记忆日记」插件的问题！请尽量完整填写以下信息，方便快速定位问题。
+
+        ⚠️ **注意脱敏**：粘贴日志、截图或配置时，请勿包含 token / 密钥 / 完整 QQ 号等敏感信息。
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 发生了什么？和你预期的行为有什么差别？
+      placeholder: 例：发送 /写日记 后机器人无响应，日记也没有生成……
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 请按顺序列出触发问题的操作步骤
+      placeholder: |
+        1. 打开 QQ，向机器人发送……
+        2. 等待自动写日记触发……
+        3. 观察到……
+      render: markdown
+    validations:
+      required: false
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+      description: 正常情况下应该发生什么？
+      placeholder: 例：机器人应回复「日记已生成」并在日记本中新增一篇日记
+    validations:
+      required: false
+  - type: input
+    id: occur_time
+    attributes:
+      label: 问题发生时间
+      description: 问题大概什么时候出现的？（精确到日期或时刻均可，例如 2026-10-28 晚上、持续多日）
+      placeholder: 例：2026-10-28 21:30 左右
+    validations:
+      required: false
+  - type: input
+    id: astrbot_version
+    attributes:
+      label: AstrBot 版本
+      description: 你使用的 AstrBot 版本号（本插件要求 AstrBot >= 4.0.0 且 < 5.0.0，当前测试版本 4.29.3）
+      placeholder: 例：4.29.3
+    validations:
+      required: true
+  - type: input
+    id: plugin_version
+    attributes:
+      label: 插件版本
+      description: 可在 AstrBot WebUI 插件管理中查看，或查看插件目录下 metadata.yaml 中的 version
+      placeholder: 例：v0.5.3
+    validations:
+      required: true
+  - type: dropdown
+    id: deploy_env
+    attributes:
+      label: 部署环境
+      description: 你的 AstrBot 运行在哪里？如涉及云端导出，请同时注明 AstrBot 与 NapCat 是否在同一台机器 / 是否共享数据卷
+      options:
+        - 本机部署（Windows / macOS / Linux 桌面）
+        - 云服务器部署，AstrBot 与 NapCat 同机
+        - 云服务器部署，AstrBot 与 NapCat 不同机（跨机 / 跨容器，未共享数据卷）
+        - 云服务器部署，AstrBot 与 NapCat 不同机但共享数据卷
+        - 其他 / 不确定
+      default: 0
+    validations:
+      required: false
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 消息平台 / 协议端
+      description: 你通过什么协议端接入 QQ？
+      options:
+        - NapCat
+        - llonebot
+        - 其他 aiocqhttp 协议端
+        - 其他平台（非 QQ）
+        - 不确定
+      default: 0
+    validations:
+      required: false
+  - type: dropdown
+    id: module
+    attributes:
+      label: 问题涉及的功能模块
+      description: 问题主要和哪个功能有关？
+      options:
+        - 聊天指令（/写日记、/导出日记、/导入日记 等 13 条指令）
+        - 自动写日记（定时生成）
+        - WebUI 日记本视图
+        - 日记导入 / 导出（zip、HMAC 验签）
+        - 其他
+      default: 0
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: 报错日志（如果有）
+      description: 请粘贴 AstrBot 日志（控制台或 WebUI 日志页）中与 [memory_diary] 相关的报错片段。**注意脱敏：不要粘贴 token / 密钥 / 完整 QQ 号等敏感信息。**
+      placeholder: 粘贴相关日志片段……
+      render: text
+    validations:
+      required: false
+  - type: input
+    id: contact
+    attributes:
+      label: 联系方式（可选）
+      description: 如需进一步沟通可以留下 QQ 或其他联系方式；注意 issue 内容公开可见，介意请留空
+      placeholder: 可留空
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已确认日志和描述中不包含 token、密钥、完整 QQ 号等敏感信息
+          required: true
+        - label: 我已搜索现有 issues，没有重复的问题反馈
+          required: false

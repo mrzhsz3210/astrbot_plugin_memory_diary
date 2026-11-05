@@ -1,0 +1,49 @@
+name: 🤝 共建者招募
+description: 认领岗位 / 报名共建，欢迎一起把「记忆日记」做得更好
+title: "【共建者招募】"
+labels: ["recruitment"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你愿意参与「记忆日记」的共建！请按以下格式填写报名信息。
+
+        ⚠️ **请注意**：GitHub 的 issue 内容**公开可见**，无法设置为仅作者可见；如介意联系方式公开，可以只留邮箱。
+  - type: input
+    id: role
+    attributes:
+      label: 想认领的岗位
+      description: 📄 文档内容（README 瘦身、使用教程、官网文案、视频简介） / 🧪 环境测试（在真实 AstrBot 环境跑新版本和 PR，做回归）——详见 README「共建者招募」一节
+      placeholder: 例：环境测试
+    validations:
+      required: true
+  - type: input
+    id: background
+    attributes:
+      label: 相关背景（一句话）
+      placeholder: 例：写过一年 Python，用过 AstrBot
+    validations:
+      required: true
+  - type: input
+    id: weekly_time
+    attributes:
+      label: 预计每周可投入时间
+      placeholder: 例：3~5 小时
+    validations:
+      required: true
+  - type: input
+    id: contact
+    attributes:
+      label: 联系方式
+      description: QQ / 邮箱均可，方便作者与你进一步沟通；issue 内容公开可见，介意的话请只留邮箱
+      placeholder: 例：邮箱 example@xxx.com
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: 认领前必答：你觉得这个插件最该改的一个地方是什么？
+      description: 没有标准答案，想听听你的真实想法
+      placeholder: 例：我觉得 README 太长，新用户找不到重点……
+    validations:
+      required: true

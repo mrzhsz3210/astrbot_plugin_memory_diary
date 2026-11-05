@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本地数据（插件运行后生成的日记数据绝不应进仓库）
+*.zip
+.diary_key
+diary_*
+pref_*
+
+# 测试运行时 AstrBot 导入生成的默认数据目录（默认配置、t2i 模板）
+/data/
