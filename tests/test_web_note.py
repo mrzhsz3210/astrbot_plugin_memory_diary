@@ -432,3 +432,50 @@ async def test_diary_token_command_flow():
             "text": "x", "ext_id": "cmd-2",
         })
         assert r["status"] == 401, r
+
+
+# ------------------------- 来源显示名 -------------------------
+
+
+async def test_note_source_display_name_override():
+    """配置的 external_source_display 只改分隔条展示名，provenance 仍记机器标识。"""
+    async with World(config={"external_source_display": "dsh=零陵香"}) as world:
+        plugin = world.refactor.plugin
+        token = _make_token(plugin)
+        r = await _post(plugin, {
+            "token": token, "source": "dsh", "day": TODAY,
+            "text": "她那边记了一条重要的事", "ext_id": "disp-1",
+        })
+        assert r["status"] == 200, r
+        content = _read_day(plugin, TODAY)
+        assert "（外部·零陵香）" in content, content
+        assert "（外部·dsh）" not in content, content
+        prov, status = plugin.load_provenance(SENDER)
+        assert status == "ok", status
+        recs = prov["entries"]["20261023.md"]["external"]
+        assert recs[-1]["source"] == "dsh", recs
+
+
+async def test_note_source_display_name_fallback_and_malformed():
+    """未配置 / 配置格式坏时回退原始 source 标识。"""
+    async with World() as world:
+        plugin = world.refactor.plugin
+        token = _make_token(plugin)
+        r = await _post(plugin, {
+            "token": token, "source": "dsh", "day": TODAY,
+            "text": "默认显示名", "ext_id": "disp-2",
+        })
+        assert r["status"] == 200, r
+        content = _read_day(plugin, TODAY)
+        assert "（外部·dsh）" in content, content
+
+    async with World(config={"external_source_display": "=无键对;dsh= ;app2=茴香"}) as world:
+        plugin = world.refactor.plugin
+        token = _make_token(plugin)
+        r = await _post(plugin, {
+            "token": token, "source": "dsh", "day": TODAY,
+            "text": "坏配置回退", "ext_id": "disp-3",
+        })
+        assert r["status"] == 200, r
+        content = _read_day(plugin, TODAY)
+        assert "（外部·dsh）" in content, content

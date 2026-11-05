@@ -7,6 +7,7 @@
 ### 新增
 - **外部写入 API（issue #3 关联）**：新增 Web 端点 `POST /api/v1/plugins/extensions/astrbot_plugin_memory_diary/note`，双闸鉴权（AstrBot API key 的 plugin 权限 + 插件侧 token，token 只存 SHA-256 哈希于 `external_write_tokens.json`）；凭证以 `〔外部凭证〕` 字段进入日记正文、与日记 zip 原子重写落盘，`provenance.json` 的 external 记录保证幂等（同一 ext_id 重复提交不产生重复段落）。上限 8 KB、不允许未来日期、ext_id 限 64 字符可打印 ASCII，每 token 每分钟 20 次限流（429）。场景分析与方案设计来自 @Sil-Future；README「已有贡献」名单同时收录 @puppe110（issue #2）。
 - **`/日记凭证` 指令**（管理员）：QQ 侧手工登记日记凭证，与外部写入同一管线、同样幂等（QQ 私聊 `/日记凭证 新办 <来源标识>` 可办理写入 token）。
+- **外部来源显示名**（配置 `external_source_display`，如 `dsh=零陵香`）：外部写入分隔条「（外部·来源）」中的来源可映射为自定义显示名，多条英文分号分隔；只改展示文字，provenance 仍记机器来源标识，验签、幂等、审计不受影响。
 - **存储接口稳定性承诺**（docs/README §13.6）：承诺 `memory_diary/storage.py` 的 `replace_day_entry`（zip 内单日记段落替换）在 v0.x 系列内保持签名与语义稳定；明确不承诺 zip 写入侧契约。
 
 ### 修复

@@ -82,6 +82,23 @@ class WebNoteApiMixin:
         bucket.append(now)
         return True
 
+    def _ext_display_name(self, source: str) -> str:
+        """来源显示名：读配置 `external_source_display`（`来源标识=显示名`，多条英文分号分隔）。
+
+        只影响分隔条的展示文字；provenance 里记录的仍是机器来源标识，验签、
+        幂等、审计全不受影响。配置缺项、格式错误或查不到时回退原始 source。
+        """
+        raw = str(self.config.get("external_source_display", "") or "")
+        mapping: dict[str, str] = {}
+        for part in raw.split(";"):
+            if "=" not in part:
+                continue
+            key, _, value = part.partition("=")
+            key, value = key.strip(), value.strip()
+            if key and value:
+                mapping[key] = value
+        return mapping.get(source, source)
+
     # ------------------------- 端点 -------------------------
 
     async def web_external_note(self):
@@ -189,7 +206,7 @@ class WebNoteApiMixin:
                     text,
                     sender_name=nick or "",
                     entry_name_hint=day,
-                    separator_note=f"（外部·{source}）",
+                    separator_note=f"（外部·{self._ext_display_name(source)}）",
                     origin="",
                     mode="",
                     provenance_mutator=_mut,

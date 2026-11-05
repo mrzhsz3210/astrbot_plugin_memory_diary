@@ -1089,7 +1089,7 @@ _CONF_README_ORDER = [
     # 10.10 限额与防护
     "diary_op_interval",
     # 10.11 界面
-    "web_diary_brand",
+    "web_diary_brand", "external_source_display",
     # 10.12 插图配置与形象档案（v0.6，顺序与 README bullet 一致）
     "image_enabled", "image_mode", "image_local_url", "image_api_base",
     "image_api_key", "image_model", "image_size_preset",
@@ -1133,6 +1133,7 @@ _CONF_LABEL_PREFIXES = [
     ("日记操作间隔", "diary_op_interval"),
     ("（已废弃）启用上下文哨兵", "enable_context_watch"),
     ("日记本页面的称呼", "web_diary_brand"),
+    ("外部来源显示名", "external_source_display"),
     ("日记时区", "diary_timezone"),
     # 10.12 插图配置与形象档案（v0.6）
     ("插图功能总开关", "image_enabled"),
