@@ -6,6 +6,10 @@
   其余章节刻意从简，完整文档以官网为准。
 -->
 
+<p align="center">
+  <a href="https://github.com/mrzhsz3210/astrbot_plugin_memory_diary/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/mrzhsz3210/astrbot_plugin_memory_diary/actions/workflows/ci.yml/badge.svg"></a>
+</p>
+
 <h1 align="center">致下一个失忆的自己</h1>
 
 <p align="center">记忆日记（astrbot_plugin_memory_diary）· AstrBot 插件</p>
@@ -20,8 +24,7 @@
 > 📖 **完整文档**（写作模式、指令列表、配置项逐项说明、存储与备份、故障恢复……）见官方网站：
 > [astrbotmemorydiary.ok.kimi.link](https://astrbotmemorydiary.ok.kimi.link)。
 
-> 📝 **用户调研**：如果你用过「记忆日记」，欢迎填一下[这份问卷](https://v.wjx.cn/vm/YDNYun0.aspx#)（约 4–5 分钟）。
-> 想了解真实使用体验、最痛的地方和下一版最该改什么；匿名为主、联系方式选填，不收集聊天记录、日记内容或配置，结果只做汇总。
+> 📝 **用户调研**：如果你用过「记忆日记」，欢迎填一下[这份问卷](https://v.wjx.cn/vm/YDNYun0.aspx#)（约 4–5 分钟）。想了解真实使用体验、最痛的地方和下一版最该改什么；匿名为主、联系方式选填，不收集聊天记录、日记内容或配置，结果只做汇总。
 
 ## 🤝 共建者招募
 
