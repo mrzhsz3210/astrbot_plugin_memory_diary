@@ -241,9 +241,16 @@ class TransferCommandsMixin:
                 controller.keep(timeout=120, reset_timeout=True)
                 return
 
+            # P2-1：QQ 侧同样先看压缩包本身体积，超大直接拒（解压在 _verify_bundle
+            # 里还有解压后总量/压缩比双闸）
             try:
-                owner_id, key, entries, images, annotations = self._verify_bundle(
-                    Path(downloaded)
+                if Path(downloaded).stat().st_size > 32 * 1024 * 1024:
+                    raise ValueError("迁移包文件超过 32MB 上限，已拒绝导入")
+            except FileNotFoundError:
+                pass
+            try:
+                owner_id, key, entries, images, annotations, provenance = (
+                    self._verify_bundle(Path(downloaded))
                 )
                 sender_name = ""
                 try:
@@ -253,6 +260,7 @@ class TransferCommandsMixin:
                 mode = self._install_bundle(
                     ev.get_sender_id(), owner_id, key, entries, sender_name,
                     images=images, annotations=annotations,
+                    provenance=provenance,
                 )
                 n_days = len(entries)
                 if mode == "same_key":

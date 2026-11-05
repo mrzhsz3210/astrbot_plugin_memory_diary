@@ -265,11 +265,15 @@ class WebDiaryApiMixin:
             return _web_error("没有收到文件", status_code=400)
         tmp = self.data_dir / f"import_tmp_{secrets.token_hex(4)}.zip"
         try:
-            await upload.save(tmp)
-            owner_id, key, entries, images, annotations = self._verify_bundle(tmp)
+            # P2-1：上传本体限 32MB（压缩态）；解压后总量/压缩比双闸在
+            # _verify_bundle 里，zip bomb 在校验前不会整体进内存
+            await upload.save(tmp, max_bytes=32 * 1024 * 1024)
+            owner_id, key, entries, images, annotations, provenance = (
+                self._verify_bundle(tmp)
+            )
             mode = self._install_bundle(
                 owner_id, owner_id, key, entries, check_owner=False,
-                images=images, annotations=annotations,
+                images=images, annotations=annotations, provenance=provenance,
             )
             logger.info(
                 f"[memory_diary] Web 页面导入迁移包成功："

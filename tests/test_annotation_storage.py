@@ -419,7 +419,7 @@ async def test_annotations_for_day_sorted_and_deep_copied():
 
 
 # ---------------------------------------------------------------------------
-# 迁移包：_verify_bundle 5 元组 / 篡改拒绝 / 旧包兼容 / 安装重签
+# 迁移包：_verify_bundle 6 元组 / 篡改拒绝 / 旧包兼容 / 安装重签
 # ---------------------------------------------------------------------------
 
 
@@ -430,11 +430,11 @@ async def test_verify_bundle_returns_five_tuple_with_annotations():
         bundle = make_bundle(plugin)
         try:
             result = plugin._verify_bundle(bundle)
-            assert isinstance(result, tuple) and len(result) == 5, (
-                f"_verify_bundle 应返回 5 元组 "
-                f"(owner, key, entries, images, annotations)，实际 {result!r}"
+            assert isinstance(result, tuple) and len(result) == 6, (
+                f"_verify_bundle 应返回 6 元组 "
+                f"(owner, key, entries, images, annotations, provenance)，实际 {result!r}"
             )
-            owner, user_key, entries, images, annotations = result
+            owner, user_key, entries, images, annotations, provenance = result
             assert owner == SENDER
             assert images == {}, f"没有插图的迁移包 images 应为空 dict，实际 {images!r}"
             assert isinstance(annotations, dict), "迁移包内的批注应是规范 dict"
@@ -491,7 +491,7 @@ async def test_verify_bundle_old_package_without_annotations_is_none():
             SENDER, plugin._diary_path(SENDER), plugin._list_entries(SENDER)
         )
         try:
-            owner, user_key, entries, images, annotations = plugin._verify_bundle(bundle)
+            owner, user_key, entries, images, annotations, _prov = plugin._verify_bundle(bundle)
             assert owner == SENDER
             assert annotations is None, (
                 f"旧包（无 annotations.json）第 5 项应为 None，实际 {annotations!r}"
@@ -507,7 +507,7 @@ async def test_install_bundle_resigns_annotations_with_local_key():
         seed_annotations(src_plugin)
         bundle = make_bundle(src_plugin)
         try:
-            _owner, user_key, entries, images, annotations = src_plugin._verify_bundle(
+            _owner, user_key, entries, images, annotations, _prov = src_plugin._verify_bundle(
                 bundle
             )
             dst_plugin = _plugin(dst_world)
@@ -543,7 +543,7 @@ async def test_install_bundle_without_annotations_writes_no_sidecar():
             SENDER, src_plugin._diary_path(SENDER), src_plugin._list_entries(SENDER)
         )
         try:
-            _owner, user_key, entries, images, annotations = src_plugin._verify_bundle(
+            _owner, user_key, entries, images, annotations, _prov = src_plugin._verify_bundle(
                 bundle
             )
             assert annotations is None

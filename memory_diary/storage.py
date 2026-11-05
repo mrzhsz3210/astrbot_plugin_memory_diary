@@ -88,6 +88,10 @@ class StorageMixin:
     PROVENANCE_MAX_EXTERNAL_PER_ENTRY = 100   # 单日最多记多少条外部写入
     PROVENANCE_MAX_EXTERNAL_TOTAL = 2000      # 全 zip 外部写入记录总上限
 
+    # P2-20：单用户 zip 内插图字节总量上限（整包重写是 O(包大小) 的内存/耗时，
+    # 不封顶的话长期使用会把写日记的同步 IO 拖垮小内存机器）
+    IMAGES_TOTAL_MAX_BYTES = 256 * 1024 * 1024
+
     # 外部写入 API（v0.6.2，issue #3）的请求形状上限
     EXTERNAL_NOTE_MAX_BYTES = 8192   # 单条 text 的 UTF-8 字节上限（8 KB）
     EXTERNAL_EXT_ID_MAX = 64         # ext_id 长度上限（可打印 ASCII）
@@ -493,12 +497,41 @@ class StorageMixin:
                 path,
                 {self.README_ZIP_ENTRY: self._readme_text(sender_id, "").encode("utf-8")},
             )
-        with zipfile.ZipFile(path, "a", zipfile.ZIP_DEFLATED) as z:
-            z.writestr(self._image_entry(name), data)
-            z.writestr(
-                self._image_sig_entry(name),
-                self._image_sig(sender_id, name, data).encode("utf-8"),
+        # 审查 P1-3/P2-14：插图也走原子重写（读全包→临时文件→自验→os.replace）。
+        # 旧的 zipfile "a" 追加模式在中断/磁盘满时会覆盖中央目录，整份日记变
+        # BadZipFile；且对已损坏的 zip 会"忽略旧内容从 EOF 追加"，把坏包改写成
+        # 只含插图的合法包，绕过 .corrupt 隔离——旧日记无声消失。
+        data_dict: dict = {}
+        if path.exists():
+            try:
+                with zipfile.ZipFile(path) as z:
+                    bad = z.testzip()
+                    if bad is not None:
+                        raise zipfile.BadZipFile(f"CRC 校验失败: {bad}")
+                    data_dict = {n: z.read(n) for n in z.namelist()}
+            except zipfile.BadZipFile:
+                self._quarantine_corrupt(path)
+                raise DiaryCorruptError(
+                    "日记 zip 已损坏，插图未写入，已隔离为 .corrupt 副本"
+                )
+            except DiaryCorruptError:
+                raise
+            except Exception as e:
+                logger.warning(f"[memory_diary] 读取日记 zip 失败，插图未写入: {e}")
+                return ""
+        # P2-20：单用户插图总量上限，防"整包读进内存重写"随使用时间线性恶化
+        total_img = sum(len(b) for n, b in data_dict.items() if n.startswith("images/"))
+        if total_img + len(data) > self.IMAGES_TOTAL_MAX_BYTES:
+            raise ValueError(
+                f"插图总量超过 {self.IMAGES_TOTAL_MAX_BYTES // (1024 * 1024)}MB 上限，"
+                "请先删除旧日记中的插图"
             )
+        out = dict(data_dict)
+        out[self._image_entry(name)] = data
+        out[self._image_sig_entry(name)] = self._image_sig(
+            sender_id, name, data
+        ).encode("utf-8")
+        self._write_zip_atomic(path, out)
         logger.info(
             f"[memory_diary] 用户 {sender_id} 的插图已写入 zip：{name}"
             f"（{len(data)} 字节）"
@@ -2345,12 +2378,42 @@ class StorageMixin:
             "· 本包仍含你的签名钥匙，拿到它的人能伪造你这份日记的签名，请勿转发。\n"
             "· 必须在两台设备上使用同一个 QQ 号与 bot 对话——签名绑定了你的 QQ 号。\n"
         )
+    # 迁移包解压上限（P2-1，zip bomb 防护）：校验前任何条目都不得整体读入内存
+    BUNDLE_MAX_TOTAL_BYTES = 64 * 1024 * 1024   # 解压后总字节上限
+    BUNDLE_MAX_ENTRY_BYTES = 64 * 1024 * 1024    # 单条目解压后上限
+    BUNDLE_MAX_ENTRIES = 10000                   # 条目数上限
+    BUNDLE_MAX_RATIO = 200                       # 单条目解压/压缩比上限（文本约 5~10x）
+
+    @classmethod
+    def _check_zip_limits(cls, zf, what: str):
+        """校验 zip 的条目数/单条目大小/总解压大小/压缩比，超限抛 ValueError。
+
+        在校验阶段之前调用——zip bomb 的危害就是"校验时整体解压"这一步。
+        """
+        infos = zf.infolist()
+        if len(infos) > cls.BUNDLE_MAX_ENTRIES:
+            raise ValueError(f"{what}条目数超过上限（{cls.BUNDLE_MAX_ENTRIES}），已拒绝")
+        total = 0
+        for i in infos:
+            total += i.file_size
+            if i.file_size > cls.BUNDLE_MAX_ENTRY_BYTES:
+                raise ValueError(
+                    f"{what}存在超过 {cls.BUNDLE_MAX_ENTRY_BYTES // (1024 * 1024)}MB 的条目，已拒绝"
+                )
+            if i.compress_size > 16 and i.file_size > i.compress_size * cls.BUNDLE_MAX_RATIO:
+                raise ValueError(f"{what}压缩比异常（疑似 zip bomb），已拒绝")
+        if total > cls.BUNDLE_MAX_TOTAL_BYTES:
+            raise ValueError(
+                f"{what}解压后总量超过 {cls.BUNDLE_MAX_TOTAL_BYTES // (1024 * 1024)}MB 上限，已拒绝"
+            )
+
     def _verify_bundle(self, bundle_path: Path):
         """解析并校验迁移包。返回
         (主人QQ, 该用户的派生钥匙bytes, {日记条目名: 内容}, {图片条目名: bytes},
-         批注规范 dict 或 None)；
+         批注规范 dict 或 None, 来源侧车原始 bytes 或 None)；
         不可信即抛 ValueError。旧包没有 images/ 时第 4 项为 {}；
-        旧包没有 annotations.json 时第 5 项为 None（向后兼容）。
+        旧包没有 annotations.json 时第 5 项为 None（向后兼容）；
+        旧包没有 provenance.json 时第 6 项为 None（v0.6.2 起随包迁移，幂等索引不丢）。
 
         两种格式：
         - memory-diary-export/2（现行）：user_key.txt 是主人这把派生钥匙（hex），
@@ -2362,6 +2425,7 @@ class StorageMixin:
         这里再加 HMAC 防"换图不换文"）；批注文件同样整体验签（设计第二部分第 4 节）。
         """
         with zipfile.ZipFile(bundle_path) as z:
+            self._check_zip_limits(z, "迁移包")
             bad = z.testzip()
             if bad is not None:
                 raise ValueError(f"迁移包有损坏（条目 {bad} CRC 校验失败）")
@@ -2405,7 +2469,9 @@ class StorageMixin:
         entries = {}
         images = {}
         annotations = None
+        provenance = None
         with zipfile.ZipFile(io.BytesIO(diary_bytes)) as dz:
+            self._check_zip_limits(dz, "迁移包里的日记文件")
             bad = dz.testzip()
             if bad is not None:
                 raise ValueError(f"迁移包里的日记文件有损坏（条目 {bad} CRC 校验失败）")
@@ -2437,8 +2503,37 @@ class StorageMixin:
                     )
                 except Exception:
                     raise ValueError("批注文件无法解析，迁移包可能被改动过")
+            # 来源侧车（P2-2）：与批注同口径验签——包内有就必须有签名且验签通过，
+            # 否则按篡改拒绝整个迁移包；通过则原样带回，安装时换本机钥匙重签，
+            # 换机后幂等索引与 <self> 来源记录不丢。
+            if self.PROVENANCE_ENTRY in dnames:
+                praw = dz.read(self.PROVENANCE_ENTRY)
+                if self.PROVENANCE_SIG_ENTRY not in dnames:
+                    raise ValueError("来源侧车缺少签名，迁移包可能被改动过")
+                pactual = (
+                    dz.read(self.PROVENANCE_SIG_ENTRY)
+                    .decode("utf-8", "ignore")
+                    .strip()
+                )
+                pexpected = hmac.new(
+                    sign_key,
+                    owner_id.encode("utf-8")
+                    + b"\n"
+                    + self.PROVENANCE_ENTRY.encode("utf-8")
+                    + b"\n"
+                    + praw,
+                    hashlib.sha256,
+                ).hexdigest()
+                if not hmac.compare_digest(pexpected, pactual):
+                    raise ValueError("来源侧车验签失败，迁移包可能被改动过")
+                provenance = praw
             for n in sorted(dnames):
-                if n in (self.ANNOTATIONS_ENTRY, self.ANNOTATIONS_SIG_ENTRY):
+                if n in (
+                    self.ANNOTATIONS_ENTRY,
+                    self.ANNOTATIONS_SIG_ENTRY,
+                    self.PROVENANCE_ENTRY,
+                    self.PROVENANCE_SIG_ENTRY,
+                ):
                     continue
                 if self.IMAGE_NAME_RE.match(n):
                     sig_name = self._image_sig_entry(n)
@@ -2485,12 +2580,12 @@ class StorageMixin:
                 entries[n] = content
         if not entries:
             raise ValueError("迁移包里没有任何日记")
-        return owner_id, user_key, entries, images, annotations
+        return owner_id, user_key, entries, images, annotations, provenance
 
     def _install_bundle(self, sender_id: str, owner_id: str, user_key: bytes,
                         entries: dict, sender_name: str = "",
                         check_owner: bool = True, images: dict = None,
-                        annotations: dict = None) -> str:
+                        annotations: dict = None, provenance: bytes = None) -> str:
         """把验签通过的迁移包安放到位。返回模式：same_key / resign（仅作提示用）。
 
         现行机制不再收养主密钥：日记一律用本机派生的主人钥匙重新签名。
@@ -2542,6 +2637,13 @@ class StorageMixin:
             out[self.ANNOTATIONS_ENTRY] = ann_raw
             out[self.ANNOTATIONS_SIG_ENTRY] = self._annotations_sig(
                 sender_id, ann_raw
+            ).encode("utf-8")
+        if provenance:
+            # P2-2：来源侧车原样带回、用本机钥匙重签——幂等索引与 <self>
+            # 记录换机后不丢，外部客户端重放旧 ext_id 不会产生重复段落。
+            out[self.PROVENANCE_ENTRY] = provenance
+            out[self.PROVENANCE_SIG_ENTRY] = self._provenance_sig(
+                sender_id, provenance
             ).encode("utf-8")
         self._write_zip_atomic(target, out)
         return mode

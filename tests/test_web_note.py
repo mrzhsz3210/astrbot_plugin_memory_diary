@@ -600,3 +600,45 @@ async def test_note_display_name_sanitized_against_separator_forgery():
         content = _read_day(plugin, TODAY)
         assert "（外部·坏名x" in content, content
         assert "坏——名" not in content
+
+
+async def test_bundle_roundtrip_preserves_provenance_idempotency():
+    """P2-2：迁移包携带 provenance.json——换机后旧 ext_id 重放返回
+    replayed 且不重复追加段落（幂等索引随包迁移）。"""
+    async with World() as src_world, World() as dst_world:
+        src = src_world.refactor.plugin
+        token = _make_token(src)
+        r = await _post(src, {
+            "token": token, "source": "dsh", "day": TODAY,
+            "text": "跨机记忆", "ext_id": "mig-1",
+        })
+        assert r["status"] == 200, r
+        bundle = src._build_export_bundle(
+            SENDER, src._diary_path(SENDER), src._list_entries(SENDER)
+        )
+        try:
+            dst = dst_world.refactor.plugin
+            owner, key, entries, images, annotations, provenance = (
+                dst._verify_bundle(bundle)
+            )
+            assert provenance is not None, (
+                "有种过外部写入的迁移包必须带回来源侧车（第 6 项）"
+            )
+            dst._install_bundle(
+                SENDER, owner, key, entries, provenance=provenance
+            )
+            token2 = _make_token(dst)
+            r2 = await _post(dst, {
+                "token": token2, "source": "dsh", "day": TODAY,
+                "text": "跨机记忆", "ext_id": "mig-1",
+            })
+            assert r2["status"] == 200, r2
+            assert r2["body"].get("replayed") is True, (
+                f"换机后重放旧 ext_id 应返回 replayed，实际 {r2['body']}"
+            )
+            content, _, _ = dst._load_latest(SENDER)
+            assert content.count("跨机记忆") == 1, (
+                f"换机后重放不得重复追加：\n{content}"
+            )
+        finally:
+            bundle.unlink(missing_ok=True)
