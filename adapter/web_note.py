@@ -95,6 +95,9 @@ class WebNoteApiMixin:
                 continue
             key, _, value = part.partition("=")
             key, value = key.strip(), value.strip()
+            # 显示名会写进日记分隔条（审查 P3-1）：剔除换行与分隔条语法字符，
+            # 防止配置值伪造「—— …… ——」行或拆断注入结构；截断到 16 字符。
+            value = re.sub(r"[\r\n—─–‒()（）【】]", "", value)[:16]
             if key and value:
                 mapping[key] = value
         return mapping.get(source, source)
@@ -150,6 +153,8 @@ class WebNoteApiMixin:
                 413,
             )
         ext_id = payload.get("ext_id")
+        if isinstance(ext_id, str):
+            ext_id = ext_id.strip()
         if not isinstance(ext_id, str) or not self._EXT_ID_RE.match(ext_id):
             return self._note_err(
                 "BAD_REQUEST",

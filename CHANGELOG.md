@@ -5,13 +5,18 @@
 ## [v0.6.2] - 2026-11-05
 
 ### 新增
-- **外部写入 API（issue #3 关联）**：新增 Web 端点 `POST /api/v1/plugins/extensions/astrbot_plugin_memory_diary/note`，双闸鉴权（AstrBot API key 的 plugin 权限 + 插件侧 token，token 只存 SHA-256 哈希于 `external_write_tokens.json`）；凭证以 `〔外部凭证〕` 字段进入日记正文、与日记 zip 原子重写落盘，`provenance.json` 的 external 记录保证幂等（同一 ext_id 重复提交不产生重复段落）。上限 8 KB、不允许未来日期、ext_id 限 64 字符可打印 ASCII，每 token 每分钟 20 次限流（429）。场景分析与方案设计来自 @Sil-Future；README「已有贡献」名单同时收录 @puppe110（issue #2）。
+- **外部写入 API（issue #3 关联）**：新增 Web 端点 `POST /api/v1/plugins/extensions/astrbot_plugin_memory_diary/note`，双闸鉴权（AstrBot API key 的 plugin 权限 + 插件侧 token，token 只存 SHA-256 哈希于 `external_write_tokens.json`）；内容以「（外部·来源）」分隔条段落追加进当天日记正文、与日记 zip 原子重写落盘，`provenance.json` 的 external 记录保证幂等（同一 ext_id 重复提交不产生重复段落）。上限 8 KB、不允许未来日期、ext_id 限 64 字符可打印 ASCII，每 token 每分钟 20 次限流（429）。场景分析与方案设计来自 @Sil-Future；README「已有贡献」名单同时收录 @puppe110（issue #2）。
 - **`/日记凭证` 指令**：QQ 私聊管理外部写入凭证——`新办 <来源标识>`（凭证本体只显示一次）/ `列表`（不含凭证本体）/ `吊销 <序号>`；凭证只存 SHA-256 哈希于 `external_write_tokens.json`。
 - **外部来源显示名**（配置 `external_source_display`，如 `dsh=零陵香`）：外部写入分隔条「（外部·来源）」中的来源可映射为自定义显示名，多条英文分号分隔；只改展示文字，provenance 仍记机器来源标识，验签、幂等、审计不受影响。
-- **存储接口稳定性承诺**（docs/README §13.6）：承诺 `memory_diary/storage.py` 的 `replace_day_entry`（zip 内单日记段落替换）在 v0.x 系列内保持签名与语义稳定；明确不承诺 zip 写入侧契约。
+- **存储接口稳定性承诺**（docs/README §13.6）：承诺 zip 文件名派生规则（HMAC 文件名与旧 MD5 命名的回退迁移）与 zip 读取侧布局（`diaries/`、`sigs/`、`provenance.json`、`images/`、`说明.txt`）在 v0.x 系列内稳定；明确不承诺 zip 写入侧契约——外部写入生态建立在 HTTP API 契约之上。
 
 ### 修复
 - **合入 v0.6.1.1 hotfix1**（手机端窄屏批量删除修复）：v0.6.1 的批量删除复选框在窄屏下被 `display: none` 隐藏，hotfix1 把窄屏目录改为左侧抽屉修复；v0.6.2 完整合入该修复，hotfix1 用户无感升级。
+- **外部写入幂等窗口超限丢错方向**（代码审查 v0.6.2 P1-1）：幂等 external 记录满 100 条时原先保留最早的 100 条、丢弃最新，导致刚写入的 ext_id 立即失效、重试重复追加；改为保留最近 100 条。
+- **外部写入路径未先迁移旧格式**（代码审查 v0.6.2 P1-2）：外部写入 API 不经过读取侧的迁移触发点，旧格式（v1 明文 / v2 单篇 zip / v3 按篇）日记会被"只认现行条目名"的整包重写静默丢弃；写入前统一触发迁移，旧日记验签失败时拒绝写入（防篡改优先）。
+- **ext_id 尾部空白导致幂等失效**（代码审查 v0.6.2 P2-3）：`"abc"` 与 `"abc\n"` 曾被视作不同幂等键；校验前先剥离首尾空白。
+- **外部来源显示名可伪造分隔条**（代码审查 v0.6.2 P3-1）：显示名映射值原先原样进分隔条，配置值里塞 `——` 或换行可伪造日记结构；显示名现经消毒（去除换行与各种破折号/括号字符、截断 16 字符）。
+- **`/日记凭证` 日志回显泄漏 token 前缀**（代码审查 v0.6.2 P3-3）：无法识别的参数回显进 warning 日志时未掩码，token 前缀可能落日志；现对凭证形态参数统一掩码后回显。
 
 ### 文档
 - README：更新说明换版至 v0.6.1 → v0.6.2；新增「14 外部写入 API（v0.6.2）」完整使用说明与「13.6 存储接口稳定性承诺」；招募区新增视觉设计岗与「已有贡献」表。

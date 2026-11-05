@@ -946,10 +946,14 @@ class StorageMixin:
 
     @classmethod
     def _normalize_external_records(cls, records) -> list:
-        """清洗外部写入记录：{source, ext_id, at}，按写入先后保留，超限丢最旧。"""
-        out = []
+        """清洗外部写入记录：{source, ext_id, at}，按写入先后保留，超限丢最旧。
+
+        丢最旧 = 保最近 N 条（切片尾部）：幂等去重窗口必须跟着"最近写入"走——
+        刚写入的 ext_id 若因容量裁剪丢失，客户端重放会被当首次写入而重复追加。
+        """
+        cleaned = []
         if not isinstance(records, list):
-            return out
+            return cleaned
         for rec in records:
             if not isinstance(rec, dict):
                 continue
@@ -960,10 +964,8 @@ class StorageMixin:
                 continue
             if not ext_id or len(ext_id) > cls.EXTERNAL_EXT_ID_MAX:
                 continue
-            out.append({"source": source, "ext_id": ext_id, "at": at})
-            if len(out) >= cls.PROVENANCE_MAX_EXTERNAL_PER_ENTRY:
-                break
-        return out
+            cleaned.append({"source": source, "ext_id": ext_id, "at": at})
+        return cleaned[-cls.PROVENANCE_MAX_EXTERNAL_PER_ENTRY:]
 
     @classmethod
     def _normalize_provenance(cls, data) -> dict:
@@ -1882,6 +1884,18 @@ class StorageMixin:
         if self._secret_key() is None:
             raise DiaryKeyUnavailable("签名密钥不可用，已拒绝写入日记")
 
+        # 写路径统一先迁移旧格式（审查 P1-2）：外部写入 API 等路径不经过
+        # 读取侧的 _list_entries，不先迁移的话旧格式条目会被下方"只认
+        # ENTRY_NAME_RE"的分支静默跳过，并在整包重写时永久丢失。
+        # v1.x 迁移分支内部会反过来调用 _save_diary，用重入锁防止无限递归
+        mig = (
+            None
+            if getattr(self, "_in_legacy_migration", False)
+            else self._migrate_legacy(sender_id)
+        )
+        if mig == "tampered":
+            raise DiaryTamperedError("旧日记验签失败，已拒绝写入，请先处理旧日记")
+
         # zip 不支持原地修改，整体重写（日记体量小，开销可忽略）
         existing: dict = {}
         # 插图与图片签名原样搬运：_save_diary 只重写日记条目，绝不能把插图冲掉
@@ -2170,7 +2184,12 @@ class StorageMixin:
                 return "tampered"
             try:
                 day = datetime.fromtimestamp(md_path.stat().st_mtime).strftime("%Y%m%d")
-                self._save_diary(sender_id, content, entry_name_hint=day)
+                # _save_diary 开头也会触发迁移检查，挂重入锁避免递归
+                self._in_legacy_migration = True
+                try:
+                    self._save_diary(sender_id, content, entry_name_hint=day)
+                finally:
+                    self._in_legacy_migration = False
                 md_path.unlink(missing_ok=True)
                 sig_path.unlink(missing_ok=True)
                 logger.info(

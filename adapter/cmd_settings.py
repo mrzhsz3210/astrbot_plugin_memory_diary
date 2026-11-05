@@ -275,9 +275,14 @@ class SettingsCommandsMixin:
                 )
             return
 
+        # 审查 P3-3：原始消息可能带着明文凭证（用户手滑把 mdw_ 粘进参数），
+        # 凭证不落日志——掩码后再记。
+        raw_msg = event.message_str or ""
+        masked = " ".join(
+            t[:4] + "***" if t.startswith("mdw_") else t for t in raw_msg.split()
+        )
         logger.warning(
-            f"[memory_diary] 无法识别的日记凭证参数，原始消息："
-            f"{(event.message_str or '')!r}"
+            f"[memory_diary] 无法识别的日记凭证参数（凭证已掩码）：{masked!r}"
         )
         yield event.plain_result(usage)
 

@@ -506,3 +506,97 @@ async def test_note_two_users_same_source_write_to_own_diaries():
         # 交叉验证：互不可见
         assert "B 的记忆" not in _read_day(plugin, TODAY, sender="10001")
         assert "A 的记忆" not in _read_day(plugin, TODAY, sender="20002")
+
+
+# ------------------------- 审查报告回归（_review_v062） -------------------------
+
+
+async def test_note_ext_id_trailing_newline_still_idempotent():
+    """P2-3：ext_id 尾部换行先归一化再判重——首次写入与重放是同一幂等键，不重复追加。"""
+    async with World() as world:
+        plugin = world.refactor.plugin
+        token = _make_token(plugin)
+        payload = {
+            "token": token, "source": "dsh", "day": TODAY,
+            "text": "同一篇记忆", "ext_id": "abc\n",
+        }
+        r1 = await _post(plugin, payload)
+        assert r1["status"] == 200 and r1["body"]["appended"] is True, r1
+        r2 = await _post(plugin, {**payload, "ext_id": "abc"})
+        assert r2["body"].get("replayed") is True, r2
+        assert _read_day(plugin, TODAY).count("同一篇记忆") == 1
+
+
+async def test_note_idempotency_window_keeps_most_recent_at_capacity():
+    """P1-1：单篇条目 external 达上限时保留最近记录——刚写入的 ext_id 重放不重复追加。"""
+    async with World() as world:
+        plugin = world.refactor.plugin
+        token = _make_token(plugin)
+        cap = plugin.PROVENANCE_MAX_EXTERNAL_PER_ENTRY
+        for i in range(cap + 1):
+            plugin._ext_rate_buckets().clear()  # 绕过限流，专测容量边界
+            r = await _post(plugin, {
+                "token": token, "source": "dsh", "day": TODAY,
+                "text": f"容量第 {i} 条", "ext_id": f"cap-{i}",
+            })
+            assert r["status"] == 200, (i, r)
+        prov, status = plugin.load_provenance(SENDER)
+        assert status == "ok"
+        recs = prov["entries"]["20261023.md"]["external"]
+        assert len(recs) == cap, len(recs)
+        assert recs[-1]["ext_id"] == f"cap-{cap}", recs[-3:]
+        plugin._ext_rate_buckets().clear()
+        r = await _post(plugin, {
+            "token": token, "source": "dsh", "day": TODAY,
+            "text": f"容量第 {cap} 条", "ext_id": f"cap-{cap}",
+        })
+        assert r["body"].get("replayed") is True, r
+        assert _read_day(plugin, TODAY).count(f"容量第 {cap} 条") == 1
+
+
+async def test_note_triggers_legacy_migration_before_write():
+    """P1-2：外部写入前先迁移旧格式——旧日记绝不因整包重写永久丢失。"""
+    async with World() as world:
+        plugin = world.refactor.plugin
+        legacy = "旧格式 v2.0 的全部日记内容"
+        plugin._write_zip_atomic(
+            plugin._diary_path(SENDER),
+            {
+                "diary.md": legacy.encode("utf-8"),
+                "diary.sig": plugin._signature(SENDER, legacy).encode("utf-8"),
+            },
+        )
+        token = _make_token(plugin)
+        r = await _post(plugin, {
+            "token": token, "source": "dsh", "day": TODAY,
+            "text": "外部写入的新段落", "ext_id": "mig-1",
+        })
+        assert r["status"] == 200, r
+        content = _read_day(plugin, TODAY)
+        assert "外部写入的新段落" in content
+        # 旧内容落在迁移日（v2.0 迁移按 zip 修改时间归档，非固定时钟），
+        # 所以全包 diaries/ 范围断言，不按固定日期钉死。
+        with zipfile.ZipFile(_zip_path(plugin)) as z:
+            all_text = "".join(
+                z.read(n).decode("utf-8", "ignore")
+                for n in z.namelist()
+                if n.startswith("diaries/")
+            )
+        assert legacy in all_text, "旧日记内容在外部写入后丢失"
+
+
+async def test_note_display_name_sanitized_against_separator_forgery():
+    """P3-1：显示名剔除换行/分隔条字符并截断，配置值无法伪造日记分隔条。"""
+    async with World(config={
+        "external_source_display": "dsh=坏——名（x）" + "y" * 30,
+    }) as world:
+        plugin = world.refactor.plugin
+        token = _make_token(plugin)
+        r = await _post(plugin, {
+            "token": token, "source": "dsh", "day": TODAY,
+            "text": "消毒测试", "ext_id": "san-1",
+        })
+        assert r["status"] == 200, r
+        content = _read_day(plugin, TODAY)
+        assert "（外部·坏名x" in content, content
+        assert "坏——名" not in content
