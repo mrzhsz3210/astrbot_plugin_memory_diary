@@ -479,3 +479,30 @@ async def test_note_source_display_name_fallback_and_malformed():
         assert r["status"] == 200, r
         content = _read_day(plugin, TODAY)
         assert "（外部·dsh）" in content, content
+
+
+# ------------------------- 多用户隔离 -------------------------
+
+
+async def test_note_two_users_same_source_write_to_own_diaries():
+    """凭证即定位主人：同来源标识的两枚凭证各写各的日记，互不越界。"""
+    async with World() as world:
+        plugin = world.refactor.plugin
+        token_a = _make_token(plugin, sender="10001")
+        token_b = _make_token(plugin, sender="20002")
+        r = await _post(plugin, {
+            "token": token_a, "source": "dsh", "day": TODAY,
+            "text": "A 的记忆", "ext_id": "iso-a1",
+        })
+        assert r["status"] == 200, r
+        r = await _post(plugin, {
+            "token": token_b, "source": "dsh", "day": TODAY,
+            "text": "B 的记忆", "ext_id": "iso-b1",
+        })
+        assert r["status"] == 200, r
+        # 各写各的
+        assert "A 的记忆" in _read_day(plugin, TODAY, sender="10001")
+        assert "B 的记忆" in _read_day(plugin, TODAY, sender="20002")
+        # 交叉验证：互不可见
+        assert "B 的记忆" not in _read_day(plugin, TODAY, sender="10001")
+        assert "A 的记忆" not in _read_day(plugin, TODAY, sender="20002")
