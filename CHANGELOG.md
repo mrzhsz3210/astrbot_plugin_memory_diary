@@ -2,6 +2,19 @@
 
 本项目所有重要变更都会记录在此文件。
 
+## [v0.6.2] - 2026-11-05
+
+### 新增
+- **外部写入 API（issue #3 关联）**：新增 Web 端点 `POST /api/v1/plugins/extensions/astrbot_plugin_memory_diary/note`，双闸鉴权（AstrBot API key 的 plugin 权限 + 插件侧 token，token 只存 SHA-256 哈希于 `external_write_tokens.json`）；凭证以 `〔外部凭证〕` 字段进入日记正文、与日记 zip 原子重写落盘，`provenance.json` 的 external 记录保证幂等（同一 ext_id 重复提交不产生重复段落）。上限 8 KB、不允许未来日期、ext_id 限 64 字符可打印 ASCII，每 token 每分钟 20 次限流（429）。场景分析与方案设计来自 @Sil-Future；README「已有贡献」名单同时收录 @puppe110（issue #2）。
+- **`/日记凭证` 指令**（管理员）：QQ 侧手工登记日记凭证，与外部写入同一管线、同样幂等（QQ 私聊 `/日记凭证 新办 <来源标识>` 可办理写入 token）。
+- **存储接口稳定性承诺**（docs/README §13.6）：承诺 `memory_diary/storage.py` 的 `replace_day_entry`（zip 内单日记段落替换）在 v0.x 系列内保持签名与语义稳定；明确不承诺 zip 写入侧契约。
+
+### 修复
+- **合入 v0.6.1.1 hotfix1**（手机端窄屏批量删除修复）：v0.6.1 的批量删除复选框在窄屏下被 `display: none` 隐藏，hotfix1 把窄屏目录改为左侧抽屉修复；v0.6.2 完整合入该修复，hotfix1 用户无感升级。
+
+### 文档
+- README：更新说明换版至 v0.6.1 → v0.6.2；新增「14 外部写入 API（v0.6.2）」完整使用说明与「13.6 存储接口稳定性承诺」；招募区新增视觉设计岗与「已有贡献」表。
+
 ## [v0.6.1.1] - 2026-11-03（hotfix1，紧急热修复）
 
 ### 修复
