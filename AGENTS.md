@@ -45,6 +45,22 @@
 - `CHANGELOG.md` 每个版本补一节；`RELEASE_NOTES_v<版本>.md` 随发布目录走（含致谢与回退说明）。
 - 改 `_conf_schema.json` 时跑一遍 `python -m json.tool`（CI 也会查）。
 
+## 文档同步义务（没有任何测试兜底，全靠自觉）
+
+以下改动必须**同步改文档**，漏一项就是发布事故：
+
+1. **增删/改命令** → 同步 `docs/README.md` §7.1 指令列表（表格行）；
+   若新命令的回复受/不受人设口吻影响，还要在 §7.1 的「人设口吻作用范围」注记里说明边界。
+2. **配置页新增配置项**（`_conf_schema.json` 加键）→ 四处联动，缺一不可：
+   - `docs/README.md` §10 对应小节加 bullet（顺序即配置页顺序——有回归测试盯着）；
+   - `tests/test_v055_features.py` 的 `_CONF_README_ORDER` 和 `_CONF_LABEL_PREFIXES` 各加一行；
+   - `admin-guide.md`「配置项详解」对应章节加说明（**没有测试兜底，最容易漏**）；
+   - schema 里的键位置遵守既有约定：批注配置项紧跟插图项之后、`diary_timezone` 与废弃的
+     `enable_context_watch` 固定为配置页最后两项（有回归测试盯着）。
+3. 功能级变更（新增 API、新指令族、外部写入这类）→ `admin-guide.md` 的白话原理/对应章节
+   与 `docs/README.md` 的专题章节（如 §14）同步；随包文档（admin-guide）不能引用不进包的
+   `docs/` 内容，要引就把内容**完整复制**进 admin-guide（它进发布包，`docs/` 不进）。
+
 ## 数据与安全红线
 
 - `.diary_key`（HMAC 密钥）是机密：不进任何包/仓库/备份的公开副本，但用户自己备份迁移时必须带上它；
