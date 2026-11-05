@@ -145,8 +145,13 @@ class DeleteCommandsMixin:
                 controller.keep(timeout=60, reset_timeout=True)
                 return
             if text.isdigit():
-                idx = int(text)
-                if 1 <= idx <= len(entries):
+                # P3-2：isdigit() 会放行 ² 等上标数字（int() 转不了），
+                # 解析失败统一走"没看懂"分支，不能让 ValueError 打断交互。
+                try:
+                    idx = int(text)
+                except (TypeError, ValueError):
+                    idx = None
+                if idx is not None and 1 <= idx <= len(entries):
                     targets = [entries[idx - 1]]
             else:
                 m_range = re.match(

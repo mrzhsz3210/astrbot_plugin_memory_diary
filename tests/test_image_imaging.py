@@ -471,9 +471,10 @@ async def test_image_usage_count_limit_and_file_format():
         plugin = _plugin(world)
 
         assert plugin._image_usage_remaining() == 2
-        assert plugin._image_usage_consume() is True
-        assert plugin._image_usage_consume() is True
-        assert plugin._image_usage_consume() is False, "超过每日上限仍允许消耗"
+        # 契约 2：consume 返回实际记账日期，额度不足返回 ""（假值）
+        assert plugin._image_usage_consume() == "20261023"
+        assert plugin._image_usage_consume() == "20261023"
+        assert plugin._image_usage_consume() == "", "超过每日上限仍允许消耗"
         assert plugin._image_usage_remaining() == 0
 
         rec = plugin._image_usage_load()
@@ -497,7 +498,7 @@ async def test_image_usage_resets_on_new_day():
         plugin._image_usage_load()  # 触发加载（可能缓存）
 
         assert plugin._image_usage_remaining() == 3, "跨天后每日用量没有重置"
-        assert plugin._image_usage_consume() is True
+        assert plugin._image_usage_consume() == "20261023"
         rec = plugin._image_usage_load()
         assert rec.get("date") == "20261023"
         assert int(rec.get("count", -1)) == 1
@@ -512,7 +513,7 @@ async def test_image_usage_remaining_never_negative_when_count_over_limit():
         )
         plugin._image_usage_load()
         assert plugin._image_usage_remaining() == 0, "超限后剩余量应为 0，不能是负数"
-        assert plugin._image_usage_consume() is False
+        assert plugin._image_usage_consume() == ""
 
 
 # ---------------------------------------------------------------------------
@@ -617,7 +618,7 @@ async def test_caption_image_handles_failures_and_content_list_form():
 async def test_image_usage_refund_returns_quota_and_never_goes_negative():
     async with World(config=img_config(image_limit_daily=6)) as world:
         plugin = _plugin(world)
-        assert plugin._image_usage_consume() is True
+        assert plugin._image_usage_consume() == "20261023"
         assert plugin._image_usage_load()["count"] == 1
 
         plugin._image_usage_refund()

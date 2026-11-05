@@ -9,6 +9,7 @@ import re
 
 from astrbot.api.event import AstrMessageEvent
 
+from ..memory_diary.common import strip_trailing_decorations
 from ..memory_diary.log import logger
 from .compat import At
 
@@ -134,19 +135,57 @@ class GateMixin:
 
     @classmethod
     def _strip_invisible(cls, text: str) -> str:
-        """剥离零宽与方向控制字符；只影响指令解析，不回写消息内容。"""
-        return cls._INVISIBLE_RE.sub("", text or "")
+        """剥离零宽/方向控制字符与尾部 ``[MSG_ID:…]`` 机器标记（只用于解析）。
+
+        P2-11 修复：qq_tools（show_message_id）等插件会往消息尾部追加
+        ``[MSG_ID:-2037476869]`` 这类机器标记。以前只剥零宽字符，带参指令
+        （``/日记 完整``、``/日记范围 最近7天``、``/日记密码``…）参数里带着标记，
+        被当成"无法识别参数"。这里与 ``/reset`` 判定共用同一套口径
+        （``memory_diary.common.strip_trailing_decorations``：只剥尾部、循环剥完），
+        解析链上所有调用点（含交互式追问的序号/确认解析）自动受益。
+        纪律不变：只影响指令解析判断，绝不回写 event.message_str 原文。
+        """
+        cleaned = cls._INVISIBLE_RE.sub("", text or "")
+        return strip_trailing_decorations(cleaned)
 
     def _command_arg(self, event: AstrMessageEvent) -> str:
-        """从原始消息取指令后的完整参数，并剥掉 @提及。
+        """从原始消息取指令后的完整参数，并剥掉"真正的" @提及。
 
         P2-3 修复：AstrBot 的 CommandFilter 按空格拆参数，只把第一个 token 传给
         处理函数的参数——"/日记范围 2026-10-01 到 2026-10-23" 会被截成单日。
         这里直接解析 event.message_str，保留带空格的完整参数。
+
+        P3-5 修复：以前无条件用正则剥掉参数里所有 ``@…``，
+        ``/形象 修改 黑发@红色发带`` 会被截成"修改 黑发"。现在只剥两类**真正的**
+        提及：(1) 消息链里 At 组件对应的 ``@<QQ号>`` 文本形式；(2) 参数开头的
+        独立 @提及（``/注入日记 @我的助手 最新`` 这种）。正文中间的 ``@`` 原样保留。
         """
         text = self._strip_invisible(event.message_str or "").strip()
         parts = text.split(maxsplit=1)
         arg = parts[1] if len(parts) > 1 else ""
         # 全角空格（U+3000）无需额外兜底：str.split() 默认按 Unicode 空白切分，
         # 已把全角空格当分隔符处理。
-        return re.sub(r"@[^\s@，,]+", "", arg).strip()
+        return self._strip_arg_mentions(event, arg).strip()
+
+    def _strip_arg_mentions(self, event: AstrMessageEvent, arg: str) -> str:
+        """只剥真正的 @提及，保留正文里的 @（P3-5）。"""
+        if not arg or "@" not in arg:
+            return arg
+        # 1) 消息链里真有 At 组件时，剥掉其 QQ 号的文本形式（@12345678）。
+        qqs = set()
+        if At is not None:
+            try:
+                for comp in event.get_messages() or []:
+                    if isinstance(comp, At):
+                        qq = str(getattr(comp, "qq", "") or "").strip()
+                        if qq:
+                            qqs.add(qq)
+            except Exception:
+                pass
+        out = arg
+        for qq in sorted(qqs, key=len, reverse=True):
+            out = out.replace(f"@{qq}", "")
+        # 2) 参数开头的独立 @提及（@昵称 后面跟参数）：真提及通常独立成词放在最前，
+        #    正文中间的 @（如"黑发@红色发带"）不算提及、必须保留。
+        out = re.sub(r"^@[^\s@，,]+\s*", "", out)
+        return out

@@ -44,10 +44,16 @@ from .log import logger
 class IllustrationMixin:
     """插图决策与异步管线；由 MemoryDiaryCore 组合。"""
 
+    # 形象描述提炼的 LLM 调用超时（秒）：与批注生成路径同口径，超时降级返回
+    # 空串，绝不把已经落盘的 /写日记 卡在这里（审查 P3-16）。
+    _PERSONA_DESC_LLM_TIMEOUT = 60
+
     # ---- 日记正文里的机器标记（解析后必须从正文移除）----
-    _AI_MARKER_RE = re.compile(r"〔\s*插图\s*[:：]\s*([^〕]+?)〕")
-    _PHOTO_MARKER_RE = re.compile(r"〔\s*用户照片\s*[:：]\s*([^〕]+?)〕")
-    _PERSONA_MARKER_RE = re.compile(r"〔\s*形象提议\s*[:：]\s*([^〕]+?)〕")
+    # 审查 P3-14：payload 一律排除换行并限制长度——模型漏写 "〕" 时不能把后续
+    # 整段正文吞进 alt/描述并截断丢失；含换行或超长的标记整段原样保留、不解析。
+    _AI_MARKER_RE = re.compile(r"〔\s*插图\s*[:：]\s*([^〕\n]{1,80}?)〕")
+    _PHOTO_MARKER_RE = re.compile(r"〔\s*用户照片\s*[:：]\s*([^〕\n]{1,80}?)〕")
+    _PERSONA_MARKER_RE = re.compile(r"〔\s*形象提议\s*[:：]\s*([^〕\n]{1,120}?)〕")
     # 正文里已落盘的图片语法（QQ/Web 呈现与注入占位都按这个解析）
     _IMAGE_MD_RE = re.compile(
         r"!\[(?P<alt>[^\]]*)\]\((?P<name>images/[^)\s]+)\)"
@@ -104,7 +110,11 @@ class IllustrationMixin:
         return min(passed, self._image_usage_remaining())
 
     def _count_ai_image_markers(self, content: str) -> int:
-        """数一数 AI 在正文里表达了几次插图意愿（闸门输入）。"""
+        """数一数 AI 在正文里表达了几次插图意愿（闸门输入）。
+
+        只数**合法**标记：payload 含换行/超长（模型漏写 "〕"）的整段原样保留、
+        不计入意愿，也不参与解析（审查 P3-14）。
+        """
         try:
             return len(self._AI_MARKER_RE.findall(content or ""))
         except Exception:
@@ -510,7 +520,9 @@ class IllustrationMixin:
 
         if not ai:
             if notice_parts:
-                self._image_last_notice = "\n\n" + "\n\n".join(notice_parts)
+                self._image_notice_put(
+                    sender_id, "\n\n" + "\n\n".join(notice_parts)
+                )
             return
 
         # 形象档案为空：初始化仪式——先提炼一版提案给用户确认，这次不画
@@ -530,14 +542,19 @@ class IllustrationMixin:
                 )
             self._remove_pending(sender_id, entry_name, [d["pending_ref"] for d in ai])
             if notice_parts:
-                self._image_last_notice = "\n\n" + "\n\n".join(notice_parts)
+                self._image_notice_put(
+                    sender_id, "\n\n" + "\n\n".join(notice_parts)
+                )
             return
 
         # 正常调度：额度不够的占位要清掉，不能留 PENDING 引用在正文里
         skipped = []
         quota_skipped = 0
         for decision in ai:
-            if not self._image_usage_consume():
+            # 审查 P3-15（契约 2）：记账日期随任务带到后台，跨午夜失败时按原
+            # 记账日期退款，不吃掉新一天的额度。
+            consume_day = self._image_usage_consume()
+            if not consume_day:
                 skipped.append(decision["pending_ref"])
                 quota_skipped += 1
                 continue
@@ -558,11 +575,12 @@ class IllustrationMixin:
                         prompt=prompt,
                         cfg=cfg,
                         sem=sem,
+                        usage_day=consume_day,
                     )
                 )
             except RuntimeError:
                 # 没有运行中的事件循环（同步测试/极端场景）：退还额度 + 删除占位
-                self._image_usage_refund()
+                self._image_usage_refund(consume_day)
                 skipped.append(decision["pending_ref"])
                 logger.warning("[memory_diary] 无事件循环，插图任务未创建")
                 break
@@ -579,7 +597,9 @@ class IllustrationMixin:
                 f"（今天的插图额度已经用完，{quota_skipped} 幅没有画。）"
             )
         if notice_parts:
-            self._image_last_notice = "\n\n" + "\n\n".join(notice_parts)
+            self._image_notice_put(
+                sender_id, "\n\n" + "\n\n".join(notice_parts)
+            )
 
     def _remove_pending(self, sender_id: str, entry_name: str, refs: list) -> None:
         """把还没开始画的 PENDING 占位从正文里删掉（失败只记日志）。"""
@@ -590,6 +610,28 @@ class IllustrationMixin:
             self.replace_pending_images(sender_id, entry_name, {}, refs)
         except Exception as e:
             logger.warning(f"[memory_diary] 清理插图占位失败: {e}")
+
+    def _pending_ref_still_there(self, sender_id: str, entry_name: str,
+                                 pending_ref: str) -> bool:
+        """同步复查（无 await）：目标日记仍存在，且正文里仍含该 PENDING 占位。
+
+        审查 P2-7：生图期间用户可能 /删除日记，或删后同日重写。若此时照样
+        save_image，会把图写回 zip（必要时重建已删除的 zip，让删掉的日期"复活"
+        成孤儿图）并推送"插图到了"，而正文里根本没有这张图。落盘前必须先确认
+        这条占位仍属于当前正文；读失败/验签失败一律按"不满足"处理。
+        """
+        if not pending_ref:
+            return False
+        try:
+            if entry_name not in self._list_entries(sender_id):
+                return False
+            content, tampered = self._load_entry(sender_id, entry_name)
+        except Exception as e:
+            logger.warning(f"[memory_diary] 生图落盘前复查日记失败（放弃写入）: {e}")
+            return False
+        if tampered or not content:
+            return False
+        return str(pending_ref) in content
 
     def _get_image_semaphore(self, concurrency: int) -> asyncio.Semaphore:
         """全局并发生图上限（设计第 5 节：image_concurrency 防显存/速率崩溃）。"""
@@ -611,11 +653,14 @@ class IllustrationMixin:
     async def _run_image_job(self, sender_id: str, sender_name: str, umo: str,
                             day: str, pending_ref: str, alt: str,
                             orientation: str, prompt: str, cfg: dict = None,
-                            sem=None) -> None:
+                            sem=None, *, usage_day: str = "") -> None:
         """单张图的后台任务：生成 → 入 zip → 替换占位 → 推送；失败静默清占位。
 
         cfg 是调度时的配置快照（第 9 个位置参数，契约固定）；sem 是共享的
         并发生图信号量（调度层传入，缺省时按当前配置自建）。
+        usage_day 是调度时 _image_usage_consume() 返回的记账日期（契约 2，
+        关键字参数，不改变既有位置参数契约）：失败退款按这一天退，跨午夜
+        不扣新一天的额度。
         """
         entry_name = self._md_entry(day)
         cfg = cfg if isinstance(cfg, dict) else self._image_cfg()
@@ -631,8 +676,18 @@ class IllustrationMixin:
                 )
             if not data:
                 # 配置页承诺"生成失败不计数"：失败退还今日额度（设计 D2/D3）
-                self._image_usage_refund()
+                self._image_usage_refund(usage_day)
                 self._remove_pending(sender_id, entry_name, [pending_ref])
+                return
+            # 审查 P2-7：生图期间用户可能删除/重写这篇日记。落盘前用无 await 的
+            # 同步段复查"目标 entry 仍在且仍含 pending_ref"；不满足就退款返回，
+            # 不写图（否则会复活已删的 zip / 留下正文无引用的孤儿图）、不推送。
+            if not self._pending_ref_still_there(sender_id, entry_name, pending_ref):
+                logger.info(
+                    f"[memory_diary] 目标日记已删除/改写，放弃写入插图并退还额度："
+                    f"{entry_name}"
+                )
+                self._image_usage_refund(usage_day)
                 return
             seq = self._next_image_seq(sender_id, day)
             name = self.save_image(sender_id, data, day, seq, alt)
@@ -641,6 +696,9 @@ class IllustrationMixin:
                 sender_id, entry_name, {pending_ref: replacement}, []
             )
             if not ok:
+                # 契约 1：replace_pending_images 找不到占位/未落盘时返回 False——
+                # 这次没有产出用户可见的图，额度必须退还，且不推送"插图到了"。
+                self._image_usage_refund(usage_day)
                 self._remove_pending(sender_id, entry_name, [pending_ref])
                 return
             logger.info(
@@ -649,12 +707,12 @@ class IllustrationMixin:
             await self._notify_image_arrived(umo, alt, name, data, sender_name)
         except asyncio.CancelledError:
             # 插件卸载/终止：不再等网络，清掉占位后退出（额度未产出图，退还）
-            self._image_usage_refund()
+            self._image_usage_refund(usage_day)
             self._remove_pending(sender_id, entry_name, [pending_ref])
             raise
         except Exception as e:
             logger.warning(f"[memory_diary] 插图任务异常（已清理占位）: {e}")
-            self._image_usage_refund()
+            self._image_usage_refund(usage_day)
             self._remove_pending(sender_id, entry_name, [pending_ref])
 
     def _next_image_seq(self, sender_id: str, day: str) -> int:
@@ -781,7 +839,18 @@ class IllustrationMixin:
         return str((self.config or {}).get("persona_image_desc", "") or "").strip()
 
     def _set_config_value(self, key: str, value) -> bool:
-        """写配置项并落盘（AstrBotConfig 有 save_config；纯 dict 只改内存）。"""
+        """写配置项并落盘（AstrBotConfig 有 save_config；纯 dict 只改内存）。
+
+        审查 P3-18：先把旧值备份好，`save_config()` 成功后才算生效；落盘抛异常
+        或显式返回 False 时把内存回滚到旧值并返回 False。否则"提示写入失败，
+        本进程却已生效、重启又回滚"，用户看到的行为与提示矛盾。
+        """
+        try:
+            existed = key in self.config
+            old = self.config[key] if existed else None
+        except Exception as e:
+            logger.warning(f"[memory_diary] 读取配置项 {key} 失败: {e}")
+            return False
         try:
             self.config[key] = value
         except Exception as e:
@@ -790,11 +859,28 @@ class IllustrationMixin:
         save = getattr(self.config, "save_config", None)
         if callable(save):
             try:
-                save()
+                saved = save()
             except Exception as e:
-                logger.warning(f"[memory_diary] 保存配置项 {key} 失败: {e}")
+                self._restore_config_value(key, existed, old)
+                logger.warning(f"[memory_diary] 保存配置项 {key} 失败（已回滚）: {e}")
+                return False
+            if saved is False:
+                self._restore_config_value(key, existed, old)
+                logger.warning(
+                    f"[memory_diary] 保存配置项 {key} 失败（save_config 返回 False，已回滚）"
+                )
                 return False
         return True
+
+    def _restore_config_value(self, key: str, existed: bool, old) -> None:
+        """把配置项回滚到写入前的状态（失败只记日志，不掩盖原始错误）。"""
+        try:
+            if existed:
+                self.config[key] = old
+            else:
+                self.config.pop(key, None)
+        except Exception as e:
+            logger.warning(f"[memory_diary] 回滚配置项 {key} 失败: {e}")
 
     def _pending_persona_key(self) -> str:
         return "pending_persona_image_desc"
@@ -876,14 +962,23 @@ class IllustrationMixin:
             return ""
         prompt = PERSONA_IMAGE_DESC_PROMPT.format(persona=persona[:2000])
         try:
-            resp = await provider.text_chat(
-                prompt=prompt,
-                system_prompt=(
-                    "你是一个只输出一行中文形象描述的工具，"
-                    "不要解释、不要列表、不要引号。"
+            resp = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=prompt,
+                    system_prompt=(
+                        "你是一个只输出一行中文形象描述的工具，"
+                        "不要解释、不要列表、不要引号。"
+                    ),
                 ),
+                timeout=self._PERSONA_DESC_LLM_TIMEOUT,
             )
             text = str(getattr(resp, "completion_text", "") or "")
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[memory_diary] 提炼形象描述超时"
+                f"（{self._PERSONA_DESC_LLM_TIMEOUT}s），本次跳过"
+            )
+            return ""
         except Exception as e:
             logger.warning(f"[memory_diary] 提炼形象描述失败: {e}")
             return ""

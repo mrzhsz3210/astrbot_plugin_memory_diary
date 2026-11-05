@@ -63,6 +63,20 @@ def _all_text(req) -> str:
     return "\n".join(_extra_texts(req)) + "\n" + (req.system_prompt or "")
 
 
+async def _ack(plugin):
+    """模拟请求成功后的 on_llm_response（P2-12 harness 适配）。
+
+    P2-12 修复把"本代际已注入"标记推迟到 on_llm_response 才确认；harness 不会
+    自动触发钩子，所以同一代际的第二个请求前必须显式 ack，否则会被当成
+    "首轮请求失败"而允许重新注入。只补钩子调用，不改任何断言。
+    baseline 是更老的实现、没有该钩子（老版本 AstrBot 兼容路径），差分场景里
+    跳过 ack——它按旧行为"交付即落位"，两侧结果仍然可比。
+    """
+    response_hook = getattr(plugin, "on_llm_response", None)
+    if response_hook is not None:
+        await response_hook(_event(), None)
+
+
 def _norm_quotes(text: str) -> str:
     """统一中英文引号，避免契约排版字符差异影响逐行断言。"""
     return (
@@ -376,6 +390,7 @@ async def test_annotation_disabled_injection_is_byte_identical_to_baseline():
             )
             first = _request(contexts=[{"role": "user", "content": "你好"}])
             await inst.plugin.on_llm_request(_event(), first)
+            await _ack(inst.plugin)
             second = _request(contexts=[{"role": "user", "content": "你好"}])
             await inst.plugin.on_llm_request(_event(), second)
             return {
@@ -432,6 +447,7 @@ async def test_reset_first_inject_generates_once_per_generation():
         # 新会话第一次请求：同步生成 + 注入
         first = _request(contexts=[{"role": "user", "content": "你好"}])
         await plugin.on_llm_request(_event(), first)
+        await _ack(plugin)
         assert len(inst.provider.calls) == 1, "reset 后首次注入应同步生成一次批注"
         assert "【页边批注" in _all_text(first)
         loaded, status = plugin.load_annotations(SENDER)

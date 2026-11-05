@@ -14,6 +14,7 @@ import json
 import os
 import re
 import secrets
+import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -257,6 +258,45 @@ class ServiceMixin:
         text = re.sub(r"</?self\s*>", "", text, flags=re.IGNORECASE)
         return text, spans
 
+    # ------------------------- 插图提示（按 sender 分键） -------------------------
+
+    def _image_notice_pending(self) -> dict:
+        """P3-24：按 sender 分键的插图提示箱（sender_id -> 提示文本）。
+
+        旧版是插件级单值 ``_image_last_notice``，多人并发写日记会互相清空/串号
+        （B 写完等"人设口吻"通知时，A 的写日记流程开始/结束都会改动同一个值；
+        A 清空 → await LLM 数秒 → B 把自己的提示写进去 → A 回来读到 B 的提示）。
+        现在 ``_write_diary`` 与插图模块都只读写写作者自己的槽位，通知层按 sender
+        读一次即清，插件级全局状态不再参与。
+
+        dict 惰性创建：core.py 的初始化不属本任务写域，旧的 ``_image_last_notice``
+        字段保持原样、不再被业务代码使用。
+        """
+        pending = getattr(self, "_image_notice_by_sender", None)
+        if not isinstance(pending, dict):
+            pending = {}
+            self._image_notice_by_sender = pending
+        return pending
+
+    def _image_notice_take(self, sender_id) -> str | None:
+        """取走该 sender 的插图提示（读一次即清）；该 sender 没有登记时返回 None。"""
+        pending = self._image_notice_pending()
+        key = str(sender_id)
+        if key not in pending:
+            return None
+        return str(pending.pop(key) or "")
+
+    def _image_notice_put(self, sender_id, text: str) -> None:
+        """登记/覆盖该 sender 的插图提示；空串也落键（表示本篇没有提示）。
+
+        插图模块（``_schedule_illustrations`` 一带）也通过它写提示，避免碰
+        插件级共享字段。容量与其它内存状态一致（_STATE_CAP），超了丢最旧的。
+        """
+        pending = self._image_notice_pending()
+        pending[str(sender_id)] = str(text or "")
+        while len(pending) > _STATE_CAP:
+            pending.pop(next(iter(pending)))
+
     async def _write_diary(
         self,
         umo: str,
@@ -477,7 +517,9 @@ class ServiceMixin:
         # 图标关闭时 image_addon 为空串：不额外调用模型、不改变原有 prompt（零感知）。
         image_photos: list = []
         image_notice_extra = ""
-        self._image_last_notice = ""
+        # P3-24：为本 sender 开一个空的插图提示槽（占位，避免读到上一次残留；
+        # 不再碰插件级共享字段 _image_last_notice）。
+        self._image_notice_put(sender_id, "")
         try:
             if self._image_enabled():
                 image_cfg = self._image_cfg()
@@ -620,9 +662,11 @@ class ServiceMixin:
             except Exception as e:
                 logger.warning(f"[memory_diary] 插图调度失败（日记已保存）: {e}")
             if image_notice_extra:
-                self._image_last_notice = (
-                    (self._image_last_notice or "") + image_notice_extra
-                )
+                # P3-24：追加到本 sender 自己的槽位（插图模块若已通过
+                # _image_notice_put 写了提示，这里接在它后面），不碰全局字段。
+                pending = self._image_notice_pending()
+                key = str(sender_id)
+                pending[key] = (pending.get(key) or "") + image_notice_extra
             # 记录本次读到的历史边界，下一次只取游标之后的新消息。
             # 自动触发时当前消息可能还没进 history，记下它的哈希，下一轮跳过。
             last_msg_hash = (
@@ -787,28 +831,44 @@ class ServiceMixin:
         key = await self._provider_key(umo)
         return int(base * self._calib_factor(key))
 
+    async def _last_context_used_info(self, umo: str):
+        """取「哨兵口径」的最近一次上下文占用记录；失效时返回 None（P3-12）。
+
+        失效条件：v2 未开启 / 窗口大小改了 / 代际变了（``/new`` 换 conversation_id）。
+        ``/new`` 只换 cid、不清 history 以外的东西，旧会话的占用数若继续被状态页与
+        手动写日记门槛复用，就会显示/判定一个不存在的占用；换 cid 后立即回退到
+        按当前会话历史估算。
+        """
+        if not self._token_estimation_v2():
+            return None
+        info = self._last_context_used.get(umo)
+        limit = self._context_limit()
+        if not info or limit <= 0 or int(info.get("limit", -1)) != limit:
+            return None
+        if str(info.get("cid", "")) != str(await self._curr_cid(umo) or ""):
+            return None
+        return info
+
     async def _context_used(self, umo: str) -> int:
         """当前上下文占用：v2 下与哨兵同口径，供状态页和手动门槛复用。
 
-        优先取最近一次请求时哨兵算出的 used（同一会话、同一窗口大小）——
-        这样 /日记状态、手动写日记门槛看到的百分比和哨兵判定完全一致，
+        优先取最近一次请求时哨兵算出的 used（同一会话、同一窗口大小、同一代际）
+        ——这样 /日记状态、手动写日记门槛看到的百分比和哨兵判定完全一致，
         不会再出现"哨兵说该写了、状态页说没满"。没有可用记录（还没发过
-        请求 / 哨兵停用 / 窗口大小刚改过）时回退按历史估算。
+        请求 / 哨兵停用 / 窗口大小刚改过 / /new 换了代际）时回退按历史估算。
         旧公式路径保持 v0.5.4 的历史口径不变。
         """
         if self._token_estimation_v2():
-            info = self._last_context_used.get(umo)
-            limit = self._context_limit()
-            if limit > 0 and info and int(info.get("limit", -1)) == limit:
+            info = await self._last_context_used_info(umo)
+            if info is not None:
                 return int(info.get("used", 0) or 0)
         return await self._estimate_history_tokens(umo)
 
     async def _context_calib_key(self, umo: str) -> str:
         """观测行用的 provider::model：优先复用哨兵最近一次请求记下的 key。"""
         if self._token_estimation_v2():
-            info = self._last_context_used.get(umo)
-            limit = self._context_limit()
-            if limit > 0 and info and int(info.get("limit", -1)) == limit and info.get("key"):
+            info = await self._last_context_used_info(umo)
+            if info is not None and info.get("key"):
                 return str(info["key"])
         return await self._provider_key(umo)
 
@@ -828,9 +888,18 @@ class ServiceMixin:
             key = await self._provider_key(umo, req)
             if not key:
                 return
+            # P3-13：留一个到本次 ProviderRequest 的弱引用，on_llm_response 时据此
+            # 判断这一轮是否跑过多步工具（AstrBot 会把每次工具结果追加进同一个
+            # req 的 tool_calls_result）。弱引用拿不到时退回强引用（仅 v2+校准
+            # 同时开启时才暂存，且每次请求都会被同 umo 的新样本替换）。
+            try:
+                req_ref = weakref.ref(req)
+            except TypeError:  # pragma: no cover - 少数 duck-typed 请求不支持弱引用
+                req_ref = lambda _req=req: _req  # noqa: E731
             self._pending_estimates[umo] = {
                 "key": key,
                 "estimate": self._estimate_tokens(req),
+                "req_ref": req_ref,
             }
             self._cap_state(self._pending_estimates)
         except Exception as e:
@@ -957,12 +1026,16 @@ class ServiceMixin:
                 f"（E={estimate}, actual={actual}, 样本 {table[key]['samples']}）"
             )
 
-    def _watch(self, umo: str, cid: str) -> dict:
-        """取/重置某会话的哨兵状态。conversation_id 变化时视为新会话。"""
-        state = self._watch_state.get(umo)
+    def _watch(self, key: str, cid: str) -> dict:
+        """取/重置某命名空间的哨兵状态。conversation_id 变化时视为新会话。
+
+        P1-4：``key`` 由 ``_inject_state_key(umo, sender_id, in_group)`` 生成，
+        群聊里每个发送者各自一份提醒/自动写状态，互不吞掉。
+        """
+        state = self._watch_state.get(key)
         if state is None or state.get("cid") != cid:
             state = {"cid": cid, "reminded": False, "auto_written": False}
-            self._watch_state[umo] = state
+            self._watch_state[key] = state
             self._cap_state(self._watch_state)
         return state
 
@@ -1035,21 +1108,28 @@ class ServiceMixin:
             if not key:
                 key = await self._provider_key(umo, req)
         used = int(base * self._calib_factor(key))
+        cid = await self._curr_cid(umo)
         if self._token_estimation_v2():
             # 记下本次哨兵口径的占用，供 /日记状态 与手动写日记门槛复用：
             # 三处看到同一个数，避免"哨兵说该写了、状态页说没满"。
+            # P3-12：同时记下代际 cid，/new 换会话后读取时据此判定记录已失效。
             self._last_context_used[umo] = {
                 "used": used,
                 "limit": limit,
                 "key": key,
+                "cid": cid,
             }
             self._cap_state(self._last_context_used)
         ratio = used / limit
         if ratio < remind_ratio:
             return
 
-        cid = await self._curr_cid(umo)
-        state = self._watch(umo, cid)
+        # P1-4：哨兵状态按 (umo, sender) 命名空间化——群聊里 A 触发过阈值后，
+        # B 的请求仍要各自判定、各自提醒/自动写。
+        state = self._watch(
+            self._inject_state_key(umo, event.get_sender_id(), bool(event.get_group_id())),
+            cid,
+        )
         pct = int(ratio * 100)
 
         if auto_ratio > 0 and ratio >= auto_ratio and not state["auto_written"]:
@@ -1383,30 +1463,83 @@ class ServiceMixin:
             return
         now = self._now()
         today = now.strftime("%Y%m%d")
+        # P3-10：记下上一次检查时间，用来区分"启动太晚"和"事件循环被阻塞错过窗口"
+        last_tick = getattr(self, "_auto_last_tick_at", None)
+        self._auto_last_tick_at = now
         state = self._auto_state or self._load_auto_state()
         self._auto_state = state
         if str(state.get("last_trigger_day") or "") == today:
+            # P3-9：当天已触发过。旧状态文件没有 done_senders 字段——按旧语义视为
+            # "今天已全部处理完"直接跳过（向后兼容）；新格式只跳过已完成用户，
+            # 把重载/取消时没轮到的用户补写掉（同一天不重复写）。
+            if not isinstance(state.get("done_senders"), list):
+                return
+        else:
+            target = now.replace(
+                hour=parsed[0], minute=parsed[1], second=0, microsecond=0
+            )
+            if now < target:
+                return
+            # 启动/重启比设定时间晚太多（例如服务器休眠后开机）不补写，等明天；
+            # 只给一个小窗口，避免“到点前已过”却突然补写。
+            late = (now - target).total_seconds()
+            if late > AUTO_DIARY_GRACE_SECONDS:
+                self._warn_auto_diary_window_missed(today, target, late, last_tick)
+                return
+            # 先落盘“今天已触发”+ 空的完成集合：之后逐用户处理、处理一个标记一个，
+            # 中途取消/重载时没轮到的用户仍算未完成，由当天后续 tick 补写。
+            state = {
+                "last_trigger_day": today,
+                "last_trigger_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "done_senders": [],
+                # 触发时刻已登记的用户快照：当天之后（触发之后）才登记的新用户
+                # 不属于本轮，不能在 grace 窗口之外的深夜被突然补写。
+                "pending_senders": [str(s) for s in self._auto_users],
+            }
+            self._auto_state = state
+            self._save_auto_state(state)
+            logger.info(
+                f"[memory_diary] 到点触发每天自动写日记（{today} "
+                f"{parsed[0]:02d}:{parsed[1]:02d}，登记用户 {len(self._auto_users)} 个）"
+            )
+        if not self._auto_pending_targets(state):
             return
-        target = now.replace(
-            hour=parsed[0], minute=parsed[1], second=0, microsecond=0
+        await self._run_auto_diaries(today, state=state)
+
+    def _auto_pending_targets(self, state) -> set:
+        """P3-9：本轮触发里还没处理完的 sender 集合（触发时刻已登记的用户）。"""
+        if not isinstance(state, dict):
+            return set()
+        done = {str(s) for s in state.get("done_senders") or []}
+        pending = state.get("pending_senders")
+        if isinstance(pending, list):
+            registered = {str(s) for s in pending}
+        else:
+            # 没有快照（早期新格式状态）时回退为当前登记用户，宁补勿漏
+            registered = {str(s) for s in self._auto_users}
+        return registered - done
+
+    def _warn_auto_diary_window_missed(
+        self, today: str, target, late: float, last_tick
+    ) -> None:
+        """P3-10：过了补写窗口时留一条 warning，不再静默跳过一整天。
+
+        只在当天第一次跳过时记录（tick 每 20 秒一次，不能刷屏）。
+        """
+        if getattr(self, "_auto_grace_warned_day", "") == today:
+            return
+        self._auto_grace_warned_day = today
+        if last_tick is not None and last_tick < target:
+            reason = (
+                "上一次检查停在到点之前，事件循环可能被长时间阻塞"
+                "（或进程休眠后刚被唤醒），错过了补写窗口"
+            )
+        else:
+            reason = "插件启动/恢复时已超过补写窗口（启动太晚不补写是既有设计）"
+        logger.warning(
+            f"[memory_diary] 自动写日记跳过 {today}：到点后已过 {late:.0f} 秒，"
+            f"超过 {AUTO_DIARY_GRACE_SECONDS} 秒补写窗口（{reason}）；今天不会再补写"
         )
-        if now < target:
-            return
-        # 启动/重启比设定时间晚太多（例如服务器休眠后开机）不补写，等明天；
-        # 只给一个小窗口，避免“到点前已过”却突然补写。
-        if (now - target).total_seconds() > AUTO_DIARY_GRACE_SECONDS:
-            return
-        # 先落盘“今天已触发”：之后无论成功失败都不再重试（进程重载也不会）
-        self._auto_state = {
-            "last_trigger_day": today,
-            "last_trigger_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        self._save_auto_state(self._auto_state)
-        logger.info(
-            f"[memory_diary] 到点触发每天自动写日记（{today} "
-            f"{parsed[0]:02d}:{parsed[1]:02d}，登记用户 {len(self._auto_users)} 个）"
-        )
-        await self._run_auto_diaries(today)
 
     def _has_full_diary_today(self, sender_id: str, day: str) -> bool:
         """今天是否已经写过完整日记（私聊或群聊场景都算）。"""
@@ -1436,38 +1569,78 @@ class ServiceMixin:
             content, "group" if is_group else "private"
         )
 
-    async def _run_auto_diaries(self, day: str):
-        """给登记过的私聊用户逐个写完整日记；单个失败继续下一个，不重试。"""
+    def _mark_auto_diary_done(self, state, sender_id: str) -> None:
+        """P3-9：把该用户记进当天完成集合并立即落盘（成功/跳过/失败都算完成）。
+
+        失败也记完成 = 保持"失败不重试"的既有边界；只有被取消/重载打断、
+        还没轮到的用户不记完成，由当天后续 tick 补写。
+        """
+        if not isinstance(state, dict):
+            return
+        done = state.get("done_senders")
+        if not isinstance(done, list):
+            done = []
+        key = str(sender_id)
+        if key not in done:
+            done.append(key)
+        state["done_senders"] = done
+        self._auto_state = state
+        self._save_auto_state(state)
+
+    async def _run_auto_diaries(self, day: str, state: dict | None = None):
+        """给登记过的私聊用户逐个写完整日记；单个失败继续下一个，不重试。
+
+        ``state`` 非空时（定时 tick 调用）逐用户把 sender 记进当天完成集合并落盘；
+        插件中途重载/取消后，没轮到的用户由当天后续 tick 补写（P3-9）。
+        """
         users = list(self._auto_users.items())
         if not users:
             logger.info("[memory_diary] 自动写日记：没有登记过私聊会话的用户，跳过")
             return
+        done = set()
+        wanted = None
+        if isinstance(state, dict):
+            done = {str(s) for s in state.get("done_senders") or []}
+            pending = state.get("pending_senders")
+            if isinstance(pending, list):
+                wanted = {str(s) for s in pending}
         wrote = skipped = failed = 0
         for sender_id, rec in users:
             sender_id = str(sender_id)
             rec = rec if isinstance(rec, dict) else {}
+            if wanted is not None and sender_id not in wanted:
+                # 触发时刻还没登记的用户不在本轮范围内（不在深夜补写）
+                continue
+            if sender_id in done:
+                # 今天已经处理过（含失败/跳过），不再重复写
+                continue
             if not self._is_allowed(sender_id):
                 # 真正触发前再过一遍白名单：管理员收紧名单后无需重启，
                 # 已登记的用户也不再被写
                 skipped += 1
+                self._mark_auto_diary_done(state, sender_id)
                 continue
             umo = str(rec.get("umo") or "").strip()
             if not umo:
                 skipped += 1
+                self._mark_auto_diary_done(state, sender_id)
                 continue
             if sender_id in self._writing:
                 # 同一用户已有写日记流程（手动/哨兵/定时）在进行，避免并发重写 zip
                 skipped += 1
+                self._mark_auto_diary_done(state, sender_id)
                 continue
             try:
                 if self._has_full_diary_today(sender_id, day):
                     skipped += 1
+                    self._mark_auto_diary_done(state, sender_id)
                     continue
             except Exception as e:
                 logger.warning(
                     f"[memory_diary] 检查用户 {sender_id} 今日完整日记失败，跳过: {e}"
                 )
                 skipped += 1
+                self._mark_auto_diary_done(state, sender_id)
                 continue
             self._writing.add(sender_id)
             diary, err = None, None
@@ -1480,6 +1653,9 @@ class ServiceMixin:
                     allow_life=False,
                     requested_mode="full",
                 )
+            except asyncio.CancelledError:
+                # 取消/重载打断：不能把这个用户记成已完成，留给当天后续 tick 补写
+                raise
             except Exception as e:
                 err = f"自动写日记异常：{e}"
             finally:
@@ -1498,6 +1674,7 @@ class ServiceMixin:
                 await self._notify_auto_diary_failure(umo, err)
             else:
                 skipped += 1
+            self._mark_auto_diary_done(state, sender_id)
         logger.info(
             f"[memory_diary] 每天定时自动写日记完成：成功 {wrote}，跳过 {skipped}，失败 {failed}"
         )

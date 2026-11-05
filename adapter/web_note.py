@@ -13,7 +13,8 @@
    默认拒绝写入（fail-closed）。
 2. 幂等：ext_id 强制携带，去重索引进 provenance.json 的 external 记录——
    随包 HMAC 签名、重启不丢、与日记段落在**同一次原子重写**里落盘；
-   重放返回首次结果，绝不二次追加。
+   重放返回首次结果，绝不二次追加。删除日记时 external 记录转存独立墓碑
+   侧车（P2-4），删除后重放同一 ext_id 返回 replayed 且不复活已删内容。
 3. 只追加：外部写入只追加为新段落，绝不覆盖、绝不删除既有内容；
    单条 8 KB 上限；日期校验复用 WebDiaryApiMixin._web_normalize_day。
 4. fail-closed：任何一项校验失败 → 本轮整体不写；异常不吞，返回明确
@@ -102,6 +103,24 @@ class WebNoteApiMixin:
                 mapping[key] = value
         return mapping.get(source, source)
 
+    @staticmethod
+    def _break_separator_lines(text: str) -> str:
+        """拆断外部正文里形似日记分隔条的行（P2-5），使解析侧不再认它。
+
+        存储层的分隔条语法是「行首 `—— `、行尾 `——`」，被
+        `_segments` / `_segment_info` / `_filter_segments_for_group` 当成插件
+        写入的场景/模式元数据。外部 text 若含 `—— 21:00 写于群聊 ——` 就能让
+        私聊来源的记忆混进群聊注入，`—— … 完整 ——` 还能占掉当天完整篇名额。
+        在第一个「——」中间插一个零宽字符：展示上无差别，正则不再命中；
+        只动行首（stripped 后以「——」开头）的行，不改动正文其余内容。
+        """
+        lines = []
+        for line in text.split("\n"):
+            if line.strip().startswith("——"):
+                line = line.replace("——", "—\u200b—", 1)
+            lines.append(line)
+        return "\n".join(lines)
+
     # ------------------------- 端点 -------------------------
 
     async def web_external_note(self):
@@ -145,7 +164,9 @@ class WebNoteApiMixin:
         text = payload.get("text")
         if not isinstance(text, str) or not text.strip():
             return self._note_err("BAD_REQUEST", "text 缺失或为空", 400)
-        text = text.strip()
+        # P2-5：写入前拆断外部正文里形似日记分隔条的行，避免外部内容伪造
+        # 「写于群聊 / 完整」等插件元数据；长度上限按最终正文计算。
+        text = self._break_separator_lines(text.strip())
         if len(text.encode("utf-8")) > self.EXTERNAL_NOTE_MAX_BYTES:
             return self._note_err(
                 "PAYLOAD_TOO_LARGE",
@@ -186,6 +207,26 @@ class WebNoteApiMixin:
                 )
                 return self._note_err(
                     "WRITE_FAILED", "日记完整性校验未通过，请检查日记文件", 500
+                )
+
+            # P2-4：删除墓碑——命中说明这段曾写过、且所属日记已被删除。返回与既有
+            # 重放同形的响应且绝不写盘，否则桥超时重试同一 ext_id 会把已删段落复活。
+            tomb_rec, tomb_status = self.has_tombstone(owner, source, ext_id)
+            if tomb_status == "tampered":
+                logger.error(
+                    f"[memory_diary] 外部写入被拒绝：主人 {owner} 的删除墓碑验签失败"
+                )
+                return self._note_err(
+                    "WRITE_FAILED", "日记完整性校验未通过，请检查日记文件", 500
+                )
+            if tomb_rec is not None:
+                return _web_json(
+                    {
+                        "ok": True,
+                        "day": str(tomb_rec.get("day") or day)[:8],
+                        "appended": False,
+                        "replayed": True,
+                    }
                 )
 
             def _mut(data: dict):

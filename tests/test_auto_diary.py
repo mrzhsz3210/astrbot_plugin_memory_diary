@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 
 from harness.fakes import make_event
@@ -10,6 +11,30 @@ from harness.world import DIARY_TEXT, FIXED_NOW, World, message
 
 SENDER = "10001"
 UMO = "aiocqhttp:FriendMessage:10001"
+
+# refactor 从 P3-9 起在自动写日记状态里多记"触发时的用户快照 + 当天已完成的
+# sender 集合"；baseline 没有这两个字段。差分比较前统一抹掉（行为差异由
+# test_review_v062_auto.py 钉住）。
+AUTO_STATE_FILE = "auto_diary_state.json"
+_AUTO_STATE_NEW_FIELDS = ("done_senders", "pending_senders")
+
+
+def _visible_auto_state(state: dict) -> dict:
+    return {k: v for k, v in (state or {}).items() if k not in _AUTO_STATE_NEW_FIELDS}
+
+
+def _drop_auto_state_new_fields(rel: str, raw: bytes) -> bytes:
+    """快照差分豁免：去掉自动写日记状态文件里 refactor 新增的两个字段。"""
+    if not rel.endswith(AUTO_STATE_FILE):
+        return raw
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return raw
+    if isinstance(data, dict):
+        for field in _AUTO_STATE_NEW_FIELDS:
+            data.pop(field, None)
+    return json.dumps(data, ensure_ascii=False).encode("utf-8")
 
 
 def _private_event(text: str = "你好", **kwargs):
@@ -117,18 +142,22 @@ async def test_tick_triggers_auto_diary_and_daily_dedup():
             return {
                 "registered": registered,
                 "users_file": plugin._auto_diary_users_path().exists(),
-                "first_state": first_state,
+                "first_state": _visible_auto_state(first_state),
                 "first_entries": first_entries,
                 "first_sent": first_sent,
                 "sent_after_same_day_tick": len(second_sent),
-                "second_state": second_state,
+                "second_state": _visible_auto_state(second_state),
                 "second_entries": second_entries,
                 "provider_calls": len(inst.provider.calls),
                 "content_has_date": "2026-10-24" in plugin._load_latest(SENDER)[0]
                 or "10-24" in plugin._load_latest(SENDER)[0],
             }
 
-        pair = await world.run_pair(scenario, label="auto tick write")
+        pair = await world.run_pair(
+            scenario,
+            label="auto tick write",
+            snapshot_normalise=_drop_auto_state_new_fields,
+        )
         value = pair.value
         assert value["registered"] == {SENDER: {"umo": UMO, "name": "阿罗", "updated": "2026-10-23 22:00:00"}}
         assert value["first_state"]["last_trigger_day"] == "20261023"
@@ -326,13 +355,17 @@ async def test_auto_state_roundtrip_and_tick_without_users():
             await plugin._auto_diary_tick()  # same day -> no-op
             after = plugin._load_auto_state()
             return {
-                "state_file": state_file,
-                "after": after,
+                "state_file": _visible_auto_state(state_file),
+                "after": _visible_auto_state(after),
                 "sent": list(inst.ctx.sent_messages),
                 "provider_calls": len(inst.provider.calls),
             }
 
-        pair = await world.run_pair(scenario, label="auto no users")
+        pair = await world.run_pair(
+            scenario,
+            label="auto no users",
+            snapshot_normalise=_drop_auto_state_new_fields,
+        )
         value = pair.value
         assert value["state_file"]["last_trigger_day"] == "20261023"
         assert value["state_file"]["last_trigger_at"] == "2026-10-23 22:01:00"

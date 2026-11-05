@@ -87,13 +87,116 @@ def _normalize_preset(raw) -> dict:
     return out
 
 
+# 严格魔数表：只认这几种真图片，认不出就是认不出（绝不回退 "png"）。
+# 与 common.sniff_image_ext 不同——那个函数带着"未知回退 png"的兼容语义给
+# storage/前端用，这里必须严格，否则 HTML/JSON 错误页会被当插图收下。
+_STRICT_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"\xff\xd8\xff", "jpg"),
+    (b"GIF87a", "gif"),
+    (b"GIF89a", "gif"),
+)
+
+
+def _strict_image_ext(data: bytes) -> str:
+    """严格魔数嗅探：是 png/jpg/webp/gif 之一返回扩展名，否则返回 ""。"""
+    data = bytes(data or b"")
+    for magic, ext in _STRICT_IMAGE_MAGIC:
+        if data.startswith(magic):
+            return ext
+    # WebP: "RIFF"+4 字节长度+"WEBP"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return ""
+
+
 def _looks_like_image(data: bytes) -> bool:
-    """是不是一张认得出的图片（防止把 JSON 错误页当图写进 zip）。"""
+    """是不是一张认得出的图片（防止把 JSON 错误页当图写进 zip）。
+
+    P2-6：这里必须用严格魔数比对；不能复用 common.sniff_image_ext
+    （它认不出时回退 "png"，会让本函数恒真）。
+    """
     if not data or len(data) < 16:
         return False
     if len(data) > IMAGE_MAX_BYTES:
         return False
-    return sniff_image_ext(data) in ("png", "jpg", "webp", "gif")
+    return _strict_image_ext(data) != ""
+
+
+# JSON 响应（生图 API / ComfyUI /history / 视觉接口）的响应体上限。
+# 取 12MB 而不是更小的值：OpenAI 兼容 images API 的 b64_json 响应本身就是图片
+# （base64 约为原始字节的 4/3，IMAGE_MAX_BYTES=8MB 对应约 10.7MB），上限太小会把
+# 合法的大图响应当错误页拒掉；12MB 仍远小于"无限流打满内存"的规模。
+HTTP_JSON_MAX_BYTES = 12 * 1024 * 1024
+
+
+def _content_length(resp) -> int | None:
+    """从响应头取 Content-Length（没有/非法/负数返回 None）。"""
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    try:
+        raw = headers.get("content-length")
+    except Exception:
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
+
+
+async def _read_body_limited(resp, max_bytes: int) -> bytes | None:
+    """边收边计数读响应体；累计超过 max_bytes 立即停止并返回 None。
+
+    P2-9：超限部分不再累积（内存占用最多约 上限 + 单个 chunk），
+    用于兜住没有 Content-Length 的超大响应/无限流。
+    """
+    total = 0
+    chunks = []
+    try:
+        async for chunk in resp.aiter_bytes():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                logger.warning(
+                    f"[memory_diary] HTTP 响应超过上限（{max_bytes} 字节），已中止读取"
+                )
+                return None
+            chunks.append(chunk)
+    except Exception as e:
+        logger.warning(f"[memory_diary] 读取 HTTP 响应失败: {e}")
+        return None
+    return b"".join(chunks)
+
+
+def _effective_port(parsed) -> int:
+    """URL 的实际端口：显式端口优先，缺省按 scheme 补 80/443。"""
+    try:
+        if parsed.port:
+            return int(parsed.port)
+    except Exception:
+        pass
+    return 443 if (parsed.scheme or "").lower() == "https" else 80
+
+
+def _same_origin(url_a: str, url_b: str) -> bool:
+    """两个 URL 是否同源（scheme + host + 端口一致）。"""
+    try:
+        from urllib.parse import urlparse
+
+        a = urlparse(str(url_a or ""))
+        b = urlparse(str(url_b or ""))
+    except Exception:
+        return False
+    if not a.hostname or not b.hostname:
+        return False
+    if (a.scheme or "").lower() != (b.scheme or "").lower():
+        return False
+    if (a.hostname or "").lower() != (b.hostname or "").lower():
+        return False
+    return _effective_port(a) == _effective_port(b)
 
 
 class ImagingMixin:
@@ -506,20 +609,31 @@ class ImagingMixin:
 
     @staticmethod
     def _is_local_api_base(base: str) -> bool:
-        """云端地址是否指向本机/内网（这类自建 OpenAI 兼容服务常不校验 key）。"""
+        """云端地址是否指向本机/内网（这类自建 OpenAI 兼容服务常不校验 key）。
+
+        下载路径用它做 SSRF 判断（P2-9）：私有/回环 IP、localhost、.local
+        都算本机/内网；十进制/十六进制形式的 IPv4（http://2130706433/ 等价于
+        127.0.0.1）也要认出来，不能被绕过。
+        """
         try:
             from ipaddress import ip_address
             from urllib.parse import urlparse
 
-            host = (urlparse(base).hostname or "").strip().lower()
+            host = (urlparse(base).hostname or "").strip().lower().rstrip(".")
         except Exception:
             return False
-        if not host or host in ("localhost", "::1"):
-            return bool(host)
+        if not host:
+            return False
+        if host in ("localhost", "::1") or host.endswith(".localhost"):
+            return True
         try:
             ip = ip_address(host)
         except ValueError:
-            return host.endswith(".local")
+            # 数字形式的主机名：十进制/十六进制 IPv4（2130706433 = 127.0.0.1）
+            try:
+                ip = ip_address(int(host, 0))
+            except (TypeError, ValueError):
+                return host.endswith(".local")
         return ip.is_private or ip.is_loopback
 
     async def _cloud_image_from_response(self, resp):
@@ -748,13 +862,18 @@ class ImagingMixin:
             return 0
         return max(0, limit - self._image_usage_load()["count"])
 
-    def _image_usage_consume(self) -> bool:
-        """占用今日一张额度；额度用完/每日上限为 0 时返回 False。成功时原子写文件。"""
+    def _image_usage_consume(self) -> str:
+        """占用今日一张额度，成功返回实际记账日期 "YYYYMMDD"。
+
+        额度用完/每日上限为 0 时返回 ""（"" 是假值，既有
+        ``if not self._image_usage_consume()`` 调用点保持兼容）。
+        记账文件坏掉时按今天 0 计（不阻塞生图）。
+        """
         cfg = self._image_cfg()
         usage = self._image_usage_load()
         limit = cfg["image_limit_daily"]
         if limit <= 0 or usage["count"] >= limit:
-            return False
+            return ""
         usage["count"] += 1
         try:
             p = self._image_usage_path()
@@ -765,11 +884,22 @@ class ImagingMixin:
         except Exception as e:
             # 记账失败不阻塞生图（今天可能多画几张，但宁可多画不可崩）
             logger.warning(f"[memory_diary] 插图用量记账失败（本次照常生成）: {e}")
-        return True
+        return str(usage["date"])
 
-    def _image_usage_refund(self) -> None:
-        """生成失败时退还今日额度（配置页承诺"生成失败不计数"）。失败只记日志。"""
+    def _image_usage_refund(self, day: str = "") -> None:
+        """生成失败时退还额度（配置页承诺"生成失败不计数"）。失败只记日志。
+
+        day 是 consume 返回的记账日期：任务跨午夜后才失败时，day 与当前记账
+        日期不一致，此时**不能**扣今天的计数（否则吃掉新一天的额度），只记
+        debug 日志。day 为空保持旧行为（退当前记账文件那一天）。
+        """
         usage = self._image_usage_load()
+        if day and str(day) != str(usage.get("date") or ""):
+            logger.debug(
+                f"[memory_diary] 插图额度跨天退还（占用日 {day} ≠ 记账日 "
+                f"{usage.get('date')}），不改今天的计数"
+            )
+            return
         if usage["count"] <= 0:
             return
         usage["count"] -= 1
@@ -783,66 +913,123 @@ class ImagingMixin:
 
     # ---- HTTP 注入点（测试 monkeypatch 这三个方法即可，不联网）----
 
+    def _image_download_allowed(self, url: str) -> bool:
+        """下载地址是否允许：公网放行；本机/内网只放行配置 base 的同源地址。
+
+        P2-9：云端响应里的 url 不受信任，可被拿来打本机/内网（SSRF）。
+        但本地 ComfyUI/SD 通道的 image_local_url 本身就在本机/私网，它的
+        同源请求（/history、/view）必须照常可用；cloud 模式下则只认
+        image_api_base 的同源下载（配置本身是私网时也放行）。
+        """
+        if not self._is_local_api_base(url):
+            return True
+        cfg = self._image_cfg()
+        key = "image_api_base" if cfg.get("image_mode") == "cloud" else "image_local_url"
+        base = str(cfg.get(key) or "").strip()
+        return bool(base) and _same_origin(url, base)
+
     def _httpx_client(self, timeout: float):
         import httpx  # 运行时才 import：无 httpx 环境只影响生图，不影响插件加载
 
-        return httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+        # P2-9：不自动跟随 302/307，避免被重定向带到本机/内网；3xx 按失败处理。
+        return httpx.AsyncClient(timeout=timeout, follow_redirects=False)
 
-    async def _http_get(self, url: str, timeout: float, headers=None):
-        """HTTP GET → bytes；失败/非 200 返回 None（绝不抛）。"""
+    async def _http_get(self, url: str, timeout: float, headers=None,
+                        max_bytes: int | None = None):
+        """HTTP GET → bytes；失败/非 200/超限返回 None（绝不抛）。
+
+        P2-9：用 client.stream 边收边计数，超过上限立即中止（不回读到内存
+        超限部分）；并拒绝指向本机/内网的下载地址（配置 base 同源除外）。
+        """
+        limit = IMAGE_MAX_BYTES if max_bytes is None else int(max_bytes)
+        if not self._image_download_allowed(url):
+            logger.warning(f"[memory_diary] 拒绝下载指向本机/内网的图片地址：{url}")
+            return None
         try:
             async with self._httpx_client(timeout) as client:
-                resp = await client.get(url, headers=headers or None)
-                if resp.status_code < 200 or resp.status_code >= 300:
-                    logger.warning(
-                        f"[memory_diary] 生图通道 GET {url} 返回 {resp.status_code}"
-                    )
-                    return None
-                return resp.content
+                async with client.stream(
+                    "GET", url, headers=headers or None
+                ) as resp:
+                    if resp.status_code < 200 or resp.status_code >= 300:
+                        logger.warning(
+                            f"[memory_diary] 生图通道 GET {url} 返回 "
+                            f"{resp.status_code}"
+                        )
+                        return None
+                    declared = _content_length(resp)
+                    if declared is not None and declared > limit:
+                        logger.warning(
+                            f"[memory_diary] 生图通道 GET {url} 声明长度 "
+                            f"{declared} 超过上限 {limit}，已中止"
+                        )
+                        return None
+                    return await _read_body_limited(resp, limit)
         except Exception as e:
             logger.warning(f"[memory_diary] 生图通道 GET {url} 失败: {e}")
             return None
 
     async def _http_post_json(self, url: str, payload: dict, timeout: float,
                               headers=None):
-        """HTTP POST JSON → dict；失败/非 200/非 JSON 返回 None（绝不抛）。"""
+        """HTTP POST JSON → dict；失败/非 200/非 JSON/超限返回 None（绝不抛）。"""
         try:
             async with self._httpx_client(timeout) as client:
-                resp = await client.post(url, json=payload, headers=headers or None)
-                if resp.status_code < 200 or resp.status_code >= 300:
-                    logger.warning(
-                        f"[memory_diary] 生图通道 POST {url} 返回 "
-                        f"{resp.status_code}: {resp.text[:200]}"
-                    )
-                    return None
-                try:
-                    data = resp.json()
-                except Exception:
-                    return None
-                return data if isinstance(data, dict) else None
+                async with client.stream(
+                    "POST", url, json=payload, headers=headers or None
+                ) as resp:
+                    if resp.status_code < 200 or resp.status_code >= 300:
+                        logger.warning(
+                            f"[memory_diary] 生图通道 POST {url} 返回 "
+                            f"{resp.status_code}"
+                        )
+                        return None
+                    declared = _content_length(resp)
+                    if declared is not None and declared > HTTP_JSON_MAX_BYTES:
+                        logger.warning(
+                            f"[memory_diary] 生图通道 POST {url} 声明长度 "
+                            f"{declared} 超过上限 {HTTP_JSON_MAX_BYTES}，已中止"
+                        )
+                        return None
+                    body = await _read_body_limited(resp, HTTP_JSON_MAX_BYTES)
+                    if body is None:
+                        return None
+                    try:
+                        data = json.loads(body.decode("utf-8", "ignore"))
+                    except Exception:
+                        return None
+                    return data if isinstance(data, dict) else None
         except Exception as e:
             logger.warning(f"[memory_diary] 生图通道 POST {url} 失败: {e}")
             return None
 
     async def _http_post_multipart(self, url: str, form: dict, files: dict,
                                    timeout: float, headers=None):
-        """HTTP POST multipart → dict；失败返回 None（绝不抛）。"""
+        """HTTP POST multipart → dict；失败/超限返回 None（绝不抛）。"""
         try:
             async with self._httpx_client(timeout) as client:
-                resp = await client.post(
-                    url, data=form, files=files, headers=headers or None
-                )
-                if resp.status_code < 200 or resp.status_code >= 300:
-                    logger.warning(
-                        f"[memory_diary] 生图通道 multipart {url} 返回 "
-                        f"{resp.status_code}"
-                    )
-                    return None
-                try:
-                    data = resp.json()
-                except Exception:
-                    return None
-                return data if isinstance(data, dict) else None
+                async with client.stream(
+                    "POST", url, data=form, files=files, headers=headers or None
+                ) as resp:
+                    if resp.status_code < 200 or resp.status_code >= 300:
+                        logger.warning(
+                            f"[memory_diary] 生图通道 multipart {url} 返回 "
+                            f"{resp.status_code}"
+                        )
+                        return None
+                    declared = _content_length(resp)
+                    if declared is not None and declared > HTTP_JSON_MAX_BYTES:
+                        logger.warning(
+                            f"[memory_diary] 生图通道 multipart {url} 声明长度 "
+                            f"{declared} 超过上限 {HTTP_JSON_MAX_BYTES}，已中止"
+                        )
+                        return None
+                    body = await _read_body_limited(resp, HTTP_JSON_MAX_BYTES)
+                    if body is None:
+                        return None
+                    try:
+                        data = json.loads(body.decode("utf-8", "ignore"))
+                    except Exception:
+                        return None
+                    return data if isinstance(data, dict) else None
         except Exception as e:
             logger.warning(f"[memory_diary] 生图通道 multipart {url} 失败: {e}")
             return None

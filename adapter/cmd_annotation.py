@@ -86,7 +86,15 @@ class AnnotationCommandsMixin:
                 return
             # 第一步：选号
             if pending["ann"] is None:
-                if not text.isdigit():
+                # P3-2：isdigit() 会放行 ² 等上标数字（int() 转不了），
+                # 解析失败统一按"请回复序号"处理，不能让 ValueError 打断交互。
+                idx = None
+                if text.isdigit():
+                    try:
+                        idx = int(text)
+                    except (TypeError, ValueError):
+                        idx = None
+                if idx is None:
                     await ev.send(
                         ev.plain_result(
                             "📖 请回复序号选择要写回哪一条（回复「取消」退出）。"
@@ -94,7 +102,7 @@ class AnnotationCommandsMixin:
                     )
                     controller.keep(timeout=60, reset_timeout=True)
                     return
-                ann = self.annotation_by_index(sender_id, int(text))
+                ann = self.annotation_by_index(sender_id, idx)
                 if ann is None:
                     await ev.send(
                         ev.plain_result(

@@ -88,6 +88,15 @@ class StorageMixin:
     PROVENANCE_MAX_EXTERNAL_PER_ENTRY = 100   # 单日最多记多少条外部写入
     PROVENANCE_MAX_EXTERNAL_TOTAL = 2000      # 全 zip 外部写入记录总上限
 
+    # ---- 外部写入墓碑（P2-4）----
+    # 删除日记时，该天的 external 幂等记录不能随 zip 一起消失——否则桥超时重试同一
+    # ext_id 会把已删段落复活。墓碑存**独立侧车**（provenance 在 zip 内，整包删除会
+    # 连它一起没了），签名/验签与 provenance 同口径；内容只增不写正文，损坏 fail-closed。
+    TOMBSTONE_ENTRY = "provenance_tombstones.json"   # 签名域的逻辑条目名
+    TOMBSTONE_FILE_PREFIX = "provenance_tombstones_"
+    # 墓碑只会被删除动作写入，量级与 external 总上限一致；超出后保最近（丢最旧）。
+    TOMBSTONE_MAX_RECORDS = PROVENANCE_MAX_EXTERNAL_TOTAL
+
     # P2-20：单用户 zip 内插图字节总量上限（整包重写是 O(包大小) 的内存/耗时，
     # 不封顶的话长期使用会把写日记的同步 IO 拖垮小内存机器）
     IMAGES_TOTAL_MAX_BYTES = 256 * 1024 * 1024
@@ -618,7 +627,8 @@ class StorageMixin:
 
         异步生图的落点：日记先落盘（占位），图到了以后由这里改写同一篇。
         改写前先按现有签名验该条目，验不过就不动（绝不替被改过的正文重签）。
-        返回是否写入成功。
+        返回 True 当且仅当**正文确实变化并成功落盘**；条目不存在、或占位/待删
+        标记在正文里一个都没找到（内容没变）→ False（调用方据此退款/清理）。
         """
         path = self._diary_path(sender_id)
         if not path.exists():
@@ -671,7 +681,10 @@ class StorageMixin:
         content = re.sub(r"[ \t]+\n", "\n", content)
         content = re.sub(r"\n{3,}", "\n\n", content).strip("\n")
         if content == raw:
-            return True
+            # 契约 1（P2-7）：正文一个占位都没命中 → 内容没变化 → 不写盘、返回 False，
+            # 让异步生图任务知道「这篇日记已经不含该占位」（可能被删/重写），据此退款。
+            # 旧实现这里返回 True，生图任务会误以为替换成功并推送「插图到了」。
+            return False
         data[entry_name] = content.encode("utf-8")
         data[self._sig_entry(entry_name)] = self._entry_sig(
             sender_id, entry_name, content
@@ -1231,10 +1244,219 @@ class StorageMixin:
         ok, _ = self.update_provenance(sender_id, _mut)
         return ok
 
-    def _prune_provenance_entries(self, sender_id: str, entries: dict,
-                                  days: set) -> int:
-        """在 zip 条目 dict 里就地删除 entry[:8] ∈ days 的来源记录，返回删除条数。
+    # ---- 外部写入墓碑（P2-4）：删除后重放同一 ext_id 不得复活已删段落 ----
+    # （原「删除时直接 prune 来源记录」的 _prune_provenance_entries 已被
+    #  _tombstone_provenance_entries 取代：删除的 external 记录要转存墓碑，
+    #  不能物理丢弃，否则桥重放同一 ext_id 会把已删段落复活。）
+    def _tombstones_path(self, sender_id: str) -> Path:
+        """每个用户唯一一份墓碑侧车（独立文件，不随日记 zip 删除/导出）。"""
+        return self.data_dir / (
+            f"{self.TOMBSTONE_FILE_PREFIX}{self._diary_file_key(sender_id)}.json"
+        )
 
+    def _tombstones_sig_path(self, sender_id: str) -> Path:
+        p = self._tombstones_path(sender_id)
+        return p.with_name(f"{p.name}.sig")
+
+    @classmethod
+    def _tombstones_empty(cls) -> dict:
+        return {"version": 1, "updated_at": "", "records": []}
+
+    @staticmethod
+    def _dump_tombstones(data: dict) -> bytes:
+        """统一序列化（保存/验签共用）：同一个 dict 得到逐字节一致的 JSON。"""
+        return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+
+    def _tombstones_sig(self, sender_id: str, raw: bytes) -> str:
+        """墓碑签名：与 provenance 同口径（用户派生钥匙 + 用户 + 逻辑条目名 + 原始字节）。"""
+        uk = self._user_sign_key(sender_id)
+        if uk is None:
+            raise DiaryKeyUnavailable("签名密钥不可用")
+        return hmac.new(
+            uk,
+            sender_id.encode("utf-8")
+            + b"\n"
+            + self.TOMBSTONE_ENTRY.encode("utf-8")
+            + b"\n"
+            + bytes(raw),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _tombstones_sig_matches(self, sender_id: str, raw: bytes,
+                                actual: str) -> bool:
+        if not actual:
+            return False
+        try:
+            expected = self._tombstones_sig(sender_id, raw)
+        except DiaryKeyUnavailable:
+            return False
+        return hmac.compare_digest(expected, str(actual).strip())
+
+    @classmethod
+    def _normalize_tombstones(cls, data) -> dict:
+        """清洗墓碑记录（{source, ext_id, day, at, deleted_at}），同键保留最近一条。"""
+        out = cls._tombstones_empty()
+        if not isinstance(data, dict):
+            return out
+        out["updated_at"] = str(data.get("updated_at") or "")[:30]
+        records = data.get("records")
+        if not isinstance(records, list):
+            return out
+        cleaned = []
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            source = str(rec.get("source") or "").strip()
+            ext_id = str(rec.get("ext_id") or "").strip()
+            if not source or len(source) > cls.EXTERNAL_SOURCE_MAX:
+                continue
+            if not ext_id or len(ext_id) > cls.EXTERNAL_EXT_ID_MAX:
+                continue
+            day = re.sub(r"\D", "", str(rec.get("day") or ""))[:8]
+            cleaned.append(
+                {
+                    "source": source,
+                    "ext_id": ext_id,
+                    "day": day if len(day) == 8 else "",
+                    "at": str(rec.get("at") or "").strip()[:30],
+                    "deleted_at": str(rec.get("deleted_at") or "").strip()[:30],
+                    # 墓碑语义标记：这条 ext_id 已被删除，重放只回 replayed、不写正文
+                    "deleted": True,
+                }
+            )
+        # 同 (source, ext_id) 只留最后一条（最近一次删除）；超上限保最近
+        last = {}
+        for i, rec in enumerate(cleaned):
+            last[(rec["source"], rec["ext_id"])] = i
+        keep = set(last.values())
+        ordered = [rec for i, rec in enumerate(cleaned) if i in keep]
+        out["records"] = ordered[-cls.TOMBSTONE_MAX_RECORDS:]
+        return out
+
+    def _read_tombstones_entry(self, sender_id: str):
+        """读墓碑侧车原始字节与签名。返回 (raw 或 None, actual, 错误标记)。"""
+        path = self._tombstones_path(sender_id)
+        if not path.exists():
+            return None, "", ""
+        try:
+            raw = path.read_bytes()
+            sig_path = self._tombstones_sig_path(sender_id)
+            actual = (
+                sig_path.read_text(encoding="utf-8").strip()
+                if sig_path.exists()
+                else ""
+            )
+            return raw, actual, ""
+        except Exception as e:
+            logger.error(f"[memory_diary] 读取外部写入墓碑失败: {e}")
+            return None, "", "tampered"
+
+    def load_tombstones(self, sender_id: str):
+        """读取墓碑侧车。返回 (规范 dict, status)，status ∈ ok/missing/tampered/no_key。"""
+        raw, actual, err = self._read_tombstones_entry(sender_id)
+        if err:
+            return self._tombstones_empty(), "tampered"
+        if raw is None:
+            return self._tombstones_empty(), "missing"
+        if self._secret_key() is None:
+            logger.error("[memory_diary] 签名密钥不可用，无法验签外部写入墓碑")
+            return self._tombstones_empty(), "no_key"
+        if not self._tombstones_sig_matches(sender_id, raw, actual):
+            logger.warning(
+                f"[memory_diary] 用户 {sender_id} 的外部写入墓碑验签失败，已拒绝读取"
+            )
+            return self._tombstones_empty(), "tampered"
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            logger.error(f"[memory_diary] 外部写入墓碑无法解析（已按篡改处理）: {e}")
+            return self._tombstones_empty(), "tampered"
+        return self._normalize_tombstones(data), "ok"
+
+    def save_tombstones(self, sender_id: str, data: dict) -> bool:
+        """写入墓碑侧车（原子写 + 同口径 HMAC）。
+
+        fail-closed：旧文件验签失败/无法解析时**拒绝覆写**，绝不替被改过的内容重签。
+        """
+        if self._secret_key() is None:
+            logger.error("[memory_diary] 签名密钥不可用，已拒绝写入外部写入墓碑")
+            return False
+        path = self._tombstones_path(sender_id)
+        if path.exists():
+            raw, actual, err = self._read_tombstones_entry(sender_id)
+            if err or raw is None or not self._tombstones_sig_matches(
+                sender_id, raw, actual
+            ):
+                logger.warning(
+                    f"[memory_diary] 用户 {sender_id} 的外部写入墓碑验签失败，"
+                    "已拒绝覆盖写入"
+                )
+                return False
+            try:
+                json.loads(raw.decode("utf-8"))
+            except Exception:
+                logger.warning(
+                    f"[memory_diary] 用户 {sender_id} 的外部写入墓碑无法解析"
+                    "（疑似损坏），已拒绝覆盖写入"
+                )
+                return False
+        normalized = self._normalize_tombstones(data)
+        raw_out = self._dump_tombstones(normalized)
+        sig_out = self._tombstones_sig(sender_id, raw_out)
+        tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
+        sig_tmp = tmp.with_name(f"{tmp.name}.sig")
+        try:
+            tmp.write_bytes(raw_out)
+            sig_tmp.write_text(sig_out, encoding="utf-8")
+            os.replace(tmp, path)
+            os.replace(sig_tmp, self._tombstones_sig_path(sender_id))
+        except Exception as e:
+            logger.warning(f"[memory_diary] 外部写入墓碑写入失败: {e}")
+            return False
+        finally:
+            tmp.unlink(missing_ok=True)
+            sig_tmp.unlink(missing_ok=True)
+        return True
+
+    def record_tombstones(self, sender_id: str, records: list) -> bool:
+        """把一批删除记录并入墓碑侧车（读-验-改-写）。
+
+        失败只返回 False，由调用方记日志——删除动作本身不因墓碑问题被拒绝。
+        """
+        recs = [r for r in (records or []) if isinstance(r, dict)]
+        if not recs:
+            return True
+        data, status = self.load_tombstones(sender_id)
+        if status not in ("ok", "missing"):
+            logger.warning(
+                f"[memory_diary] 用户 {sender_id} 的外部写入墓碑不可用（{status}），"
+                "本次未记录删除墓碑"
+            )
+            return False
+        data["records"] = list(data.get("records") or []) + recs
+        data["updated_at"] = self._now().strftime("%Y-%m-%dT%H:%M:%S")
+        return self.save_tombstones(sender_id, data)
+
+    def has_tombstone(self, sender_id: str, source: str, ext_id: str):
+        """查某次外部写入是否已被删除（墓碑）。返回 (记录或 None, status)。
+
+        status 非 ok/missing 时调用方必须 fail-closed（不写、不改）。
+        """
+        data, status = self.load_tombstones(sender_id)
+        if status not in ("ok", "missing"):
+            return None, status
+        source = str(source or "").strip()
+        ext_id = str(ext_id or "").strip()
+        for rec in data.get("records") or []:
+            if rec.get("source") == source and rec.get("ext_id") == ext_id:
+                return rec, status
+        return None, status
+
+    def _tombstone_provenance_entries(self, sender_id: str, entries: dict,
+                                      days: set) -> int:
+        """把 entry[:8] ∈ days 的 external 记录转墓碑，并删除 zip 内该天的来源记录。
+
+        返回从 zip 侧车移除的条目数（与删批注时清理来源记录同口径）。
         验签失败/密钥不可用时不改（fail-closed，与批注清理同口径）。
         """
         days = {str(d).strip()[:8] for d in (days or set()) if str(d).strip()}
@@ -1255,20 +1477,100 @@ class StorageMixin:
             data = self._normalize_provenance(json.loads(raw.decode("utf-8")))
         except Exception:
             return 0
-        kept = {
-            k: v for k, v in data["entries"].items() if str(k)[:8] not in days
-        }
+        now = self._now().strftime("%Y-%m-%dT%H:%M:%S")
+        tombstones = []
+        kept = {}
+        for name, rec in data["entries"].items():
+            if str(name)[:8] in days:
+                for ext in rec.get("external") or []:
+                    tombstones.append(
+                        {
+                            "source": ext.get("source", ""),
+                            "ext_id": ext.get("ext_id", ""),
+                            "day": str(name)[:8],
+                            "at": ext.get("at", ""),
+                            "deleted_at": now,
+                        }
+                    )
+            else:
+                kept[name] = rec
         removed = len(data["entries"]) - len(kept)
         if not removed:
             return 0
+        # 先落墓碑、再由调用方重写 zip：墓碑写失败仍继续删（用户删除意图优先），
+        # 但反过来做的话，一次 IO 失败就会让重放永久复活已删段落。
+        if tombstones and not self.record_tombstones(sender_id, tombstones):
+            logger.warning(
+                f"[memory_diary] 用户 {sender_id} 的删除墓碑写入失败，"
+                "被删段落的重放可能复活"
+            )
         data["entries"] = kept
-        data["updated_at"] = self._now().strftime("%Y-%m-%dT%H:%M:%S")
+        data["updated_at"] = now
         out_raw = self._dump_provenance(data)
         entries[self.PROVENANCE_ENTRY] = out_raw
         entries[self.PROVENANCE_SIG_ENTRY] = self._provenance_sig(
             sender_id, out_raw
         ).encode("utf-8")
         return removed
+
+    def _tombstone_all_provenance(self, sender_id: str) -> int:
+        """整包删除前，把 zip 内全部 external 记录转墓碑。返回记录条数。
+
+        读不出/验签失败时只记日志并返回 0：删除是用户明确意图，不因侧车问题拒绝，
+        但要明确告警「重放可能复活」。
+        """
+        path = self._diary_path(sender_id)
+        if not path.exists():
+            return 0
+        try:
+            with zipfile.ZipFile(path) as z:
+                names = set(z.namelist())
+                if self.PROVENANCE_ENTRY not in names:
+                    return 0
+                raw = z.read(self.PROVENANCE_ENTRY)
+                actual = (
+                    z.read(self.PROVENANCE_SIG_ENTRY)
+                    .decode("utf-8", "ignore")
+                    .strip()
+                    if self.PROVENANCE_SIG_ENTRY in names
+                    else ""
+                )
+        except Exception as e:
+            logger.warning(
+                f"[memory_diary] 读取来源侧车失败，整包删除前未能记录墓碑: {e}"
+            )
+            return 0
+        if self._secret_key() is None or not self._provenance_sig_matches(
+            sender_id, raw, actual
+        ):
+            logger.warning("[memory_diary] 来源侧车验签失败，整包删除前未能记录墓碑")
+            return 0
+        try:
+            data = self._normalize_provenance(json.loads(raw.decode("utf-8")))
+        except Exception:
+            logger.warning("[memory_diary] 来源侧车无法解析，整包删除前未能记录墓碑")
+            return 0
+        now = self._now().strftime("%Y-%m-%dT%H:%M:%S")
+        records = []
+        for name, rec in data["entries"].items():
+            for ext in rec.get("external") or []:
+                records.append(
+                    {
+                        "source": ext.get("source", ""),
+                        "ext_id": ext.get("ext_id", ""),
+                        "day": str(name)[:8],
+                        "at": ext.get("at", ""),
+                        "deleted_at": now,
+                    }
+                )
+        if not records:
+            return 0
+        if not self.record_tombstones(sender_id, records):
+            logger.warning(
+                f"[memory_diary] 用户 {sender_id} 的删除墓碑写入失败，"
+                "被删段落的重放可能复活"
+            )
+        return len(records)
 
     def _prune_annotations_entries(self, sender_id: str, entries: dict,
                                    days: set) -> int:
@@ -1329,7 +1631,9 @@ class StorageMixin:
             logger.warning(f"[memory_diary] 读取日记 zip 失败，批注未清理: {e}")
             return 0
         removed = self._prune_annotations_entries(sender_id, entries, days)
-        removed += self._prune_provenance_entries(sender_id, entries, days)
+        # P2-4：该天日记可能还在，只是批注被删——external 幂等记录不能直接丢，
+        # 否则桥重放同一 ext_id 会把同一段内容重复追加；转墓碑后重放返回 replayed。
+        removed += self._tombstone_provenance_entries(sender_id, entries, days)
         if not removed:
             return 0
         try:
@@ -1396,18 +1700,29 @@ class StorageMixin:
         except Exception:
             return entry_name
 
-    def _list_entries(self, sender_id: str) -> list:
-        """列出该用户全部日记条目（按时间升序）。会自动做旧格式迁移。"""
-        self._migrate_legacy(sender_id)
+    def _entries_status(self, sender_id: str) -> dict:
+        """列出条目并带验签状态（P2-13 专用查询，不改 _list_entries 的返回契约）。
+
+        返回 {"entries": [...], "unsigned": [...], "tampered": bool}：
+        · entries   按时间升序的全部 diaries/*.md——**包括缺签名的**，让指令层能
+          把它们列出来并删除（否则用户「看不了、删不了」陷入死局）；
+        · unsigned  其中缺少 sigs/*.sig 的条目（读路径按篡改处理，绝不展示正文）；
+        · tampered  是否有缺签名条目，或本次旧格式迁移因验签失败被中止。
+        会自动做旧格式迁移（迁移结果决定 tampered）。
+        """
+        migration = self._migrate_legacy(sender_id)
         path = self._diary_path(sender_id)
-        entries = []
+        entries, unsigned = [], []
         if path.exists():
             try:
                 with zipfile.ZipFile(path) as z:
                     names = set(z.namelist())
                     for n in names:
-                        if self.ENTRY_NAME_RE.match(n) and self._sig_entry(n) in names:
-                            entries.append(n)
+                        if not self.ENTRY_NAME_RE.match(n):
+                            continue
+                        entries.append(n)
+                        if self._sig_entry(n) not in names:
+                            unsigned.append(n)
             except zipfile.BadZipFile:
                 # 读路径不把损坏吞成"没有日记"：error 级日志 + 指令层用 _corrupt_notice 区分
                 logger.error(
@@ -1416,7 +1731,19 @@ class StorageMixin:
                 )
             except Exception as e:
                 logger.warning(f"[memory_diary] 列出日记条目失败: {e}")
-        return sorted(entries)
+        return {
+            "entries": sorted(entries),
+            "unsigned": sorted(unsigned),
+            "tampered": migration == "tampered" or bool(unsigned),
+        }
+
+    def _list_entries(self, sender_id: str) -> list:
+        """列出该用户全部日记条目（按时间升序）。会自动做旧格式迁移。
+
+        P2-13：缺签名/签名丢失的条目也会列出（供指令层提示验签失败并允许删除），
+        它们的内容由 _load_entry 判 tampered、不会展示；写路径仍 fail-closed。
+        """
+        return self._entries_status(sender_id)["entries"]
 
     def _corrupt_notice(self, sender_id: str) -> str:
         """日记文件损坏时给用户的提示文案；未损坏返回空串（P1-3 读路径）。
@@ -1486,11 +1813,15 @@ class StorageMixin:
         return raw.strip(), False
 
     def _load_latest(self, sender_id: str):
-        """读取最新一篇日记。返回 (content, tampered, entry_name 或 None)。"""
-        migration = self._migrate_legacy(sender_id)
-        entries = self._list_entries(sender_id)
+        """读取最新一篇日记。返回 (content, tampered, entry_name 或 None)。
+
+        P2-13：缺签名的条目也参与「最新」判定（tampered=True），不再因为
+        _list_entries 过滤而返回「一篇都没有」；迁移中止时同样置 tampered。
+        """
+        status = self._entries_status(sender_id)
+        entries = status["entries"]
         if not entries:
-            return "", migration == "tampered", None
+            return "", status["tampered"], None
         content, tampered = self._load_entry(sender_id, entries[-1])
         return content, tampered, entries[-1]
 
@@ -1499,24 +1830,81 @@ class StorageMixin:
     def _pref_path(self, sender_id: str) -> Path:
         return self.data_dir / f"pref_{safe_key(sender_id)}.json"
 
-    def _load_pref_data(self, sender_id: str) -> dict:
-        """读取用户偏好文件（含注入范围、素材游标、备忘等）。"""
+    def _pref_corrupt_files(self) -> set:
+        """进程内记录已告警/已备份的损坏偏好文件（避免每次读取刷日志）。"""
+        cache = self.__dict__.get("_pref_corrupt_cache")
+        if cache is None:
+            cache = self.__dict__["_pref_corrupt_cache"] = set()
+        return cache
+
+    @staticmethod
+    def _backup_corrupt_pref(p: Path) -> None:
+        """把损坏的偏好文件复制成 .corrupt 备份（保留原件，供管理员恢复）。"""
+        backup = p.with_name(f"{p.name}.corrupt")
         try:
-            data = json.loads(self._pref_path(sender_id).read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
+            if not backup.exists():
+                backup.write_bytes(p.read_bytes())
+        except Exception as e:
+            logger.warning(f"[memory_diary] 偏好文件备份失败（{p.name}）: {e}")
+
+    def _read_pref_file(self, sender_id: str):
+        """读取偏好文件，返回 (data, ok)。
+
+        P3-8：区分「文件不存在」（ok=True、空 dict = 旧行为）与「解析失败」
+        （ok=False）：解析失败时把坏文件复制成 .corrupt 备份并记 warning，
+        调用方（_save_pref_data）必须据此**拒绝覆盖**——否则一次磁盘损坏或
+        手工编辑就会用空数据冲掉真实的注入范围/备忘/查看密码。
+        """
+        p = self._pref_path(sender_id)
+        cache = self._pref_corrupt_files()
+        if not p.exists():
+            cache.discard(p.name)
+            return {}, True
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("偏好文件内容不是 JSON 对象")
+        except Exception as e:
+            if p.name not in cache:
+                cache.add(p.name)
+                self._backup_corrupt_pref(p)
+                logger.warning(
+                    f"[memory_diary] 用户偏好文件无法解析（{p.name}），"
+                    f"已备份为 .corrupt 并拒绝后续写入: {e}"
+                )
+            return {}, False
+        cache.discard(p.name)
+        return data, True
+
+    def _load_pref_data(self, sender_id: str) -> dict:
+        """读取用户偏好文件（含注入范围、素材游标、备忘等）。
+
+        P3-8：解析失败不再静默当空——记 warning 并备份坏文件，写入侧拒绝覆盖；
+        「文件不存在」仍按空数据（旧行为）。
+        """
+        data, _ok = self._read_pref_file(sender_id)
+        return data
 
     def _save_pref_data(self, sender_id: str, data: dict) -> bool:
         """保存偏好数据；返回是否成功——失败时调用方必须告知用户，不能谎报（P2-5）。
 
         原子写（P1-1）：先写临时文件再 os.replace，避免 write_text 原地截断
         导致一次崩溃丢掉范围设置/备忘/素材游标。
+        P3-8：现有偏好文件损坏时拒绝写入（否则会用空数据覆盖真实的范围/备忘/
+        查看密码）；管理员修复或移走坏文件后才恢复。
         注意：会**就地**删除传入 dict 里的废弃字段（last_material_hash），
         调用方传入的都应是本函数域内新建/新加载的 dict，不要复用它。
         """
         try:
             p = self._pref_path(sender_id)
+            # P3-8：先确认现有文件不是损坏的——否则整文件读-改-写会拿空 dict 覆盖真实数据
+            _existing, ok = self._read_pref_file(sender_id)
+            if not ok:
+                logger.warning(
+                    f"[memory_diary] 用户 {sender_id} 的偏好文件损坏，"
+                    "已拒绝写入以避免覆盖真实的范围/备忘/查看密码"
+                )
+                return False
             # 已废弃字段（素材哈希机制已被素材游标取代）：旧 pref 文件里可能还留着，
             # 在这里统一清掉——否则每次「读-改-写」都会把它原样带回，永远删不掉。
             data.pop("last_material_hash", None)
@@ -2106,8 +2494,14 @@ class StorageMixin:
                     # 与读取路径一致：v0.4.0 之前的条目是主密钥直签，
                     # 验签必须走带回退的 _entry_sig_matches，否则旧日记会被误判成篡改
                     if not self._entry_sig_matches(sender_id, n, text, actual):
-                        logger.warning(f"[memory_diary] 篇目 {n} 验签失败，迁移时跳过")
-                        continue
+                        # P2-15：任一篇验签失败就整次中止（与 v1/v2 口径一致）。
+                        # 原实现是 continue 后整包重写——失败篇连正文带签名一起被
+                        # 永久删除且不隔离，本可抢救的内容直接没了。
+                        logger.warning(
+                            f"[memory_diary] 篇目 {n} 验签失败，为保证原文件不被"
+                            "部分重写丢失，本次迁移中止（原 zip 未改动）"
+                        )
+                        return "tampered"
                     day_map.setdefault(n[:8], []).append(
                         (f"{n[9:11]}:{n[11:13]}", text)
                     )
@@ -2117,8 +2511,11 @@ class StorageMixin:
                         data.get(n[:-3] + ".sig", b"").decode("utf-8", "ignore").strip()
                     )
                     if not self._entry_sig_matches(sender_id, n, text, actual):
-                        logger.warning(f"[memory_diary] 日记 {n} 验签失败，迁移时跳过")
-                        continue
+                        logger.warning(
+                            f"[memory_diary] 日记 {n} 验签失败，为保证原文件不被"
+                            "部分重写丢失，本次迁移中止（原 zip 未改动）"
+                        )
+                        return "tampered"
                     day_map.setdefault(n[:8], []).append(("", text))
                 if not day_map:
                     return "tampered"
@@ -2234,6 +2631,9 @@ class StorageMixin:
         return None
 
     def _delete_diary(self, sender_id: str) -> bool:
+        # P2-4：整包删除会连 zip 内的 provenance 一起删掉——先把 external 幂等
+        # 记录转存到独立墓碑侧车，否则桥重放同一 ext_id 会把已删日记整篇复活。
+        self._tombstone_all_provenance(sender_id)
         existed = False
         for p in (self._diary_path(sender_id), *self._legacy_diary_paths(sender_id)):
             try:
@@ -2277,8 +2677,9 @@ class StorageMixin:
         # 与日记删除在同一次原子写入里完成，避免"日记删了、批注没删"的两步状态。
         if deleted_days:
             self._prune_annotations_entries(sender_id, data, deleted_days)
-            # 来源级联：该天的 <self> 来源记录一并清理（与批注同纪律）
-            self._prune_provenance_entries(sender_id, data, deleted_days)
+            # 来源级联（P2-4）：该天的 <self> 来源记录随日记清理；external 幂等记录
+            # 转墓碑侧车而不是直接丢——否则桥重放同一 ext_id 会让已删段落复活。
+            self._tombstone_provenance_entries(sender_id, data, deleted_days)
 
         remaining_days = [
             n for n in data if self.ENTRY_NAME_RE.match(n) and n not in remove
@@ -2923,7 +3324,12 @@ class StorageMixin:
             return False
 
     def _view_password_rec(self, owner_id: str):
-        rec = self._load_pref_data(owner_id).get("view_password")
+        data, ok = self._read_pref_file(owner_id)
+        if not ok:
+            # P3-8：偏好文件损坏 → 密码记录不可知。按「已设密码且无法验证」处理
+            # （fail-closed），绝不因为一次磁盘损坏就静默解除 Web 日记本密码闸。
+            return {"hash": "", "corrupt": True}
+        rec = data.get("view_password")
         return rec if isinstance(rec, dict) and rec.get("hash") else None
 
     def _build_export_bundle(self, sender_id: str, diary_path: Path,

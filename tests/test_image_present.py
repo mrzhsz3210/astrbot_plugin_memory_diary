@@ -216,7 +216,7 @@ async def test_view_diary_zero_image_output_is_byte_identical_to_baseline():
 
 
 async def test_write_diary_notice_appends_image_notice_and_clears_it():
-    """手动 /写日记 的通知会追加 _image_last_notice（读一次即清空）。"""
+    """手动 /写日记 的通知会追加插图提示（按 sender 分键，读一次即清空）。"""
     async with World(
         config=img_config(diary_op_interval=0, write_min_ratio=0, use_persona=False)
     ) as world:
@@ -228,14 +228,17 @@ async def test_write_diary_notice_appends_image_notice_and_clears_it():
         async def fake_write(umo, sender_id, sender_name, **kwargs):
             state["calls"] += 1
             if state["calls"] == 1:
-                plugin._image_last_notice = notice
+                # P3-24：提示按 sender 分键，不再写插件级字段 _image_last_notice
+                plugin._image_notice_put(sender_id, notice)
             return "假日记正文", None
 
         plugin._write_diary = fake_write
         out = await inst.run_handler("write_diary_cmd", private_event("/写日记"))
         text = "\n".join(out)
         assert "正在给这篇日记画一幅插图" in text, f"写日记通知没有追加插图提示：{text!r}"
-        assert plugin._image_last_notice == "", "插图提示行读一次后没有清空"
+        assert plugin._image_notice_pending().get(SENDER, "") == "", (
+            "插图提示行读一次后没有清空"
+        )
 
         # 第二次不再追加（清空生效）
         out2 = await inst.run_handler("write_diary_cmd", private_event("/写日记"))
@@ -450,16 +453,20 @@ async def test_persona_image_cmd_modify_truncates_to_200_chars():
         plugin = inst.plugin
 
         desc = "黑" * 260
-        out = await inst.run_handler(
-            "persona_image_cmd", private_event(f"/形象 修改 {desc}")
-        )
+        # P2-19：写形象档案需要 AstrBot 管理员；假事件没有 role，用 role="admin"
+        # 标记管理员身份（判定逻辑见 cmd_help_persona._is_admin_event）。
+        modify_event = private_event(f"/形象 修改 {desc}")
+        modify_event.role = "admin"
+        out = await inst.run_handler("persona_image_cmd", modify_event)
         text = "\n".join(out)
         stored = plugin.config.get("persona_image_desc", "")
         assert len(stored) == 200, f"超过 200 字应截断，实际 {len(stored)} 字"
         assert stored == "黑" * 200
         assert "已截断" in text, f"截断应明确告知用户：{text!r}"
 
-        empty = await inst.run_handler("persona_image_cmd", private_event("/形象 修改"))
+        empty_event = private_event("/形象 修改")
+        empty_event.role = "admin"
+        empty = await inst.run_handler("persona_image_cmd", empty_event)
         assert "用法" in "\n".join(empty)
 
 
@@ -482,7 +489,9 @@ async def test_persona_image_cmd_propose_then_confirm():
         assert pending.get("kind") == "init", "首次提案 kind 应为 init"
         assert plugin.config.get("persona_image_desc", "") == "", "提案不能直接写进配置"
 
-        confirmed = await inst.run_handler("persona_image_cmd", private_event("/形象 确认"))
+        confirmed_event = private_event("/形象 确认")
+        confirmed_event.role = "admin"  # P2-19：写形象档案需要 AstrBot 管理员
+        confirmed = await inst.run_handler("persona_image_cmd", confirmed_event)
         assert "已确认并写入配置" in "\n".join(confirmed)
         assert (
             plugin.config.get("persona_image_desc")
@@ -490,7 +499,9 @@ async def test_persona_image_cmd_propose_then_confirm():
         )
         assert plugin._load_pending_persona_desc(SENDER) == {}
 
-        again = await inst.run_handler("persona_image_cmd", private_event("/形象 确认"))
+        again_event = private_event("/形象 确认")
+        again_event.role = "admin"
+        again = await inst.run_handler("persona_image_cmd", again_event)
         assert "没有确认成功" in "\n".join(again)
 
 

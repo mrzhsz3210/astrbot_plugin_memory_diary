@@ -194,19 +194,18 @@ class MemoCommandsMixin:
                 controller.stop()
                 return
             if text.isdigit():
-                idx = int(text)
-                if 1 <= idx <= len(cur):
+                # P3-2：isdigit() 会放行 ² 等上标数字（int() 转不了），
+                # 解析失败统一走"没看懂"分支，不能让 ValueError 打断交互。
+                try:
+                    idx = int(text)
+                except (TypeError, ValueError):
+                    idx = None
+                if idx is not None and 1 <= idx <= len(cur):
                     target = cur[idx - 1]
-                    # 按内容+时间定位删除，避免序号在两次读取间漂移
-                    rest = [
-                        m
-                        for m in cur
-                        if not (
-                            m.get("text") == target.get("text")
-                            and m.get("time") == target.get("time")
-                            and self._memo_scene(m) == self._memo_scene(target)
-                        )
-                    ]
+                    # P3-4：按下标只删这一个元素。旧实现按"内容+时间"过滤，同文本
+                    # 同分钟的两条备忘会被一次删掉两条却只提示删一条；cur 是刚重新
+                    # 读取的列表，下标此刻有效，不存在"序号漂移"问题。
+                    rest = cur[: idx - 1] + cur[idx:]
                     data = self._load_pref_data(sender_id)
                     if rest:
                         data["memos"] = rest
@@ -231,7 +230,9 @@ class MemoCommandsMixin:
                             )
                         )
                     )
-                else:
+                    controller.stop()
+                    return
+                if idx is not None:
                     canned = f"📌 没有这个序号（当前共 {len(cur)} 条），已取消。"
                     await ev.send(
                         ev.plain_result(
@@ -244,8 +245,9 @@ class MemoCommandsMixin:
                             )
                         )
                     )
-                controller.stop()
-                return
+                    controller.stop()
+                    return
+            # 没看懂（含 P3-2 里 isdigit() 但 int() 解析失败的输入，如 ²）
             # P3-15：用法提示分支记 repr，便于看到不可见字符
             logger.warning(
                 f"[memory_diary] 删除备忘没看懂用户回复，原始消息："

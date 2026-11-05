@@ -123,6 +123,9 @@ select.ctl { max-width: 220px; }
   border-radius: 14px;
   box-shadow: 0 14px 22px var(--shadow);
 }
+/* display:flex 会顶掉 hidden 属性的默认样式（同 .paper-menu[hidden]）：
+ * 没有这条规则时，删光/空目录下 book.hidden=true 但书仍然可见。 */
+.book[hidden] { display: none; }
 
 .page {
   flex: 1;
@@ -329,6 +332,19 @@ select.ctl { max-width: 220px; }
 }
 .diary-img .img-warning,
 .diary-img .img-missing-text { white-space: normal; word-break: break-word; }
+
+/* 需要解锁才能看（P3-21）：图其实还在，只是当前没有查看权限（need_password /
+ * need_owner），不能跟「图片缺失」用同一种视觉，否则用户以为插图坏了。 */
+.diary-img.img-gated {
+  display: block;
+  padding: 14px 16px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.diary-img.img-gated img { display: none; }
+.diary-img.img-gated::after { content: "🔒 插图需要先解锁查看"; }
 
 /* ---------- 页边批注（v0.6） ----------
  * 角标落在原文旁边（学术论文式上标）；.ann-mark 是锚点原文 + 角标 + 卡片的

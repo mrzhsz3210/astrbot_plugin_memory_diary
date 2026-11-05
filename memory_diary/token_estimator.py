@@ -112,6 +112,12 @@ def estimate_messages(messages, system_prompt: str = "") -> int:
         if isinstance(msg, dict):
             content = msg.get("content", "")
             total += estimate_text(_content_text(content))
+            # P3-11：assistant 消息里的 tool_calls（工具名 + 参数 JSON）同样占用
+            # 上下文。以前这里完全没算，工具型 agent 的上下文会被系统性低估
+            # （实测 4000 字符工具参数只算 3 tokens），提前触发的估算门槛就偏乐观。
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                total += estimate_text(str(tool_calls))
             images += _content_image_count(content)
         else:
             total += estimate_text(msg)

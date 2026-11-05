@@ -72,6 +72,8 @@ class WebDiaryApiMixin:
             "日记本：上传自定义背景板")
         reg(f"/{PLUGIN_NAME}/image/<file_key>/<name>", self.web_get_diary_image,
             ["GET"], "日记本：读取日记插图")
+        reg(f"/{PLUGIN_NAME}/unlock/<file_key>", self.web_unlock, ["POST"],
+            "日记本：用查看密码换取短期访问令牌（后续读接口带 query tk）")
         # 外部写入（v0.6.2，issue #3）：面向无面板会话的本地程序，走 AstrBot
         # v1 API key + 插件写入凭证双闸，实现见 adapter/web_note.py
         reg(f"/{PLUGIN_NAME}/note", self.web_external_note, ["POST"],
@@ -80,16 +82,95 @@ class WebDiaryApiMixin:
     @staticmethod
     def _valid_file_key(file_key: str) -> bool:
         return bool(re.fullmatch(r"[0-9a-f]{16}", file_key or ""))
-    def _check_web_password(self, owner_id: str, for_download: bool = False,
-                            pw: str = None):
+
+    # ---- 查看密码 → 短期会话令牌（P3-7） ----
+    #
+    # 查看密码原先经 GET query 传输，会进访问日志 / 浏览器历史 / Referer。
+    # 宿主 bridge 的 api:get 与 files:download 只能带 query 参数、不能带自定义
+    # header（已核对 AstrBot v4.29.3 PluginViewPage.vue），所以令牌走 query 参数
+    # 名 `tk`：前端先 POST /unlock/<file_key> 用密码换令牌，之后读接口带 tk。
+    # 令牌只放进程内存：不落盘、不进日志，插件重启即失效。
+    _WEB_TOKEN_TTL = 1800   # 令牌有效期（秒），与前端 expires_in 一致
+    _WEB_TOKEN_MAX = 256    # 同时在用的令牌上限，超出丢最旧的
+
+    def _web_token_store(self) -> dict:
+        """内存令牌表（懒初始化）：token -> {file_key, owner, exp}。"""
+        tokens = getattr(self, "_web_tokens", None)
+        if not isinstance(tokens, dict):
+            tokens = {}
+            self._web_tokens = tokens
+        return tokens
+
+    def _web_token_now(self) -> float:
+        try:
+            return float(self._now().timestamp())
+        except Exception:
+            return 0.0
+
+    def _web_prune_tokens(self, now_ts: float) -> None:
+        """清掉已过期（或损坏）的令牌。"""
+        tokens = self._web_token_store()
+        for token in [
+            t for t, rec in tokens.items()
+            if not isinstance(rec, dict) or float(rec.get("exp") or 0) <= now_ts
+        ]:
+            tokens.pop(token, None)
+
+    def _web_issue_token(self, owner_id: str, file_key: str) -> str:
+        """签发一枚绑定 (file_key, owner) 的短期令牌，返回 <hex>。"""
+        now_ts = self._web_token_now()
+        tokens = self._web_token_store()
+        self._web_prune_tokens(now_ts)
+        while len(tokens) >= self._WEB_TOKEN_MAX:
+            tokens.pop(next(iter(tokens)), None)
+        token = secrets.token_hex(24)
+        tokens[token] = {
+            "file_key": str(file_key),
+            "owner": str(owner_id),
+            "exp": now_ts + self._WEB_TOKEN_TTL,
+        }
+        return token
+
+    def _web_token_valid(self, owner_id: str, file_key: str, token=None) -> bool:
+        """query `tk` 是否命中该 (file_key, owner) 且未过期。
+
+        token=None 时从 query 取 `tk`（GET 读接口）；POST 批量删除由调用方
+        把请求体里的 tk 传进来（宿主 bridge 的 api:post 不能带 query）。
+        """
+        if token is None:
+            try:
+                token = _web_request.query.get("tk", "") or ""
+            except Exception:
+                token = ""
+        token = str(token or "").strip()
+        if not token or not file_key:
+            return False
+        tokens = self._web_token_store()
+        rec = tokens.get(token)
+        if not isinstance(rec, dict):
+            return False
+        if float(rec.get("exp") or 0) <= self._web_token_now():
+            tokens.pop(token, None)
+            return False
+        return (
+            str(rec.get("file_key") or "") == str(file_key)
+            and str(rec.get("owner") or "") == str(owner_id)
+        )
+
+    def _check_web_password(self, owner_id: str, file_key: str = "",
+                            for_download: bool = False, pw: str = None,
+                            tk: str = None):
         """Web 翻阅 / 导出 / 删除的密码闸。返回 None 放行；否则返回给前端的响应。
 
+        校验顺序（P3-7）：先认 query `tk` 令牌（对该 file_key + owner 有效且未
+        过期）；否则回退旧密码通道——GET 从 query 取 pw，POST（批量删除）由调用
+        方把请求体里的 pw 传进来（pw=None 时沿用 query，保证既有行为逐字节不变）。
         for_download=True 时（bridge.download 期望文件响应）用错误而非 JSON 表达。
-        GET 接口从 query 取 pw；POST 接口（批量删除）把密码放在请求体里，由调用方
-        通过 pw 参数传入（pw=None 时沿用 query，保证原有 GET 行为逐字节不变）。
         """
         rec = self._view_password_rec(owner_id)
         if rec is None:
+            return None
+        if self._web_token_valid(owner_id, file_key, tk):
             return None
         if pw is None:
             pw = _web_request.query.get("pw", "") or ""
@@ -98,9 +179,51 @@ class WebDiaryApiMixin:
             if for_download:
                 return _web_error("PASSWORD_REQUIRED", status_code=403)
             return _web_json({"need_password": True})
+        # 兼容保留旧 pw 通道（前端迁移到 tk 后可以删掉）；只记弃用、不记密码本体
+        logger.debug(
+            "[memory_diary] Web 密码闸仍在用已弃用的 pw 参数，建议改用 /unlock 令牌"
+        )
         if not self._verify_view_password(rec, pw):
             return _web_error("PASSWORD_WRONG", status_code=403)
         return None
+
+    async def web_unlock(self, file_key: str):
+        """用查看密码换短期访问令牌（P3-7）。
+
+        POST body: ``{"pw": "密码", "qq": "可选，旧 zip 确认主人用"}``。
+        成功 200 ``{"unlocked": true, "token": "<hex>", "expires_in": 1800}``；
+        没设查看密码的日记也发令牌（前端统一带 tk，后端行为不变）；
+        密码错 403 ``PASSWORD_WRONG``；旧 zip 未解析出主人 200 ``{"need_owner": true}``。
+        """
+        if not self._valid_file_key(file_key):
+            return _web_error("无效的用户标识", status_code=400)
+        path = self.data_dir / f"diary_{file_key}.zip"
+        if not path.exists():
+            return _web_error("日记文件不存在", status_code=404)
+        payload = await _web_request.json(default={})
+        if not isinstance(payload, dict):
+            return _web_error("无效的请求内容", status_code=400)
+        qq_hint = str(payload.get("qq") or "").strip()
+        if not qq_hint:
+            qq_hint = (_web_request.query.get("qq", "") or "").strip()
+        owner, err = self._resolve_zip_owner(path, file_key, qq_hint)
+        if not owner:
+            if err == "OWNER_UNKNOWN":
+                return _web_json({"need_owner": True})
+            return _web_error(f"无法确认日记主人：{err}", status_code=400)
+        rec = self._view_password_rec(owner)
+        if rec is not None:
+            pw = str(payload.get("pw") or "").strip()
+            if not pw:
+                return _web_error("PASSWORD_REQUIRED", status_code=403)
+            if not self._verify_view_password(rec, pw):
+                return _web_error("PASSWORD_WRONG", status_code=403)
+        return _web_json({
+            "unlocked": True,
+            "token": self._web_issue_token(owner, file_key),
+            "expires_in": self._WEB_TOKEN_TTL,
+        })
+
     async def web_list_users(self):
         users = []
         owner_map = None
@@ -179,7 +302,7 @@ class WebDiaryApiMixin:
             if err == "OWNER_UNKNOWN":
                 return _web_json({"need_owner": True})
             return _web_error(f"无法确认日记主人：{err}", status_code=400)
-        gate = self._check_web_password(owner)
+        gate = self._check_web_password(owner, file_key)
         if gate is not None:
             return gate
         entry = self._md_entry(day)
@@ -232,7 +355,7 @@ class WebDiaryApiMixin:
             if err == "OWNER_UNKNOWN":
                 return _web_json({"need_owner": True})
             return _web_error(f"无法确认日记主人：{err}", status_code=400)
-        gate = self._check_web_password(owner)
+        gate = self._check_web_password(owner, file_key)
         if gate is not None:
             return gate
         raw_name = str(name or "").strip()
@@ -359,8 +482,11 @@ class WebDiaryApiMixin:
                 return _web_json({"need_owner": True})
             return _web_error(f"无法确认日记主人：{err}", status_code=400)
         # 删除比翻阅更敏感：设了查看密码的日记，删除也必须先过密码闸。
-        # 密码在 POST 请求体里（GET 接口才用 query），见 _check_web_password 的 pw 参数。
-        gate = self._check_web_password(owner, pw=payload.get("pw"))
+        # 宿主 bridge 的 api:post 不能带 query，所以批量删除的令牌/密码都在
+        # 请求体里（tk/pw）；GET 接口才用 query。见 _check_web_password 的参数。
+        gate = self._check_web_password(
+            owner, file_key, pw=payload.get("pw"), tk=payload.get("tk")
+        )
         if gate is not None:
             return gate
 

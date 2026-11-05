@@ -36,6 +36,19 @@ def _extra_texts(req) -> list[str]:
     return [getattr(part, "text", str(part)) for part in req.extra_user_content_parts]
 
 
+async def _ack(plugin):
+    """模拟请求成功后的 on_llm_response（P2-12：注入要等它确认才算成功）。
+
+    harness 不会自动触发钩子；多轮注入用例必须显式 ack，否则会被当成
+    "首轮请求失败"而允许重新注入。resp 传 None（无 usage 时直接返回）。
+    差分场景里 baseline 是更老的实现、没有该钩子（老版本 AstrBot 兼容路径），
+    此时跳过 ack——它会按旧行为"交付即落位"，两侧结果仍然可比。
+    """
+    response_hook = getattr(plugin, "on_llm_response", None)
+    if response_hook is not None:
+        await response_hook(_event(), None)
+
+
 def _seed_diary(inst):
     plugin = inst.plugin
     plugin._save_diary(
@@ -59,6 +72,7 @@ async def test_temporary_injection_only_on_first_request():
             inst.set_history([message("user", "旧消息")])
             first = _request(contexts=[{"role": "user", "content": "你好"}])
             await plugin.on_llm_request(_event(), first)
+            await _ack(plugin)
 
             second = _request(contexts=[{"role": "user", "content": "你好"}])
             await plugin.on_llm_request(_event(), second)
@@ -147,11 +161,13 @@ async def test_reset_generation_detection_via_command_and_empty_contexts():
             inst.set_history([message("user", "旧消息")])
             first = _request()
             await plugin.on_llm_request(_event(), first)
+            await _ack(plugin)
 
             # /reset seen by on_any_message: next request re-injects.
             await plugin.on_any_message(_event("/reset"))
             after_command = _request()
             await plugin.on_llm_request(_event(), after_command)
+            await _ack(plugin)
             reset_pending_after = set(plugin._reset_pending)
 
             # Empty contexts also counts as a new generation (cid unchanged).
@@ -164,6 +180,7 @@ async def test_reset_generation_detection_via_command_and_empty_contexts():
             inst.set_history([message("user", "新会话消息")], cid="cid-2")
             new_cid = _request()
             await plugin.on_llm_request(_event(), new_cid)
+            await _ack(plugin)
             return {
                 "first_extra": _extra_texts(first),
                 "command_extra": _extra_texts(after_command),

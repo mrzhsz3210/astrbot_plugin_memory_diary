@@ -5,13 +5,18 @@
 必须留在 main.py（AstrBot 按 ``handler.__module__`` 绑定 handler），这里只放实现。
 """
 
-from astrbot.api.event import AstrMessageEvent
+from astrbot.api.event import AstrMessageEvent, filter as event_filter
 from astrbot.api.provider import ProviderRequest
 
 from ..memory_diary.common import strip_trailing_decorations
 from ..memory_diary.constants import INJECT_TEMPLATE
 from ..memory_diary.log import logger
 from .compat import TextPart
+
+# P2-12：老版本 AstrBot 4.x 没有 on_llm_response 钩子（main.py 末尾按 hasattr
+# 动态注册）。没有它就无法确认"这一轮请求真的成功了"，此时退回旧行为——交付即
+# 落位，避免"已注入"永远无法确认、每轮重复注入。
+_HAS_RESPONSE_HOOK = hasattr(event_filter, "on_llm_response")
 
 
 class EventHooksMixin:
@@ -131,18 +136,28 @@ class EventHooksMixin:
             self._reset_pending.discard(umo0)
             if reset_flagged or not req.contexts:
                 cid0 = await self._curr_cid(umo0)
-                prev_watch = self._watch_state.get(umo0)
+                # P1-4：状态按 (umo, sender) 命名空间化，命中判定用当前发送者的键
+                key0 = self._inject_state_key(
+                    umo0, event.get_sender_id(), bool(event.get_group_id())
+                )
+                prev_watch = self._watch_state.get(key0)
                 if reset_flagged or (
                     cid0
                     and (
-                        self._injected_cid.get(umo0) == cid0
+                        self._injected_cid.get(key0) == cid0
                         or (prev_watch and prev_watch.get("cid") == cid0)
                     )
                 ):
-                    self._injected_cid.pop(umo0, None)
-                    self._injected_entries.pop(umo0, None)
-                    self._pending_inject.pop(umo0, None)
-                    self._watch_state.pop(umo0, None)
+                    # /reset 清的是整个会话的上下文：非会话隔离的群聊里所有发送者
+                    # 都属于新一代，一并失效（其它会话的状态不受影响）。
+                    for state in (
+                        self._injected_cid,
+                        self._injected_entries,
+                        self._inject_confirm,
+                        self._pending_inject,
+                        self._watch_state,
+                    ):
+                        self._pop_session_state(state, umo0)
                     # 新上下文：上一代的占用估算已失效，状态页回退历史估算
                     self._last_context_used.pop(umo0, None)
                     logger.info(
@@ -169,17 +184,19 @@ class EventHooksMixin:
             in_group = bool(event.get_group_id())
             umo = event.unified_msg_origin
             cid = await self._curr_cid(umo)
+            # P1-4：注入去重/代际状态按 (umo, sender) 命名空间化；私聊键就是 umo
+            state_key = self._inject_state_key(umo, sender_id, in_group)
 
-            # 本会话已注入过的篇目记录（用于手动追加注入时去重）
-            rec = self._injected_entries.get(umo)
+            # 本命名空间已注入过的篇目记录（用于手动追加注入时去重）
+            rec = self._injected_entries.get(state_key)
             if not rec or rec.get("cid") != cid:
                 rec = {"cid": cid, "names": set()}
-                self._injected_entries[umo] = rec
+                self._injected_entries[state_key] = rec
                 self._cap_state(self._injected_entries)
 
             # a) 用户用 /注入日记 主动要求的追加注入：下一轮请求一次性带入。
             #    P2-12：手动注入是用户明确指令，不受"新会话自动读取"开关影响。
-            pending = self._pending_inject.pop(umo, None)
+            pending = self._pending_inject.pop(state_key, None)
             pending_names: set = set()
             if pending is not None:
                 scope = pending
@@ -235,8 +252,7 @@ class EventHooksMixin:
                         + "\n\n"
                         + INJECT_TEMPLATE.format(diary=inject_diary)
                     )
-                    self._injected_cid[umo] = cid
-                    self._cap_state(self._injected_cid)
+                    self._mark_inject_delivered(state_key, cid)
                     rec["names"].update(names)
                 elif tampered_any:
                     logger.warning(
@@ -247,19 +263,22 @@ class EventHooksMixin:
             # 临时模式（默认）：每个新会话的第一次 LLM 请求注入一次。
             # 不再要求 contexts 为空——/reset 后如果用户先发了 /查看日记 等命令，
             # 历史可能已经不是空的，硬性跳过会导致本会话永远注入不上。
-            if self._injected_cid.get(umo) == cid:
+            if self._injected_cid.get(state_key) == cid:
                 return
             diary, tampered_any, names = self._assemble_inject(
-                sender_id, in_group=in_group
+                sender_id, in_group=in_group, exclude_names=pending_names
             )
             if not diary:
                 if tampered_any:
                     logger.warning(
                         f"[memory_diary] 用户 {sender_id} 的日记均被篡改，跳过注入"
                     )
+                # P2-10：本轮已经用 /注入日记 的 pending 把日记塞进请求了，虽然自动
+                # 注入被排除空了，也要算作"本代际已注入"，否则下一轮又会整篇重注入。
+                if pending_names:
+                    self._mark_inject_delivered(state_key, cid)
                 return
-            self._injected_cid[umo] = cid
-            self._cap_state(self._injected_cid)
+            self._mark_inject_delivered(state_key, cid)
             rec["names"].update(names)
             # 本分支就是"本代际第一次注入日记"：此刻同步生成批注（失败静默降级），
             # 再把批注块拼在日记后一起注入；关闭态返回空串，注入文本逐字节不变。
@@ -282,12 +301,38 @@ class EventHooksMixin:
             # 注入完成后重算本次静态估算：校准样本 E 要与真正发出去的请求同口径
             self._refresh_pending_estimate(event.unified_msg_origin, req)
 
+    def _mark_inject_delivered(self, key: str, cid: str) -> None:
+        """记录"本轮已把日记塞进请求"：等 on_llm_response 确认后才算成功（P2-12）。
+
+        AstrBot 的 on_llm_request 在真正调用 provider 之前触发；provider 失败
+        （超时/网络错误/被别的插件 stop_event 终止）时不会触发 on_llm_response，
+        这一轮也进不了会话历史。所以"已注入"不能在交付时就落位——否则首轮失败
+        后 `_injected_cid` 命中，整个代际再也不注入（又回到"reset 后失忆"）。
+        这里只记一条"已交付待确认"；on_llm_response 成功时才写入 `_injected_cid`。
+        老版本 AstrBot 没有 on_llm_response 钩子时退回旧行为（交付即确认）。
+        """
+        if not _HAS_RESPONSE_HOOK:
+            self._injected_cid[key] = cid
+            self._cap_state(self._injected_cid)
+            return
+        self._inject_confirm[key] = cid
+        self._cap_state(self._inject_confirm)
+
     async def _handle_on_llm_response(self, event: AstrMessageEvent, resp):
         """拿到本次请求的真实 token 用量，对估算系数做 EWMA 自适应校准。（``main.on_llm_response`` 的实现）"""
         try:
+            # P2-12：拿到响应说明这一轮请求真的成功了，此刻才确认"本代际已注入"。
+            # 这一步与校准开关无关，必须在 _calibration_enabled 判断之前执行。
+            umo = event.unified_msg_origin
+            state_key = self._inject_state_key(
+                umo, event.get_sender_id(), bool(event.get_group_id())
+            )
+            confirmed_cid = self._inject_confirm.pop(state_key, None)
+            if confirmed_cid is not None:
+                self._injected_cid[state_key] = confirmed_cid
+                self._cap_state(self._injected_cid)
             if not self._calibration_enabled():
                 return
-            umo = event.unified_msg_origin
             pending = self._pending_estimates.pop(umo, None)
             if not pending:
                 return
@@ -297,6 +342,19 @@ class EventHooksMixin:
             actual = int(getattr(usage, "input_other", 0) or 0) + int(
                 getattr(usage, "input_cached", 0) or 0
             )
+            # P3-13：多步工具 agent 的样本口径不一致——E 是首个请求的静态估算，
+            # actual 是 agent 最后一步（含累计工具结果）的真实用量，两者配对会把
+            # 系数系统性往高处推。AstrBot 在每次工具执行后往 ProviderRequest 的
+            # tool_calls_result 里追加结果（同一次请求的同一个 req 对象），因此
+            # on_llm_response 时能据此判定"这一轮跑过多步工具"，直接跳过采样。
+            req_ref = pending.get("req_ref")
+            req = req_ref() if callable(req_ref) else None
+            if req is not None and getattr(req, "tool_calls_result", None):
+                logger.debug(
+                    "[memory_diary] 多步工具 agent：本轮 usage 与首步静态估算"
+                    "口径不一致，跳过本次校准采样"
+                )
+                return
             self._update_calibration(
                 str(pending.get("key") or ""),
                 int(pending.get("estimate", 0) or 0),

@@ -101,13 +101,21 @@ class MemoryDiaryCore(
                 "——请检查 AstrBot 数据目录的写入权限，插件将无法保存日记"
             )
 
-        # 记录每个会话（umo）上一次注入日记时的 conversation_id，避免重复注入
+        # 注入/去重/哨兵状态统一按「命名空间键」存（P1-4），键由
+        # ``_inject_state_key(umo, sender_id, in_group)`` 生成：私聊就是 umo，
+        # 群聊是 ``umo::sender_id``。私聊 umo 本身已按用户唯一，沿用 umo 既与
+        # 旧状态口径一致，也避免 AstrBot 会话隔离/非隔离下的行为差异。
+        # 记录每个命名空间上一次注入日记时的 conversation_id，避免重复注入
         self._injected_cid: dict = {}
-        # 每个会话已注入过的日记篇目：umo -> {"cid": str, "names": set}
+        # 每个命名空间已注入过的日记篇目：key -> {"cid": str, "names": set}
         self._injected_entries: dict = {}
-        # 用户主动要求的追加注入（/注入日记）：umo -> scope，下一次请求时生效
+        # P2-12：已交付、等待 on_llm_response 确认的注入：key -> cid。
+        # 只有请求真正成功（拿到响应）才把 cid 写进 _injected_cid；失败路径
+        # 不触发 on_llm_response，标记留在这里，下一次请求会重新注入。
+        self._inject_confirm: dict = {}
+        # 用户主动要求的追加注入（/注入日记）：key -> scope，下一次请求时生效
         self._pending_inject: dict = {}
-        # 上下文哨兵状态：umo -> {"cid": str, "reminded": bool, "auto_written": bool}
+        # 上下文哨兵状态：key -> {"cid": str, "reminded": bool, "auto_written": bool}
         self._watch_state: dict = {}
         # 防止同一会话并发触发自动写日记
         self._writing: set = set()
@@ -150,7 +158,9 @@ class MemoryDiaryCore(
         # 全局并发生图上限（image_concurrency；首次调度时惰性创建）
         self._image_semaphore = None
         self._image_semaphore_cap = 0
-        # 最近一次写日记的插图提示行（main.py 在"写好了"通知后读取并清空）
+        # P3-24：``_image_last_notice`` 已废弃——插图提示改为按 sender 分键
+        # （service._image_notice_put / _image_notice_take），业务路径不再读写它。
+        # 这里仅保留空字段兼容仍在读取旧字段的断言/外部代码；不要删、也不要写值。
         self._image_last_notice = ""
         # 白名单拒绝提示已发过的身份（附录 A 修复：每个身份只提示一次，防刷屏）
         self._whitelist_hint_sent: set = set()
@@ -226,6 +236,35 @@ class MemoryDiaryCore(
             while len(d) > _STATE_CAP:
                 d.pop()
 
+    # ------------------------- 注入/哨兵状态命名空间（P1-4） -------------------------
+
+    @staticmethod
+    def _inject_state_key(umo, sender_id, in_group) -> str:
+        """注入/去重/哨兵状态的命名空间键（P1-4 群聊多用户隔离）。
+
+        - 私聊：直接用 umo。私聊 umo 形如 ``...FriendMessage:<uid>``，本身已按
+          用户唯一；沿用 umo 也保持既有状态、``/reset`` 清理口径与差分基线一致。
+        - 群聊：``<umo>::<sender_id>``。AstrBot 默认非会话隔离时，同群多个白名单
+          用户共享同一个 group umo 与 conversation_id，而日记是按 sender 组装/
+          落盘的。状态若只按 umo 共享，A 注入后 B 的请求永远为空、B 的
+          ``/注入日记`` 会被判"本会话都读过了"、哨兵也只给 A 自动写。
+        - 开启会话隔离时群聊 umo 已按用户唯一，加上 sender 后仍各自独立。
+        """
+        if in_group:
+            return f"{umo}::{sender_id}"
+        return str(umo)
+
+    @staticmethod
+    def _pop_session_state(d, umo: str) -> None:
+        """删掉某会话下的全部注入/哨兵状态（群聊含其下所有发送者命名空间）。
+
+        ``/reset`` 清的是**整个会话**（非会话隔离的群聊共享同一上下文），所以
+        该 umo 下每个发送者的命名空间都要失效；其它会话/私聊不受影响。
+        """
+        prefix = f"{umo}::"
+        for key in [k for k in list(d) if k == umo or str(k).startswith(prefix)]:
+            d.pop(key, None)
+
     @staticmethod
     def _is_cancel(text: str) -> bool:
         """会话等待中的取消口令：用户改主意时立即退出等待，不必干等超时
@@ -286,6 +325,7 @@ class MemoryDiaryCore(
                 logger.warning(f"[memory_diary] 停止插图任务异常: {e}")
         self._injected_cid.clear()
         self._injected_entries.clear()
+        self._inject_confirm.clear()
         self._pending_inject.clear()
         self._watch_state.clear()
         self._writing.clear()

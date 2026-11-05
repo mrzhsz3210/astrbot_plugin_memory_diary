@@ -13,6 +13,17 @@ from ..memory_diary.log import logger
 class SettingsCommandsMixin:
     """指令实现：/日记密码、/日记状态、/日记范围、/注入日记。"""
 
+    def _revoke_web_session_tokens(self) -> None:
+        """P3-7 配套：查看密码变更/取消后立即吊销已签发的面板短期令牌。
+
+        令牌表由 web-api 懒初始化在 ``_web_tokens`` 上（不落盘、不进日志）；这里
+        只清零，绝不创建：既不要在缺属性时建实例属性，也**绝不给类加**
+        ``_web_tokens = {}`` 类属性默认值——那会跨插件实例共享同一张表。
+        """
+        tokens = getattr(self, "_web_tokens", None)
+        if isinstance(tokens, dict):
+            tokens.clear()
+
     async def _handle_diary_password(self, event: AstrMessageEvent):
         """设置/修改/取消 Web 日记本页面的查看密码（仅私聊、仅本人）。（``main.diary_password`` 的实现）"""
         if not self._should_respond(event):
@@ -81,6 +92,7 @@ class SettingsCommandsMixin:
             if not self._save_pref_data(sender_id, data):
                 yield event.plain_result("📖 保存失败（数据目录不可写），密码未设置。")
                 return
+            self._revoke_web_session_tokens()
             yield event.plain_result(
                 await self._say(
                     event.unified_msg_origin,
@@ -126,6 +138,7 @@ class SettingsCommandsMixin:
             if not self._save_pref_data(sender_id, data):
                 yield event.plain_result("📖 保存失败（数据目录不可写），密码未改动。")
                 return
+            self._revoke_web_session_tokens()
             yield event.plain_result(
                 await self._say(
                     event.unified_msg_origin,
@@ -160,6 +173,7 @@ class SettingsCommandsMixin:
             if not self._save_pref_data(sender_id, data):
                 yield event.plain_result("📖 保存失败（数据目录不可写），密码未改动。")
                 return
+            self._revoke_web_session_tokens()
             yield event.plain_result(
                 await self._say(
                     event.unified_msg_origin,
@@ -348,7 +362,10 @@ class SettingsCommandsMixin:
 
         # 哨兵状态
         cid = await self._curr_cid(umo)
-        state = self._watch_state.get(umo) or {}
+        # P1-4：哨兵/注入状态按 (umo, sender) 命名空间化，群聊里展示当前发送者
+        # 自己的状态，而不是被群里第一个说话的人占用的会话级状态。
+        state_key = self._inject_state_key(umo, sender_id, in_group)
+        state = self._watch_state.get(state_key) or {}
         watch_ok = (remind_ratio > 0 or auto_ratio > 0) and limit > 0
         if watch_ok and state.get("cid") == cid:
             flags = []
@@ -367,7 +384,7 @@ class SettingsCommandsMixin:
             inject_info = "无日记可注入"
         elif not bool(self.config.get("enable_auto_inject", True)):
             inject_info = "已关闭（配置面板关了自动读取）"
-        elif self._injected_cid.get(umo) == cid:
+        elif self._injected_cid.get(state_key) == cid:
             inject_info = "本会话已注入 ✅"
         else:
             inject_info = "本会话未注入（你下一句正常对话时注入；命令消息不触发）"
@@ -554,10 +571,13 @@ class SettingsCommandsMixin:
             return
         umo = event.unified_msg_origin
         cid = await self._curr_cid(umo)
-        rec = self._injected_entries.get(umo)
+        # P1-4：去重记录与待注入按 (umo, sender) 命名空间化——群聊里 A 读过的篇目
+        # 不能挡住 B 的 /注入日记，B 的待注入也只能给 B 的下一轮请求用。
+        state_key = self._inject_state_key(umo, sender_id, bool(event.get_group_id()))
+        rec = self._injected_entries.get(state_key)
         if not rec or rec.get("cid") != cid:
             rec = {"cid": cid, "names": set()}
-            self._injected_entries[umo] = rec
+            self._injected_entries[state_key] = rec
         already = rec["names"]
         new_targets = [t for t in targets if t not in already]
         if not new_targets:
@@ -572,7 +592,7 @@ class SettingsCommandsMixin:
             )
             return
 
-        self._pending_inject[umo] = parsed
+        self._pending_inject[state_key] = parsed
         self._cap_state(self._pending_inject)
         labels = "、".join(self._entry_label(t) for t in new_targets)
         dup_note = (

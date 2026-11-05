@@ -13,7 +13,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from harness import compare
-from harness.fakes import at_other, file_component, make_event
+from harness.fakes import at_me, at_other, file_component, make_event
 from harness.world import (
     BRIEF_TEXT,
     DIARY_TEXT,
@@ -24,6 +24,24 @@ from harness.world import (
 
 SENDER = "10001"
 SENDER_NAME = "阿罗"
+
+# P3-6：群聊「多 AI 防冲突」提示语在 baseline（固定旧文案）与 refactor
+# （按 group_require_at 分流）之间不同，差分前只去掉尾部这句差异；
+# 两种文案的存在性由 test_help_command_private_and_group_addressing 里的
+# refactor-only 断言单独钉住，否则这条行为变化在差分套件里不可见。
+_GROUP_TIP_VARIANTS = (
+    "在指令后 @我 才是叫我哦。",
+    "直接发指令即可，想明确叫我也能在指令后 @我。",
+)
+
+
+def _strip_group_tip(results):
+    texts = []
+    for text in results or []:
+        for sentence in _GROUP_TIP_VARIANTS:
+            text = text.replace(sentence, "")
+        texts.append(text)
+    return texts
 
 
 def private_event(text: str, **kwargs):
@@ -69,10 +87,11 @@ async def test_help_command_private_and_group_addressing():
             group_require_no_at = await inst.run_handler(
                 "diary_help", group_event("/日记帮助")
             )
+            inst.plugin.config["group_require_at"] = False
             return {
                 "private": private,
-                "group_plain": group_plain,
-                "group_at_me": group_at_me,
+                "group_plain": _strip_group_tip(group_plain),
+                "group_at_me": _strip_group_tip(group_at_me),
                 "group_at_other": group_at_other,
                 "group_require_no_at": group_require_no_at,
             }
@@ -95,6 +114,22 @@ async def test_help_command_private_and_group_addressing():
         assert "私聊专用" in raw_help[0].split("/查看批注")[1][:40]
         assert value["group_at_other"] == []
         assert value["group_require_no_at"] == []
+        # P3-6：群聊帮助尾部提示语必须跟 group_require_at 的实际口径一致。
+        # 默认 false：不提示"必须@"，而是说明直接发指令即可（refactor-only）。
+        raw_group = await world.refactor.run_handler(
+            "diary_help", group_event("/日记帮助")
+        )
+        assert "本群多 AI 防冲突" in raw_group[0]
+        assert "直接发指令即可" in raw_group[0]
+        assert "在指令后 @我 才是叫我哦" not in raw_group[0]
+        # 配置 true：才提示"在指令后 @我"
+        world.refactor.plugin.config["group_require_at"] = True
+        raw_group_at = await world.refactor.run_handler(
+            "diary_help", group_event("/日记帮助", messages=[at_me("99999")])
+        )
+        assert "在指令后 @我 才是叫我哦" in raw_group_at[0]
+        assert "直接发指令即可" not in raw_group_at[0]
+        world.refactor.plugin.config["group_require_at"] = False
 
 
 async def test_memo_add_and_view_commands():

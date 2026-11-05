@@ -182,13 +182,13 @@ class WriteCommandsMixin:
                         "名额已用完；可以继续写简记，或次日 00:00 重置后再写完整篇）"
                     )
 
-        # v0.6 插图提示行（有图在画 / 有形象提案待确认），由 _write_diary 写入
-        # _image_last_notice；读一次即清空，避免串到下一次通知里。
+        # v0.6 插图提示行（有图在画 / 有形象提案待确认），由 _write_diary 与插图模块
+        # 按 sender 登记在 _image_notice_by_sender；只读并清自己 sender 的那一份
+        #（P3-24：多人并发写日记时不会互相清空/串号，也不再回退插件级全局字段）。
         # 只在手动 /写日记 的通知处追加——自动写日记的通知路径保持 v0.5.5 原样。
-        image_notice = getattr(self, "_image_last_notice", "") or ""
+        image_notice = self._image_notice_take(sender_id) or ""
         if image_notice:
             notice += image_notice
-            self._image_last_notice = ""
 
         if (
             bool(self.config.get("show_diary_after_write", False))

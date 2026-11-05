@@ -21,6 +21,17 @@ class HelpPersonaCommandsMixin:
         """查看记忆日记插件的全部指令与用法。（``main.diary_help`` 的实现）"""
         if not self._should_respond(event):
             return
+        # P3-6：群聊提示语必须与实际闸门口径一致——只有配置明确要求 @ 时才提示 @；
+        # 默认（group_require_at=false）直接发指令就能用，不能固定提示"必须@"来误导用户。
+        group_tip = ""
+        if event.get_group_id():
+            if self.config.get("group_require_at", False):
+                group_tip = "本群多 AI 防冲突已生效：在指令后 @我 才是叫我哦。"
+            else:
+                group_tip = (
+                    "本群多 AI 防冲突已生效：直接发指令即可，"
+                    "想明确叫我也能在指令后 @我。"
+                )
         yield event.plain_result(
             "📖 记忆日记 · 指令一览\n"
             "━━━━━━━━━━━━━━\n"
@@ -44,11 +55,7 @@ class HelpPersonaCommandsMixin:
             "━━━━━━━━━━━━━━\n"
             "小提示：上下文快满时我会主动提醒并自动写好日记；\n"
             "写完发 /reset，我会先读一遍日记再继续陪你。\n"
-            + (
-                "本群多 AI 防冲突已生效：在指令后 @我 才是叫我哦。"
-                if event.get_group_id()
-                else ""
-            )
+            + group_tip
         )
 
     # ------------------------- 指令：形象档案（插图一致性，D6） -------------------------
@@ -60,12 +67,38 @@ class HelpPersonaCommandsMixin:
 
     _PERSONA_DESC_MAX = 200
 
+    # P2-19：形象档案是插件实例级设置（影响所有用户看到的插画），写操作只有
+    # AstrBot 管理员能做；只读查看与「重拟」提案保持白名单用户可用。
+    _PERSONA_ADMIN_REQUIRED_TEXT = (
+        "📖 形象档案是插件实例级设置，只有 AstrBot 管理员能改。\n"
+        "请让管理员发 /形象 修改 <描述> 或 /形象 确认。"
+    )
+
+    @staticmethod
+    def _is_admin_event(event: AstrMessageEvent) -> bool:
+        """判断事件发送者是不是 AstrBot 管理员（P2-19）。
+
+        优先用 AstrBot 的 ``event.is_admin()``（4.29.3 实现为 role == "admin"）；
+        老版本/测试假事件没有该方法时回退读 ``event.role``；两者都取不到按
+        非管理员处理（fail closed），不把实例级配置交给普通用户。
+        """
+        try:
+            is_admin = getattr(event, "is_admin", None)
+            if callable(is_admin):
+                return bool(is_admin())
+        except Exception:
+            pass
+        try:
+            return str(getattr(event, "role", "") or "").strip().lower() == "admin"
+        except Exception:
+            return False
+
     def _persona_image_usage_text(self) -> str:
         return (
             "📖 形象档案用法：\n"
             "· /形象 —— 查看当前形象档案与待确认的提案\n"
-            "· /形象 确认 —— 采纳待确认的提案并写入配置\n"
-            "· /形象 修改 <描述> —— 直接修改形象描述（最多 200 字）\n"
+            "· /形象 确认 —— 采纳待确认的提案并写入配置（需 AstrBot 管理员）\n"
+            "· /形象 修改 <描述> —— 直接修改形象描述（最多 200 字，需 AstrBot 管理员）\n"
             "· /形象 重拟 —— 让我按当前人设重新提炼一版提案（先给你确认）"
         )
 
@@ -102,6 +135,9 @@ class HelpPersonaCommandsMixin:
             return
 
         if action in ("确认", "确认提案", "采纳"):
+            if not self._is_admin_event(event):
+                yield event.plain_result(self._PERSONA_ADMIN_REQUIRED_TEXT)
+                return
             ok, payload = self._apply_pending_persona_desc(sender_id)
             if ok:
                 yield event.plain_result(
@@ -116,6 +152,9 @@ class HelpPersonaCommandsMixin:
             return
 
         if action in ("修改", "改"):
+            if not self._is_admin_event(event):
+                yield event.plain_result(self._PERSONA_ADMIN_REQUIRED_TEXT)
+                return
             desc = re.sub(r"\s+", " ", rest).strip()
             desc = self._strip_invisible(desc).strip()
             if not desc:

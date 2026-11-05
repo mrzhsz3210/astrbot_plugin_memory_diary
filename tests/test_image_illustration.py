@@ -137,7 +137,8 @@ async def test_image_gate_daily_remaining_caps_but_does_not_consume():
         plugin = _plugin(world)
         # 已用 5 张，今天只剩 1 张额度
         for _ in range(5):
-            assert plugin._image_usage_consume() is True
+            # 契约 2（v0.6.2 审查 P3-15）：consume 成功返回实际记账日期
+            assert plugin._image_usage_consume() == DAY
         assert plugin._image_usage_remaining() == 1
 
         assert plugin._image_gate(SENDER, False, "full", 2) == 1, (
@@ -147,11 +148,11 @@ async def test_image_gate_daily_remaining_caps_but_does_not_consume():
         assert plugin._image_gate(SENDER, False, "full", 2) == 1
         assert plugin._image_usage_remaining() == 1
 
-        assert plugin._image_usage_consume() is True
+        assert plugin._image_usage_consume() == DAY
         assert plugin._image_gate(SENDER, False, "full", 2) == 0, (
             "每日额度用完后不应再允许插图"
         )
-        assert plugin._image_usage_consume() is False
+        assert plugin._image_usage_consume() == "", "额度用完应返回空串"
 
     async with World(config=img_config(image_prob_full=1.0, image_limit_daily=0)) as world:
         plugin = _plugin(world)
@@ -159,7 +160,7 @@ async def test_image_gate_daily_remaining_caps_but_does_not_consume():
         # 注意：_conf_schema.json 里该键的 hint 目前写的是"0 = 不限制"，与实现相反，
         # 已作为文档不一致项报给 lead，测试以实现语义为准。
         assert plugin._image_usage_remaining() == 0
-        assert plugin._image_usage_consume() is False
+        assert plugin._image_usage_consume() == ""
         assert plugin._image_gate(SENDER, False, "full", 2) == 0
 
 
@@ -934,7 +935,7 @@ async def test_run_image_job_refunds_quota_on_failure_but_not_on_success():
         cfg = plugin._image_cfg()
 
         # 失败（返回 None）：先占额度 1，失败后应退还到 0
-        assert plugin._image_usage_consume() is True
+        assert plugin._image_usage_consume() == DAY
         assert plugin._image_usage_load()["count"] == 1
 
         async def fail_generate(prompt, size, ref_path=""):
@@ -944,14 +945,14 @@ async def test_run_image_job_refunds_quota_on_failure_but_not_on_success():
         await plugin._run_image_job(
             sender_id=SENDER, sender_name="阿罗", umo=UMO, day=DAY,
             pending_ref=pendings[0], alt="画面1", orientation="portrait",
-            prompt="画面1", cfg=cfg,
+            prompt="画面1", cfg=cfg, usage_day=DAY,
         )
         assert plugin._image_usage_load()["count"] == 0, (
             "生图失败应退还每日额度（生成失败不计数）"
         )
 
         # 异常路径：同样退还
-        assert plugin._image_usage_consume() is True
+        assert plugin._image_usage_consume() == DAY
 
         async def broken_generate(prompt, size, ref_path=""):
             raise RuntimeError("上游 500")
@@ -960,12 +961,12 @@ async def test_run_image_job_refunds_quota_on_failure_but_not_on_success():
         await plugin._run_image_job(
             sender_id=SENDER, sender_name="阿罗", umo=UMO, day=DAY,
             pending_ref=pendings[1], alt="画面2", orientation="portrait",
-            prompt="画面2", cfg=cfg,
+            prompt="画面2", cfg=cfg, usage_day=DAY,
         )
         assert plugin._image_usage_load()["count"] == 0, "任务异常也应退还额度"
 
         # 成功路径：额度不退还（真的产出了一张图）
-        assert plugin._image_usage_consume() is True
+        assert plugin._image_usage_consume() == DAY
 
         async def ok_generate(prompt, size, ref_path=""):
             return png(41)
@@ -974,7 +975,7 @@ async def test_run_image_job_refunds_quota_on_failure_but_not_on_success():
         await plugin._run_image_job(
             sender_id=SENDER, sender_name="阿罗", umo=UMO, day=DAY,
             pending_ref=pendings[2], alt="画面3", orientation="portrait",
-            prompt="画面3", cfg=cfg,
+            prompt="画面3", cfg=cfg, usage_day=DAY,
         )
         assert plugin._image_usage_load()["count"] == 1, "成功生成不应退还额度"
         assert len(plugin.list_images(SENDER)) == 1
@@ -1019,7 +1020,9 @@ async def _run_write_with_photos(n_photos: int):
         return {
             "content": content,
             "err": err,
-            "notice": plugin._image_last_notice or "",
+            # P3-24：插图提示改为按 sender 分键（_image_notice_pending），
+            # 不再读写插件级共享字段 _image_last_notice。
+            "notice": plugin._image_notice_pending().get(SENDER, ""),
             "images": plugin.list_images(SENDER),
             "saved": plugin._load_latest(SENDER)[0],
             "saved_tampered": plugin._load_latest(SENDER)[1],

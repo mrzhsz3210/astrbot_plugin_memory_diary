@@ -490,7 +490,8 @@ async def test_legacy_v3_flat_day_and_per_entry_migration():
         assert "—— 当天 20:30 记 ——" in value["contents"][1]
 
 
-async def test_legacy_v3_tampered_entry_skipped():
+async def test_legacy_v3_tampered_entry_aborts_migration():
+    """P2-15：混合验签失败时整次中止——绝不 continue 后整包重写（失败篇会永久消失）。"""
     async with World() as world:
         async def scenario(inst):
             plugin = inst.plugin
@@ -503,13 +504,16 @@ async def test_legacy_v3_tampered_entry_skipped():
                     name[:-3] + ".sig": b"not-a-real-signature",
                 },
             )
+            before = path.read_bytes()
             return {
                 "result": plugin._migrate_legacy("10001"),
                 "entries": plugin._list_entries("10001"),
+                "zip_unchanged": path.read_bytes() == before,
             }
 
         pair = await world.run_pair(scenario, label="v3 tampered")
         assert pair.value["result"] == "tampered"
+        assert pair.value["zip_unchanged"] is True
 
 
 async def test_hmac_filename_migration_from_legacy_md5_name():

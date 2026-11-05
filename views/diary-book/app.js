@@ -18,6 +18,16 @@ let loading = false;
 /* 插图回填的“代次”：每次真正替换正文前自增。图片请求是异步的，
  * 返回时 token 或当前页不匹配说明用户已经翻页/换人，这张图必须丢弃。 */
 let viewToken = 0;
+/* 切用户 / 刷新目录的“代次”（与 viewToken 分开）：文件夹目录请求 await 回来时
+ * 若代次已变，说明用户又切了人 / 点了刷新，这次结果必须放弃，否则旧用户的
+ * 目录和正文会落到新用户身上。 */
+let navToken = 0;
+/* 翻页请求还在路上时又请求了另一页：记下最后一次，等当前请求结束再翻，
+ * 不再静默丢按键（旧实现 loading 期间 return，按键像没反应）。 */
+let pendingDay = null;
+/* 正在请求的那一页下标：连按方向键时以它为基准连续翻页（而不是以屏幕上
+ * 还没更新的 dayIdx 为基准，否则连按两次只会翻一页）。 */
+let inflightDay = null;
 
 /* 批量删除（v0.6.1）：目录里勾选的日期，用 d.day（YYYYMMDD）作键。
  * 勾选只对当前用户/当前目录有意义，切换用户或刷新目录时必须清空。 */
@@ -35,8 +45,15 @@ const FONT_SIZE_MIN = 13;
 const FONT_SIZE_MAX = 22;
 let prefs = { font_size: 16, font_family: "kai", paper: "default", backdrop: "default" };
 
-/* 查看密码只在本页面会话内缓存（不写磁盘、不进 localStorage） */
-const sessionPw = {};
+/* 查看密码的短时凭证（v0.6.2 契约 3）：解锁 POST /unlock/<file_key> 换取 token，
+ * 之后所有读接口用 query 参数 `tk` 携带（宿主 bridge 的 api:get/api:post 不支持
+ * 自定义 header）。密码本身只在 unlock 的 POST body 里出现，不再放进 query，
+ * 避免进访问日志 / 浏览器历史。凭证只存内存：刷新页面后需要重新输入密码。 */
+const sessionToken = {};
+const sessionTokenExp = {};
+/* 本地比后端提前 5s 作废，留出请求在途的时间余量；后端仍是权威。 */
+const TOKEN_SKEW_MS = 5000;
+const TOKEN_TTL_FALLBACK_S = 1800;
 /* 自定义纸张 / 背景板图片缓存。这里存的是 blob: URL，不是 base64 data URL：
  * Chromium/Edge 会把 CSS 自定义属性值截断到 1,000,000 字符，而一张 2MB 图片的
  * base64 约 3MB，直接塞进 --d-paper-image 会被截断成非法 URL，背景画不出来，
@@ -358,6 +375,245 @@ $("dialogInput").addEventListener("keydown", (e) => {
 });
 $("dialogInput").addEventListener("input", () => setDialogError(""));
 
+/* ---------- 查看密码凭证（v0.6.2 契约 3） ---------- */
+function tokenAlive(key = currentKey) {
+  const token = sessionToken[key];
+  if (!token) return false;
+  const exp = sessionTokenExp[key] || 0;
+  if (exp && Date.now() >= exp - TOKEN_SKEW_MS) {
+    delete sessionToken[key];
+    delete sessionTokenExp[key];
+    return false;
+  }
+  return true;
+}
+
+function setSessionToken(key, token, expiresIn) {
+  if (!key || !token) return;
+  sessionToken[key] = String(token);
+  const ttl = Number(expiresIn) > 0 ? Number(expiresIn) : TOKEN_TTL_FALLBACK_S;
+  sessionTokenExp[key] = Date.now() + ttl * 1000;
+}
+
+function clearSessionToken(key = currentKey) {
+  if (!key) return;
+  delete sessionToken[key];
+  delete sessionTokenExp[key];
+}
+
+/* 读接口的凭证参数：token 走 query `tk`（契约 3）。没有可用 token 时返回空对象，
+ * 由后端返回 need_password / 403 PASSWORD_REQUIRED，再走 acquireToken 的闸门。 */
+function authParams() {
+  return tokenAlive(currentKey) ? { tk: sessionToken[currentKey] } : {};
+}
+
+/* 主人 QQ 对话框（旧 zip 没有主人信息时用；unlock 接口用它验签/解析 owner） */
+async function askOwnerQq({ message, error = "", okText = "验签并解锁" }) {
+  return askDialog({
+    title: "确认日记主人",
+    message,
+    error,
+    inputMode: "numeric",
+    placeholder: "日记主人的 QQ 号",
+    okText,
+  });
+}
+
+/* owner 解析成功后本地更新用户信息（P3-20）：owner/protected 以便顶栏 🔒/🔓
+ * 与下拉框标签立刻正确。不重新拉 users，避免把人正在勾选的批量删除选择清掉。
+ * passwordVerified=true 表示刚才的密码确实验证通过（acquireToken 成功），
+ * 此时 protected 必定是 true；只解出 owner 时不能乱动 protected。 */
+function markOwnerResolved(qq, { passwordVerified = false } = {}) {
+  const u = users.find((x) => x.file_key === currentKey);
+  if (!u) return;
+  u.owner_known = true;
+  if (!u.owner && qq) u.owner = String(qq);
+  if (passwordVerified) u.protected = true;
+  $("ownerHint").hidden = true;
+  syncUserSelectLabels();
+  updateLockUI();
+}
+
+/* 下拉框标签依赖 protected / owner：本地更新后要重写选项文字（保持当前选中） */
+function syncUserSelectLabels() {
+  const sel = $("userSelect");
+  for (let i = 0; i < sel.options.length && i < users.length; i += 1) {
+    sel.options[i].textContent = userLabel(users[i]);
+  }
+}
+
+/* 走「主人 QQ → 查看密码」两道闸门，用 unlock 接口换短时 token。
+ * 返回 true 表示 token 已就绪；false 表示用户取消或失败（提示已给出）。
+ * needOwner=true 时先问主人 QQ（旧 zip 的说明里没有用户ID）。
+ */
+async function acquireToken({ reason = "", needOwner = false, qq = "", intent = "打开" } = {}) {
+  const key = currentKey;
+  if (!key) return false;
+  let ownerQq = qq ? String(qq) : "";
+  let error = "";
+  let silentTried = false;
+  const askQq = (err = "") =>
+    askOwnerQq({
+      message:
+        "这份旧日记的说明里没有主人 QQ（文件名是加密的、反推不出）。\n" +
+        `请输入日记主人的 QQ 号：会用它全量验签，通过后才会${intent}。`,
+      error: err,
+    });
+  if (needOwner && !ownerQq) {
+    const asked = await askQq();
+    if (asked === null) {
+      toast("已取消");
+      return false;
+    }
+    ownerQq = asked;
+  }
+  for (;;) {
+    // 有主人 QQ 时先不带密码试换一次令牌：旧 zip 可能根本没设查看密码，
+    // 后端对「没设密码的日记」直接发令牌，不该让用户白输一次密码。
+    if (ownerQq && !silentTried) {
+      silentTried = true;
+      let silent = null;
+      try {
+        silent = await bridge.apiPost(`unlock/${key}`, { qq: ownerQq });
+      } catch (e) {
+        const msg = e.message || "";
+        if (!msg.includes("PASSWORD_REQUIRED") && !msg.includes("PASSWORD_WRONG")) {
+          // QQ 验签不过 / 文件不存在等：重新问主人 QQ
+          const asked = await askQq("QQ 号与日记签名对不上，请重新输入。");
+          if (asked === null) {
+            toast("已取消");
+            return false;
+          }
+          ownerQq = asked;
+          silentTried = false;
+          error = "";
+          continue;
+        }
+      }
+      if (silent && silent.token) {
+        setSessionToken(key, silent.token, silent.expires_in);
+        // 没输密码就拿到令牌说明这份日记没有查看密码：只确认 owner，不动 protected
+        markOwnerResolved(ownerQq);
+        updateLockUI();
+        return true;
+      }
+      if (silent && silent.need_owner) {
+        const asked = await askQq();
+        if (asked === null) {
+          toast("已取消");
+          return false;
+        }
+        ownerQq = asked;
+        silentTried = false;
+        continue;
+      }
+      // PASSWORD_REQUIRED：确实有密码，继续下面弹密码框
+    }
+    const pw = await askDialog({
+      title: "这份日记已上锁",
+      message: reason || "这份日记设了查看密码，请输入后继续。",
+      error,
+      password: true,
+      placeholder: "4~32 位、不含空格",
+      okText: "解锁",
+    });
+    if (pw === null) {
+      toast("已取消");
+      return false;
+    }
+    let r;
+    try {
+      const body = ownerQq ? { pw, qq: ownerQq } : { pw };
+      r = await bridge.apiPost(`unlock/${key}`, body);
+    } catch (e) {
+      const msg = e.message || "";
+      if (msg.includes("PASSWORD_WRONG")) {
+        error = "密码不对，请重新输入。";
+        continue;
+      }
+      if (
+        msg.includes("OWNER_UNKNOWN") ||
+        msg.includes("无法确认日记主人") ||
+        msg.includes("QQ 号与日记签名")
+      ) {
+        const asked = await askQq("QQ 号与日记签名对不上，请重新输入。");
+        if (asked === null) {
+          toast("已取消");
+          return false;
+        }
+        ownerQq = asked;
+        silentTried = false;
+        error = "";
+        continue;
+      }
+      toast(msg || "解锁失败");
+      return false;
+    }
+    if (r && r.need_owner) {
+      const asked = await askQq("QQ 号与日记签名对不上，请重新输入。");
+      if (asked === null) {
+        toast("已取消");
+        return false;
+      }
+      ownerQq = asked;
+      silentTried = false;
+      error = "";
+      continue;
+    }
+    if (r && r.token) {
+      setSessionToken(key, r.token, r.expires_in);
+      updateLockUI();
+      if (ownerQq) markOwnerResolved(ownerQq, { passwordVerified: true });
+      return true;
+    }
+    toast("解锁失败：后端没有返回凭证，请刷新后重试");
+    return false;
+  }
+}
+
+/* 带凭证的 GET（days / day / image 等读接口）：
+ * 1) 带上 query `tk`；2) 遇到 200 的 need_owner / need_password 时走页面内闸门
+ *    换取 token 后重试；3) 旧口径的 403 PASSWORD_REQUIRED/PASSWORD_WRONG 同样
+ *    清缓存凭证再询问。用户取消或无法通过时返回 null（toast 已给出）。 */
+async function gatedGet(endpoint, params = {}, { reason = "" } = {}) {
+  const request = () => bridge.apiGet(endpoint, { ...params, ...authParams() });
+  let r;
+  try {
+    r = await request();
+  } catch (e) {
+    const msg = e.message || "";
+    if (
+      !msg.includes("PASSWORD_REQUIRED") &&
+      !msg.includes("PASSWORD_WRONG")
+    ) {
+      throw e;
+    }
+    clearSessionToken(currentKey);
+    updateLockUI();
+    if (!(await acquireToken({ reason }))) return null;
+    return request();
+  }
+  for (let guard = 0; guard < 4; guard += 1) {
+    if (r && r.need_owner) {
+      clearSessionToken(currentKey);
+      updateLockUI();
+      if (!(await acquireToken({ needOwner: true, reason }))) return null;
+      r = await request();
+      continue;
+    }
+    if (r && r.need_password) {
+      clearSessionToken(currentKey);
+      updateLockUI();
+      if (!(await acquireToken({ reason }))) return null;
+      r = await request();
+      continue;
+    }
+    return r;
+  }
+  toast("读取失败：身份校验没有通过，请点「⟳ 刷新」重试", 5000);
+  return null;
+}
+
 /* ---------- 查看密码：顶栏的锁按钮 ---------- */
 function updateLockUI() {
   const btn = $("btnLock");
@@ -366,7 +622,7 @@ function updateLockUI() {
     btn.hidden = true;
     return;
   }
-  const unlocked = !!sessionPw[currentKey];
+  const unlocked = tokenAlive(currentKey);
   btn.hidden = false;
   btn.textContent = unlocked ? "🔓 已解锁" : "🔒 密码";
   btn.title = unlocked
@@ -378,51 +634,21 @@ function updateLockUI() {
 async function onLockClick() {
   const u = users.find((x) => x.file_key === currentKey);
   if (!u || !u.protected) return;
-  if (sessionPw[currentKey]) {
-    delete sessionPw[currentKey];
+  if (tokenAlive(currentKey)) {
+    // 重新上锁：只清本地凭证，已显示的内容保持（刷新/翻页后会重新要密码）
+    clearSessionToken(currentKey);
     updateLockUI();
     toast("已重新上锁，下次翻阅需要密码");
     return;
   }
-  let error = "";
-  for (;;) {
-    const pw = await askDialog({
-      title: "输入查看密码",
-      message:
-        "这份日记设了查看密码（主人在 QQ 里用 /日记密码 设置）。\n" +
-        "输入正确后，就能在面板里翻阅和导出这份日记。",
-      error,
-      password: true,
-      placeholder: "4~32 位、不含空格",
-      okText: "解锁",
-    });
-    if (pw === null) return;
-    if (days.length === 0) {
-      // 还没有日记可验证；先记住密码，导出时后端还会再校验一次
-      sessionPw[currentKey] = pw;
-      updateLockUI();
-      toast("已记住密码");
-      return;
-    }
-    try {
-      await bridge.apiGet(`day/${currentKey}/${days[days.length - 1].day}`, {
-        pw,
-      });
-    } catch (e) {
-      const msg = e.message || "";
-      if (msg.includes("PASSWORD_WRONG")) {
-        error = "密码不对，请重新输入。";
-        continue;
-      }
-      toast(msg || "密码校验失败");
-      return;
-    }
-    sessionPw[currentKey] = pw;
-    updateLockUI();
-    toast("已解锁");
-    if (dayIdx >= 0) await showDay(dayIdx, false);
-    return;
-  }
+  const ok = await acquireToken({
+    reason:
+      "这份日记设了查看密码（主人在 QQ 里用 /日记密码 设置）。\n" +
+      "输入正确后，就能在面板里翻阅和导出这份日记。",
+  });
+  if (!ok) return;
+  toast("已解锁");
+  if (dayIdx >= 0) await showDay(dayIdx, false);
 }
 
 function escapeHtml(s) {
@@ -831,23 +1057,35 @@ async function loadDiaryImages(day, token) {
     const name = entry.slice("images/".length);
     const img = figure.querySelector("img");
     const alt = (img && img.alt) || "";
-    const params = {};
-    if (sessionPw[currentKey]) params.pw = sessionPw[currentKey];
+    // P3-21：读图接口对 need_password / need_owner 返回 200 JSON（不是图片）。
+    // 走 gatedGet 的闸门流程：弹密码/QQ 框换取 token 后重试这张图；不能当成
+    // 「图片缺失」静默降级成 [插图：…]。
     let res = null;
     try {
-      res = await bridge.apiGet(`image/${currentKey}/${name}`, params);
+      res = await gatedGet(
+        `image/${currentKey}/${name}`,
+        {},
+        { reason: "查看日记插图需要查看密码，请输入。" }
+      );
     } catch (e) {
       console.warn("插图读取失败", name, e);
       if (!isCurrentDiaryView(day, token) || !figure.isConnected) return;
       markImageMissing(figure, alt, "");
       continue;
     }
-    // 等待期间翻页/切用户了：这张图不能落到当前页
+    // 等待（可能含密码/QQ 对话框）期间翻页/切用户了：这张图不能落到当前页
     if (!isCurrentDiaryView(day, token) || !figure.isConnected) return;
-    if (res && res.found && res.image) {
+    if (!res) {
+      // 用户取消了解锁：图其实还在，只是没权限读，不能标成「缺失」
+      figure.classList.remove("pending");
+      figure.classList.add("img-gated");
+      figure.title = "插图需要先解锁查看";
+      return;
+    }
+    if (res.found && res.image) {
       await applyDiaryImage(figure, alt, res);
     } else {
-      markImageMissing(figure, alt, res && res.status);
+      markImageMissing(figure, alt, res.status);
     }
   }
 }
@@ -874,6 +1112,41 @@ function userLabel(u) {
   return `${lock}${u.nickname}（${days}）`;
 }
 
+/* 目录/正文读取失败（P2-18）：toast 后端 message，并把右页置成明确的
+ * 「读取失败，请刷新」，同时清掉旧目录/旧正文——失败后继续显示上一个用户的
+ * 日记会让人以为看到的就是当前用户。 */
+function showDiaryReadFailure(e) {
+  const msg = (e && e.message) || "";
+  toast(msg || "读取失败，请点「⟳ 刷新」重试", 5000);
+  navToken += 1;
+  pendingDay = null;
+  viewToken += 1; // 作废仍在路上的插图回填
+  closeAnnCards();
+  days = [];
+  dayIdx = -1;
+  $("dayList").innerHTML = "";
+  $("btnToc").disabled = true;
+  $("diaryHeader").innerHTML = "";
+  $("diaryBody").textContent = "读取失败，请点「⟳ 刷新」重试。";
+  $("pageInfo").textContent = "0 / 0";
+  updateBatchDeleteUI();
+}
+
+/* 用户列表读取失败：首屏失败时不能只留一片空白，空舞台上给出可读的错误。 */
+function showUsersReadFailure(e) {
+  const msg = (e && e.message) || "";
+  toast(msg || "读取用户列表失败，请点「⟳ 刷新」重试", 5000);
+  $("book").hidden = true;
+  $("empty").hidden = false;
+  $("emptyText").textContent =
+    "读取失败，请点「⟳ 刷新」重试" + (msg ? `（${msg}）` : "");
+  $("btnExport").disabled = true;
+  days = [];
+  dayIdx = -1;
+  $("dayList").innerHTML = "";
+  $("pageInfo").textContent = "0 / 0";
+}
+
 async function loadUsers() {
   // 用户列表刷新可能换人 / 清空：旧勾选不能留到新用户的目录上
   clearSelectedDays();
@@ -897,6 +1170,15 @@ async function loadUsers() {
   if (!has) {
     viewToken += 1; // 没有任何用户：丢弃仍在路上的插图回填
     currentKey = "";
+    // 删光日记/空目录：目录与右页一起清空，否则 hidden 掉的书上还残留
+    // 刚被删掉的正文、页眉与页码（看起来像删除失败）。
+    days = [];
+    dayIdx = -1;
+    $("dayList").innerHTML = "";
+    $("btnToc").disabled = true;
+    $("diaryHeader").innerHTML = "";
+    $("diaryBody").textContent = "";
+    $("pageInfo").textContent = "0 / 0";
     updateLockUI();
     return;
   }
@@ -907,8 +1189,14 @@ async function loadUsers() {
   updateLockUI();
 }
 
+/* 拉取当前用户的日期目录。返回 true 表示成功（含「文件里还没有日记」）。
+ * 任何失败都 toast + 右页明确「读取失败，请刷新」，绝不保留上一个用户的目录/
+ * 正文（P2-18）；切用户/刷新时也先清空旧内容，避免新旧用户同屏（P2-17）。 */
 async function loadDays() {
   // 目录整体刷新（切用户 / 刷新 / 删除成功）：勾选只对旧目录有意义，先清空
+  navToken += 1;
+  const nav = navToken;
+  pendingDay = null;
   clearSelectedDays();
   updateLockUI();
   const u = users.find((x) => x.file_key === currentKey);
@@ -916,7 +1204,36 @@ async function loadDays() {
   $("ownerHint").textContent = u && !u.owner_known
     ? "这份日记还没绑定主人 QQ，翻开时会请你输入一次（验签通过才接受）"
     : "";
-  const r = await bridge.apiGet(`days/${currentKey}`);
+  // 请求前先清右页与目录：请求慢或失败时不会出现「下拉框已是新用户、
+  // 正文还是旧用户」的错位页面。
+  viewToken += 1;
+  closeAnnCards();
+  days = [];
+  dayIdx = -1;
+  $("dayList").innerHTML = "";
+  $("btnToc").disabled = true;
+  $("diaryHeader").innerHTML = "";
+  $("diaryBody").textContent = "正在读取目录…";
+  $("pageInfo").textContent = "0 / 0";
+  updateBatchDeleteUI();
+
+  let r;
+  try {
+    r = await gatedGet(`days/${currentKey}`, {}, {
+      reason: "翻阅日记目录需要查看密码，请输入。",
+    });
+  } catch (e) {
+    if (nav === navToken) showDiaryReadFailure(e);
+    return false;
+  }
+  if (nav !== navToken) return false; // 期间又切了用户/点了刷新：这次结果作废
+  if (!r) {
+    // 用户在密码/QQ 对话框点了取消：不当作「没有日记」
+    if (nav === navToken) {
+      $("diaryBody").textContent = "已取消解锁，请点「⟳ 刷新」重试。";
+    }
+    return false;
+  }
   days = r.days || [];
   renderDayList();
   if (days.length === 0) {
@@ -925,9 +1242,29 @@ async function loadDays() {
     $("diaryBody").textContent = "（这个文件里还没有日记）";
     $("pageInfo").textContent = "0 / 0";
     dayIdx = -1;
-    return;
+    return true;
   }
   await showDay(days.length - 1, false);
+  return true;
+}
+
+/* 刷新用户列表 + 当前用户目录（顶栏「⟳ 刷新」、导入成功后用）。
+ * 失败提示都在内部给出；announce=true 且全部成功才 toast「已刷新」
+ * （旧实现在 loadDays 之前就提示，失败时也会报「已刷新」）。 */
+async function refreshAll({ announce = false } = {}) {
+  try {
+    await loadUsers();
+  } catch (e) {
+    showUsersReadFailure(e);
+    return false;
+  }
+  if (!currentKey) {
+    if (announce) toast("已刷新");
+    return true;
+  }
+  const ok = await loadDays();
+  if (ok && announce) toast("已刷新");
+  return ok;
 }
 
 function renderDayList() {
@@ -963,104 +1300,26 @@ function renderDayList() {
   updateBatchDeleteUI();
 }
 
-/* 依次处理两道闸门：先绑定主人 QQ（旧 zip），再过查看密码。返回响应或 null。 */
+/* 读一天正文：带 token，遇到 need_owner（旧 zip）/need_password 时走页面内
+ * 对话框换取 token 后重试（P3-7 契约 3）。返回响应或 null。 */
 async function fetchDayWithGates(dayStr) {
-  const params = {};
-  if (sessionPw[currentKey]) params.pw = sessionPw[currentKey];
-
-  let r;
-  try {
-    r = await bridge.apiGet(`day/${currentKey}/${dayStr}`, params);
-  } catch (e) {
-    const msg = e.message || "";
-    if (!msg.includes("PASSWORD_WRONG")) {
-      toast(msg || "读取失败");
-      return null;
-    }
-    // 主人改过密码：缓存作废，下面重新询问
-    delete sessionPw[currentKey];
-    delete params.pw;
-    updateLockUI();
-    r = { need_password: true };
-  }
-
-  if (r.need_owner) {
-    let error = "";
-    for (;;) {
-      const qq = await askDialog({
-        title: "确认日记主人",
-        message:
-          "这份旧日记的说明里没有主人 QQ（文件名是加密的、反推不出）。\n" +
-          "请输入日记主人的 QQ 号：会用它全量验签，通过才会显示。",
-        error,
-        inputMode: "numeric",
-        placeholder: "日记主人的 QQ 号",
-        okText: "验签并打开",
-      });
-      if (qq === null) {
-        toast("已取消");
-        return null;
-      }
-      params.qq = qq;
-      try {
-        r = await bridge.apiGet(`day/${currentKey}/${dayStr}`, params);
-      } catch (e) {
-        delete params.qq;
-        error =
-          (e.message || "").replace(/^.*无法确认日记主人：/, "验签未通过：") ||
-          "验签未通过，请重新输入 QQ 号";
-        continue;
-      }
-      delete params.qq;
-      const u = users.find((x) => x.file_key === currentKey);
-      if (u) u.owner_known = true;
-      $("ownerHint").hidden = true;
-      toast("QQ 验签通过，已记住这份日记的主人");
-      break;
-    }
-  }
-
-  if (r.need_password) {
-    let error = "";
-    for (;;) {
-      const pw = await askDialog({
-        title: "这份日记已上锁",
-        message: "这份日记设了查看密码，请输入后翻阅。",
-        error,
-        password: true,
-        placeholder: "4~32 位、不含空格",
-        okText: "解锁",
-      });
-      if (pw === null) {
-        toast("已取消");
-        return null;
-      }
-      try {
-        r = await bridge.apiGet(`day/${currentKey}/${dayStr}`, {
-          ...params,
-          pw,
-        });
-      } catch (e) {
-        const msg = e.message || "";
-        if (msg.includes("PASSWORD_WRONG")) {
-          error = "密码不对，请重新输入。";
-          continue;
-        }
-        toast(msg || "读取失败");
-        return null;
-      }
-      sessionPw[currentKey] = pw;
-      updateLockUI();
-      break;
-    }
-  }
-  return r;
+  return gatedGet(`day/${currentKey}/${dayStr}`, {}, {
+    reason: "这份日记设了查看密码，请输入后翻阅。",
+  });
 }
 
 async function showDay(i, animate = true) {
-  if (loading || i < 0 || i >= days.length) return;
+  if (i < 0 || i >= days.length) return;
+  // 上一次翻页还在路上：记下最后一次，等它结束后再翻（旧实现直接 return，
+  // 连按方向键时后几次按键会被静默丢掉）。
+  if (loading) {
+    pendingDay = { i, animate, nav: navToken };
+    return;
+  }
   const day = days[i];
+  const nav = navToken;
   loading = true;
+  inflightDay = i;
   // 翻页/切用户前先收起上一天还开着的批注卡片：卡片是 fixed 悬浮层，不随
   // innerHTML 一起消失；翻页动画的 transform 也会临时把 fixed 卡片夹回页面里。
   closeAnnCards();
@@ -1072,9 +1331,10 @@ async function showDay(i, animate = true) {
       page.classList.add("turn");
     }
     const r = await fetchDayWithGates(day.day);
-    if (!r) return; // 用户取消或校验失败，提示已在函数内给出
     // 等待（含密码/QQ 对话框）期间用户可能已切换用户或刷新目录：
-    // days 已整体更换时放弃本次展示，避免旧内容配上新目录的标题
+    // 代次变了就放弃本次展示，避免旧内容配上新目录的标题/页码。
+    if (nav !== navToken) return;
+    if (!r) return; // 用户取消或校验失败，提示已在函数内给出
     if (!days.includes(day)) return;
     // 真正替换正文前递增 token：上一页还在路上的插图请求从此刻起一律作废
     const token = (viewToken += 1);
@@ -1096,10 +1356,30 @@ async function showDay(i, animate = true) {
     $("pageInfo").textContent = `${i + 1} / ${days.length}`;
     renderDayListActive();
   } catch (e) {
-    toast(e.message || "读取失败");
+    if (nav === navToken) toast(e.message || "读取失败");
   } finally {
     loading = false;
+    inflightDay = null;
+    // 请求期间积压的翻页：属于当前代次才执行（切用户/刷新会换代次）
+    if (pendingDay && pendingDay.nav === navToken) {
+      const next = pendingDay;
+      pendingDay = null;
+      await showDay(next.i, next.animate);
+    } else {
+      pendingDay = null;
+    }
   }
+}
+
+/* 翻页入口（按钮 / 方向键共用）：以「正在请求的那一页」为基准，连按两次
+ * ←/→ 会连续翻两页，而不是都从还没更新的 dayIdx 算、结果只翻一页。 */
+function navigateDay(delta) {
+  const base = pendingDay
+    ? pendingDay.i
+    : inflightDay !== null
+      ? inflightDay
+      : dayIdx;
+  showDay(base + delta, true);
 }
 
 function renderDayListActive() {
@@ -1165,57 +1445,30 @@ function onDayCheckChange(e) {
   updateBatchDeleteUI();
 }
 
-/* 发删除请求并处理两道闸门：need_owner（旧 zip 无主人信息）先要主人 QQ，
- * need_password / PASSWORD_WRONG 再要查看密码。成功返回响应；用户取消或失败
- * 返回 null（提示已在本函数内给出，页面数据保持不变）。 */
+/* 发删除请求并处理两道闸门（契约 3）：DELETE 是 POST，宿主 bridge 不能带
+ * query，所以 token 放 body 的 `tk` 字段；need_owner（旧 zip 无主人信息）/
+ * need_password / PASSWORD_WRONG 都走页面内对话框换 token 后重试。
+ * 成功返回响应；用户取消或失败返回 null（提示已在本函数内给出）。 */
 async function deleteDaysRequest(daysToDelete) {
-  const body = { file_key: currentKey, days: daysToDelete };
-  if (sessionPw[currentKey]) body.pw = sessionPw[currentKey];
+  const body = { file_key: currentKey, days: daysToDelete, ...authParams() };
+  const passwordReason = "删除日记需要查看密码，请输入。";
 
-  async function askOwner(error) {
-    return askDialog({
-      title: "确认日记主人",
-      message:
-        "这份旧日记的说明里没有主人 QQ（文件名是加密的、反推不出）。\n" +
-        "请输入日记主人的 QQ 号：会用它全量验签，通过才会删除。",
-      error,
-      inputMode: "numeric",
-      placeholder: "日记主人的 QQ 号",
-      okText: "验证并删除",
-    });
-  }
-
-  async function askPassword(message, error = "") {
-    return askDialog({
-      title: "这份日记已上锁",
-      message,
-      error,
-      password: true,
-      placeholder: "4~32 位、不含空格",
-      okText: "解锁并删除",
-    });
-  }
-
-  for (;;) {
+  for (let guard = 0; guard < 6; guard += 1) {
     let r;
     try {
       r = await bridge.apiPost("delete_days", body);
     } catch (e) {
       const msg = e.message || "";
       if (msg.includes("PASSWORD_WRONG") || msg.includes("PASSWORD_REQUIRED")) {
-        // 主人改过密码：缓存作废，重新询问（与 doExport 同一口径）
-        delete sessionPw[currentKey];
-        delete body.pw;
+        // 主人改过密码 / token 过期：本地凭证作废，重新问密码换 token
+        clearSessionToken(currentKey);
+        delete body.tk;
         updateLockUI();
-        const pw = await askPassword(
-          "删除日记需要查看密码，请输入。",
-          msg.includes("PASSWORD_WRONG") ? "密码不对，请重新输入。" : ""
-        );
-        if (pw === null) {
+        if (!(await acquireToken({ reason: passwordReason, intent: "删除" }))) {
           toast("已取消删除");
           return null;
         }
-        body.pw = pw;
+        Object.assign(body, authParams());
         continue;
       }
       if (
@@ -1223,50 +1476,52 @@ async function deleteDaysRequest(daysToDelete) {
         msg.includes("无法确认日记主人") ||
         msg.includes("QQ 号与日记签名")
       ) {
-        const qq = await askOwner(
-          msg.includes("OWNER_UNKNOWN")
-            ? ""
-            : "QQ 号与日记签名对不上，请重新输入。"
-        );
-        if (qq === null) {
+        if (!(await acquireToken({
+          needOwner: true,
+          reason: passwordReason,
+          intent: "删除",
+        }))) {
           toast("已取消删除");
           return null;
         }
-        body.qq = qq;
+        Object.assign(body, authParams());
         continue;
       }
       toast(msg || "删除失败", 4500);
       return null;
     }
-    // 闸门响应是 HTTP 200（need_owner / need_password），不是错误：问完再重试
+    // 闸门响应是 HTTP 200（need_owner / need_password），不是错误：换 token 再试
     if (r.need_owner) {
-      const qq = await askOwner("");
-      if (qq === null) {
+      clearSessionToken(currentKey);
+      delete body.tk;
+      if (!(await acquireToken({
+        needOwner: true,
+        reason: passwordReason,
+        intent: "删除",
+      }))) {
         toast("已取消删除");
         return null;
       }
-      body.qq = qq;
+      Object.assign(body, authParams());
       continue;
     }
     if (r.need_password) {
-      const pw = await askPassword("删除日记需要查看密码，请输入。");
-      if (pw === null) {
+      clearSessionToken(currentKey);
+      delete body.tk;
+      updateLockUI();
+      if (!(await acquireToken({ reason: passwordReason, intent: "删除" }))) {
         toast("已取消删除");
         return null;
       }
-      body.pw = pw;
+      Object.assign(body, authParams());
       continue;
     }
-    // 成功：记住密码 / 主人信息，后续翻阅、导出不再重复输入
-    if (body.pw) sessionPw[currentKey] = body.pw;
-    if (body.qq) {
-      const u = users.find((x) => x.file_key === currentKey);
-      if (u) u.owner_known = true;
-      $("ownerHint").hidden = true;
-    }
+    // 成功：token / 主人信息已在 acquireToken 内记好（含 P3-20 的锁按钮刷新）
     updateLockUI();
     return r;
   }
+  toast("删除失败：身份校验没有通过，请点「⟳ 刷新」后重试", 5000);
+  return null;
 }
 
 async function onBatchDelete() {
@@ -1299,19 +1554,26 @@ async function onBatchDelete() {
     clearSelectedDays();
     const deleted = Number(r.deleted) || 0;
     const remaining = Number(r.remaining) || 0;
+    // missing：后端专门回报「勾选了但 zip 里本来就不存在」的天数。不提示的话，
+    // 用户在别处删过某天后会以为这次也一并删干净了（其实那几天本来就没有）。
+    const missing = Number(r.missing) || 0;
+    const missingNote = missing > 0 ? `，其中 ${missing} 天本来没有日记` : "";
     if (deleted === 0) {
-      toast("所选日期没有日记，未做任何改动");
+      toast(
+        missing > 0
+          ? `所选日期没有日记，未做任何改动（其中 ${missing} 天本来没有日记）`
+          : "所选日期没有日记，未做任何改动"
+      );
     } else {
-      toast(`已删除 ${deleted} 天日记（剩余 ${remaining} 天）`, 4500);
+      toast(
+        `已删除 ${deleted} 天日记${missingNote}（剩余 ${remaining} 天）`,
+        4500
+      );
     }
     // 与「⟳ 刷新」同一顺序：先刷新用户列表（可能换人 / 用户整体消失），
     // 再按刷新后的 currentKey 拉目录；全部删光时 loadUsers 已切到空状态。
-    try {
-      await loadUsers();
-      if (currentKey) await loadDays();
-    } catch (e) {
-      toast(e.message || "删除成功，但刷新列表失败，请点「⟳ 刷新」重试", 5000);
-    }
+    // 失败提示在 refreshAll 内部给出，不会把删除成功的文案覆盖成「已刷新」。
+    await refreshAll({ announce: false });
   } finally {
     deleting = false;
     updateBatchDeleteUI();
@@ -1369,8 +1631,9 @@ async function doExport(mode) {
   const u = users.find((x) => x.file_key === currentKey);
   if (!u) return;
 
-  const params = {};
-  if (sessionPw[currentKey]) params.pw = sessionPw[currentKey];
+  /* 额外的非凭证参数（目前只有旧 zip 的主人 QQ）；token 到发请求时现取。 */
+  const extraParams = {};
+  const passwordReason = "导出迁移包需要查看密码，请输入。";
 
   async function askOwner(message, error = "") {
     return askDialog({
@@ -1391,10 +1654,22 @@ async function doExport(mode) {
       toast("已取消导出");
       return;
     }
-    params.qq = qq;
+    extraParams.qq = qq;
+  }
+
+  // P1-6：下载（files:download）失败时宿主拿不到后端的 JSON 错误码——response.data
+  // 是 Blob，getBridgeErrorMessage 只能取到 axios 的「Request failed with status
+  // code 403」，PASSWORD_REQUIRED / PASSWORD_WRONG 在下载路径上永远不会出现。
+  // 所以已知这份日记有查看密码、本地又没有 token 时，先主动弹密码框解锁再下载。
+  if (u.protected && !tokenAlive(currentKey)) {
+    if (!(await acquireToken({ reason: passwordReason }))) {
+      toast("已取消导出");
+      return;
+    }
   }
 
   const run = async () => {
+    const params = { ...extraParams, ...authParams() };
     if (mode === "local") {
       const r = await bridge.apiGet(`export_local/${currentKey}`, params);
       return { filename: r.filename, local: true };
@@ -1414,36 +1689,42 @@ async function doExport(mode) {
       4500
     );
 
-  for (;;) {
+  for (let guard = 0; guard < 6; guard += 1) {
     try {
       const r = await run();
-      if (params.pw) sessionPw[currentKey] = params.pw;
-      if (params.qq) u.owner_known = true;
+      if (extraParams.qq) {
+        // 主人 QQ 通过验签：本地更新用户信息，让 🔒 按钮/下拉标签立刻正确
+        markOwnerResolved(extraParams.qq);
+        toast("QQ 验签通过，已记住这份日记的主人");
+      }
       updateLockUI();
       okToast(r);
       return;
     } catch (e) {
       const msg = e.message || "";
-      if (msg.includes("PASSWORD_REQUIRED") || msg.includes("PASSWORD_WRONG")) {
-        delete sessionPw[currentKey];
-        delete params.pw;
+      const generic403 = /status code 403\b/i.test(msg);
+      const generic400 = /status code 400\b/i.test(msg);
+      // 下载路径只有通用 403，按「需要查看密码」回退询问（P1-6）；
+      // 「存到本机」走 apiGet，仍可能拿到明确的 PASSWORD_* 错误码。
+      if (
+        msg.includes("PASSWORD_REQUIRED") ||
+        msg.includes("PASSWORD_WRONG") ||
+        generic403
+      ) {
+        clearSessionToken(currentKey);
         updateLockUI();
-        const pw = await askDialog({
-          title: "这份日记已上锁",
-          message: "导出迁移包需要查看密码，请输入。",
-          error: msg.includes("PASSWORD_WRONG") ? "密码不对，请重新输入。" : "",
-          password: true,
-          placeholder: "4~32 位、不含空格",
-          okText: "解锁并导出",
-        });
-        if (pw === null) {
+        if (!(await acquireToken({ reason: passwordReason }))) {
           toast("已取消导出");
           return;
         }
-        params.pw = pw;
         continue;
       }
-      if (msg.includes("OWNER_UNKNOWN") || msg.includes("QQ 号与日记签名")) {
+      // 旧 zip（说明里没有用户ID）：下载失败只剩通用 400，主人 QQ 未知时重问
+      if (
+        msg.includes("OWNER_UNKNOWN") ||
+        msg.includes("QQ 号与日记签名") ||
+        (generic400 && u.owner_known === false)
+      ) {
         const qq = await askOwner(
           "导出迁移包需要日记主人的 QQ 号（写入清单并用于验签）。",
           "QQ 号与日记签名对不上，请重新输入。"
@@ -1452,7 +1733,7 @@ async function doExport(mode) {
           toast("已取消导出");
           return;
         }
-        params.qq = qq;
+        extraParams.qq = qq;
         continue;
       }
       if (msg.includes("REMOTE_PANEL")) {
@@ -1463,12 +1744,27 @@ async function doExport(mode) {
       return;
     }
   }
+  toast("导出失败：身份校验没有通过，请点「⟳ 刷新」后重试", 5000);
 }
+
+/* 迁移包上传上限：与后端 ``upload.save(tmp, max_bytes=32MB)`` 对齐。
+ * 超过上限后端必然拒绝；前端先按 file.size 拦下来，免得把几十上百 MB 的
+ * 整包读进页面内存再传一遍（标签页会卡顿甚至 OOM）。 */
+const IMPORT_MAX_BYTES = 32 * 1024 * 1024;
 
 async function doImport(file) {
   if (!file) return;
   if (!/\.zip$/i.test(file.name)) {
     toast("请选择迁移包 zip 文件");
+    return;
+  }
+  if (file.size > IMPORT_MAX_BYTES) {
+    const mb = (file.size / (1024 * 1024)).toFixed(1);
+    toast(
+      `迁移包 ${mb}MB 超过 32MB 上限：请改用 QQ 指令 /导入日记，` +
+        "或按用户拆分后再从页面导入",
+      6500
+    );
     return;
   }
   try {
@@ -1478,10 +1774,24 @@ async function doImport(file) {
       `导入完成：${r.imported} 天日记（${MODE_TEXT[r.mode] || r.mode}）`,
       4500
     );
-    await loadUsers();
-    if (currentKey) await loadDays();
+    try {
+      await loadUsers();
+      if (currentKey) await loadDays();
+    } catch (e2) {
+      toast(e2.message || "导入成功，但刷新列表失败，请点「⟳ 刷新」重试", 5000);
+    }
   } catch (e) {
-    toast(e.message || "导入失败", 5000);
+    const msg = e.message || "";
+    // 宿主 files:upload 固定 60s 超时，但服务端可能已经继续完成导入并落盘；
+    // 直接报 timeout 会让用户反复重试，而重复导入会被后端拒绝。
+    if (/timeout/i.test(msg)) {
+      toast(
+        "导入请求超时：后台可能已经导入完成，请先点「⟳ 刷新」确认，确认没有再重试",
+        7000
+      );
+      return;
+    }
+    toast(msg || "导入失败", 5000);
   }
 }
 
@@ -1536,12 +1846,13 @@ $("backdropInput").addEventListener("change", async (e) => {
 });
 $("userSelect").addEventListener("change", async (e) => {
   currentKey = e.target.value;
+  // 切用户：loadDays 内部会先换代次（navToken）并清空旧目录/正文，在途的
+  // 翻页结果会被丢弃，不会出现「目录是新用户、正文是旧用户」的错位页面。
   await loadDays();
 });
 $("btnRefresh").addEventListener("click", async () => {
-  await loadUsers();
-  if (currentKey) await loadDays();
-  toast("已刷新");
+  // 全部成功后才 toast「已刷新」；失败提示由 refreshAll 内部按后端 message 给出
+  await refreshAll({ announce: true });
 });
 $("btnBatchDelete").addEventListener("click", onBatchDelete);
 $("btnExport").addEventListener("click", (e) => {
@@ -1563,8 +1874,8 @@ $("fileInput").addEventListener("change", async (e) => {
   await doImport(e.target.files[0]);
   e.target.value = "";
 });
-$("btnPrev").addEventListener("click", () => showDay(dayIdx - 1, true));
-$("btnNext").addEventListener("click", () => showDay(dayIdx + 1, true));
+$("btnPrev").addEventListener("click", () => navigateDay(-1));
+$("btnNext").addEventListener("click", () => navigateDay(1));
 document.addEventListener("keydown", (e) => {
   if (!document.getElementById("dialogMask").hidden) {
     if (e.key === "Escape") {
@@ -1581,8 +1892,18 @@ document.addEventListener("keydown", (e) => {
     }
     return; // 对话框打开时不响应翻页快捷键
   }
-  if (e.key === "ArrowLeft") showDay(dayIdx - 1, true);
-  if (e.key === "ArrowRight") showDay(dayIdx + 1, true);
+  // 焦点在表单控件里时，方向键属于控件本身：在「选择用户」下拉框上按 ←/→
+  // 会切换用户（原生行为），若再冒泡到这里还会同时翻页 → 左右两页来自不同用户。
+  const target = e.target;
+  if (
+    target &&
+    target.closest &&
+    target.closest("select, input, textarea, [contenteditable]")
+  ) {
+    return;
+  }
+  if (e.key === "ArrowLeft") navigateDay(-1);
+  if (e.key === "ArrowRight") navigateDay(1);
   // 抽屉开着时优先用 Escape 关抽屉，不触发上面的对话框分支（对话框开着已提前 return）
   if (e.key === "Escape") closeToc();
 });
@@ -1604,6 +1925,11 @@ window.addEventListener("resize", () => {
   annResizeTimer = setTimeout(repositionActiveAnnCard, 120);
 });
 
-await loadUsers();
+try {
+  await loadUsers();
+} catch (e) {
+  // 首屏失败不能只留一片空白：空舞台上显示可读的错误与「刷新」指引
+  showUsersReadFailure(e);
+}
 if (currentKey) await loadDays();
 updateLockUI();

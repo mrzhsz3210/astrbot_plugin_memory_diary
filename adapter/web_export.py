@@ -36,7 +36,7 @@ class WebExportApiMixin:
             if err == "OWNER_UNKNOWN":
                 return None, _web_error("OWNER_UNKNOWN", status_code=400)
             return None, _web_error(f"无法确认日记主人：{err}", status_code=400)
-        gate = self._check_web_password(owner, for_download=True)
+        gate = self._check_web_password(owner, file_key, for_download=True)
         if gate is not None:
             return None, gate
         try:
@@ -117,6 +117,9 @@ class WebExportApiMixin:
 
         只含日记 zip，绝不含签名钥匙（"绝不入包"原则不变）；包内附 备份说明.txt。
         继承面板登录鉴权，等价管理员本机操作，不加额外密码闸。
+        P1-5 产品口径（用户拍板）：查看密码只保护单个用户的翻阅/单用户导出；
+        「一键备份全部」属管理员信任域例外，**不**套查看密码闸——能登管理面板
+        的人本来就能读到这些 zip。文档需同步说明这个例外。
         """
         bundle, count, err = self._prepare_backup_all()
         if err is not None:
@@ -145,7 +148,9 @@ class WebExportApiMixin:
 
         「存到本机并打开位置」会写管理员主目录并启动文件管理器，必须只在
         本机操作时可用。这里用 ``client_host`` 判断回环地址，并对反向代理
-        转发头做二次校验：只要第一跳不是回环地址，就按远程处理。
+        转发头做二次校验：**只信最后一跳**——``X-Forwarded-For`` 链由离本机
+        最近的代理追加，首项是客户端可以随便伪造的，拿首项判本机等于没判
+        （远程面板伪造 ``X-Forwarded-For: 127.0.0.1`` 就能触发服务器落盘）。
         """
         try:
             host = str(getattr(_web_request, "client_host", "") or "").strip().lower()
@@ -155,15 +160,22 @@ class WebExportApiMixin:
             return False
         try:
             headers = getattr(_web_request, "headers", None)
-            forwarded = ""
-            if headers is not None:
-                forwarded = str(
-                    headers.get("x-forwarded-for") or headers.get("x-real-ip") or ""
-                ).strip()
         except Exception:
-            forwarded = ""
-        first = forwarded.split(",")[0].strip().lower()
-        return not first or first in self._WEB_LOOPBACKS
+            headers = None
+        forwarded = ""
+        if headers is not None:
+            try:
+                xff = str(headers.get("x-forwarded-for") or "").strip()
+                real_ip = str(headers.get("x-real-ip") or "").strip()
+            except Exception:
+                xff = real_ip = ""
+            if xff:
+                # 只看最后一跳：那是最近一层代理看到的直连客户端地址
+                hops = [h.strip().lower() for h in xff.split(",") if h.strip()]
+                forwarded = hops[-1] if hops else ""
+            elif real_ip:
+                forwarded = real_ip.lower()
+        return not forwarded or forwarded in self._WEB_LOOPBACKS
 
     @staticmethod
     def _open_file_location(target: Path) -> None:

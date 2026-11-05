@@ -274,12 +274,31 @@ class AnnotationMixin:
 
     @staticmethod
     def _next_annotation_seq(data: dict, day: str) -> int:
+        """当天已用的最大序号 + 1（兼容 P2-8 起可能出现的 ``_<4位hex>`` 后缀）。"""
         used = set()
         for item in (data or {}).get("annotations") or []:
-            m = re.match(r"^ann_(\d{8})_(\d+)$", str(item.get("id") or ""))
+            m = re.match(
+                r"^ann_(\d{8})_(\d+)(?:_[0-9a-f]{4})?$", str(item.get("id") or "")
+            )
             if m and m.group(1) == day:
                 used.add(int(m.group(2)))
         return (max(used) + 1) if used else 1
+
+    @staticmethod
+    def _unique_annotation_id(base: str, used_ids: set) -> str:
+        """按《批注功能接口契约》生成全局唯一 id：撞号追加 ``_<2字节hex>``。
+
+        P2-8：id 的日期段取**生成当天**、序号当天递增；万一仍撞号（并发/旧数据/
+        跨版本混写），按契约追加 4 位 hex 后缀，最多重试若干次。
+        """
+        if base not in used_ids:
+            return base
+        for _ in range(32):
+            cand = f"{base}_{secrets.token_hex(2)}"
+            if cand not in used_ids:
+                return cand
+        # 极端兜底：4 位 hex 撞满 32 次（理论上不可能），加长后缀保证唯一
+        return f"{base}_{secrets.token_hex(4)}"
 
     @staticmethod
     def _parse_annotation_payload(raw):
@@ -390,10 +409,15 @@ class AnnotationMixin:
                 return {**result, "reason": "parse_error"}
 
             now = self._now()
-            day = now.strftime("%Y%m%d")
+            today = now.strftime("%Y%m%d")
             now_iso = self._now_iso()
             round_id = f"r_{now.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(2)}"
-            seq = self._next_annotation_seq(data, day)
+            seq = self._next_annotation_seq(data, today)
+            used_ids = {
+                str(x.get("id") or "")
+                for x in data.get("annotations") or []
+                if str(x.get("id") or "")
+            }
             seen = {
                 (
                     str(x.get("anchor") or "").strip(),
@@ -418,10 +442,14 @@ class AnnotationMixin:
                     continue
                 # 锚点必须真的出现在本轮读过的日记可锚文本里（防模型编造锚点；
                 # 也用于确定 entry；落在占位符/随笔里的锚点在这里被硬过滤）
+                #
+                # P2-8：循环变量必须改名为 anchor_day——以前叫 day，会把外层
+                # "生成当天"覆盖成"锚点所在天"，id 的日期段和 seq 的基数对不上，
+                # 跨天锚点就会产出重复 id（/查看批注 去重静默隐藏、写回一次 resolve 多条）。
                 entry_day = ""
-                for _name, day, _anchorable, search in day_texts:
+                for _name, anchor_day, _anchorable, search in day_texts:
                     if anchor in search:
-                        entry_day = day
+                        entry_day = anchor_day
                         break
                 if not entry_day:
                     logger.warning(
@@ -432,9 +460,11 @@ class AnnotationMixin:
                 if key in seen:
                     continue
                 seen.add(key)
+                ann_id = self._unique_annotation_id(f"ann_{today}_{seq}", used_ids)
+                used_ids.add(ann_id)
                 accepted.append(
                     {
-                        "id": f"ann_{day}_{seq}",
+                        "id": ann_id,
                         "round": round_id,
                         "anchor": anchor,
                         "entry": f"{entry_day}.md",
@@ -928,11 +958,16 @@ class AnnotationMixin:
         if not reply["summary"]:
             return False
 
-        hit = {"found": False}
+        hit = {"found": False, "count": 0}
 
         def _mut(data: dict):
+            # P2-8：id 契约是全局唯一；旧数据可能残留重复 id（撞号历史），
+            # 命中多条时只写第一条并告警，避免一次确认把同 id 的多条一起改掉。
             for item in data.get("annotations") or []:
                 if str(item.get("id") or "") == ann_id:
+                    hit["count"] += 1
+                    if hit["found"]:
+                        continue
                     item["status"] = "resolved"
                     item["reply"] = reply
                     hit["found"] = True
@@ -940,6 +975,11 @@ class AnnotationMixin:
             return data
 
         ok, _ = self.update_annotations(sender_id, _mut)
+        if hit["count"] > 1:
+            logger.warning(
+                f"[memory_diary] 批注 id 重复（{ann_id} 命中 {hit['count']} 条），"
+                "已只写回第一条；建议运行一次数据修复"
+            )
         # P2-2：id 不存在时不能报"成功"（否则用户以为写回了、实际什么都没写）
         return bool(ok and hit["found"])
 
@@ -949,15 +989,24 @@ class AnnotationMixin:
         if not ann_id:
             return False
 
-        hit = {"found": False}
+        hit = {"found": False, "count": 0}
 
         def _mut(data: dict):
+            # P2-8：同 apply_annotation_reply，重复 id 只改第一条并告警
             for item in data.get("annotations") or []:
                 if str(item.get("id") or "") == ann_id:
+                    hit["count"] += 1
+                    if hit["found"]:
+                        continue
                     item["status"] = "deferred"
                     hit["found"] = True
             data["updated_at"] = self._now_iso()
             return data
 
         ok, _ = self.update_annotations(sender_id, _mut)
+        if hit["count"] > 1:
+            logger.warning(
+                f"[memory_diary] 批注 id 重复（{ann_id} 命中 {hit['count']} 条），"
+                "已只悬置第一条；建议运行一次数据修复"
+            )
         return bool(ok and hit["found"])
