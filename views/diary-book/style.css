@@ -1,13 +1,35 @@
 /* 活页日记本 · 记忆日记插件可视化视图 */
 /* 主题变量：bridge SDK 会维护 <html data-theme="light|dark"> */
-:root {
-  --bg: #e8e0d0;
+:root,
+:root[data-paper-theme="warm"] {
+  --bg: #f3f0ea;
   --topbar: #3d3225;
   --topbar-text: #f3ead8;
+  --paper: #fffdf8;
+  --paper-edge: #e9e4da;
+  --ink: #403a33;
+  --ink-soft: #6f685e;
+  --accent: #925240;
+  --line: rgba(105, 91, 72, 0.18);
+  --ring: #aa9f8b;
+  --ring-hole: #ddd6c8;
+  --shadow: rgba(61, 50, 37, 0.25);
+  --btn: #625747;
+  --btn-text: #fffdf8;
+  --badge-bg: rgba(146, 82, 64, 0.12);
+  --badge-bg-strong: rgba(146, 82, 64, 0.24);
+  --paper-wash: rgba(255, 253, 248, 0.82);
+  /* 危险操作（批量删除不可恢复）用独立的红，不跟正面强调色 --accent 混用 */
+  --danger: #b23b2e;
+  --danger-hover: #982f24;
+}
+
+:root[data-paper-theme="classic"] {
+  --bg: #e8e0d0;
   --paper: #fbf6e9;
   --paper-edge: #e6dcc4;
   --ink: #4a3f2f;
-  --ink-soft: #8a7a5f;
+  --ink-soft: #74644b;
   --accent: #a8523f;
   --line: rgba(122, 100, 63, 0.18);
   --ring: #b9a77e;
@@ -17,20 +39,23 @@
   --btn-text: #f8f2e3;
   --badge-bg: rgba(168, 82, 63, 0.12);
   --badge-bg-strong: rgba(168, 82, 63, 0.26);
-  /* 危险操作（批量删除不可恢复）用独立的红，不跟正面强调色 --accent 混用 */
-  --danger: #b23b2e;
-  --danger-hover: #982f24;
+  --paper-wash: rgba(251, 246, 233, 0.82);
 }
 
 [data-theme="dark"] {
-  --bg: #201c17;
   --topbar: #161310;
   --topbar-text: #e3d9c4;
+  --danger: #c8574a;
+  --danger-hover: #d96a58;
+}
+
+:root[data-theme="dark"][data-paper-theme="warm"] {
+  --bg: #201c17;
   --paper: #2e2a23;
   --paper-edge: #241f19;
   --ink: #ddd2ba;
-  --ink-soft: #9c8f74;
-  --accent: #cf7a63;
+  --ink-soft: #b9ac90;
+  --accent: #e49a82;
   --line: rgba(221, 210, 186, 0.14);
   --ring: #6f6350;
   --ring-hole: #17140f;
@@ -39,8 +64,26 @@
   --btn-text: #e8dfc9;
   --badge-bg: rgba(207, 122, 99, 0.18);
   --badge-bg-strong: rgba(207, 122, 99, 0.34);
-  --danger: #c8574a;
-  --danger-hover: #d96a58;
+  --paper-wash: rgba(46, 42, 35, 0.86);
+}
+
+:root[data-theme="dark"][data-paper-theme="classic"] {
+  --bg: #251f16;
+  --topbar: #1d1710;
+  --paper: #3a2f1f;
+  --paper-edge: #2b2216;
+  --ink: #f0dfb8;
+  --ink-soft: #c7b68c;
+  --accent: #e9a06f;
+  --line: rgba(240, 223, 184, 0.16);
+  --ring: #827052;
+  --ring-hole: #1d170f;
+  --shadow: rgba(0, 0, 0, 0.65);
+  --btn: #645039;
+  --btn-text: #f0dfb8;
+  --badge-bg: rgba(233, 160, 111, 0.18);
+  --badge-bg-strong: rgba(233, 160, 111, 0.34);
+  --paper-wash: rgba(58, 47, 31, 0.86);
 }
 
 * { box-sizing: border-box; }
@@ -567,9 +610,6 @@ select.ctl { max-width: 220px; }
     linear-gradient(var(--paper-wash), var(--paper-wash)),
     var(--d-paper-image) center / cover no-repeat;
 }
-:root { --paper-wash: rgba(251, 246, 233, 0.82); }
-[data-theme="dark"] { --paper-wash: rgba(46, 42, 35, 0.86); }
-
 /* ---------- 自定义背景板（书本背后的整张底衬） ---------- */
 /* JS 设置 --d-backdrop-image（data URL）并给 body 加 custom-backdrop 类 */
 body.custom-backdrop {
@@ -696,3 +736,46 @@ body.custom-backdrop {
   }
   .diary-body .ann-margin-card { padding: 8px 10px; }
 }
+
+/* 时间轴与待吸收素材 */
+.tools-panel {
+  margin: 12px 20px;
+  padding: 14px;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--paper-edge);
+  border-radius: 10px;
+  max-height: 46vh;
+  overflow: auto;
+}
+.tools-panel[hidden],
+#searchTools[hidden],
+#materialTools[hidden] {
+  display: none;
+}
+.tool-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.tool-row input, .tool-row select {
+  min-height: 34px;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+#searchQuery { flex: 1 1 240px; }
+.tool-status { color: var(--ink-soft); margin: 10px 0; }
+.evidence-card { border-top: 1px solid var(--line); padding: 10px 2px; }
+.evidence-card p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.evidence-card small { color: var(--ink-soft); overflow-wrap: anywhere; }
+.evidence-day { color: var(--accent); background: none; border: 0; padding: 0; cursor: pointer; }
+.evidence-mode { color: var(--ink-soft); font-size: 12px; margin-top: 4px; line-height: 1.8; }
+.evidence-badge {
+  display: inline-block;
+  padding: 0 7px;
+  color: var(--accent);
+  background: var(--paper);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  font-weight: 600;
+}
+.evidence-explicit { margin-left: 6px; color: var(--accent); font-weight: 600; }

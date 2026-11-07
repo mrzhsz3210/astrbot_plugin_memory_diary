@@ -14,6 +14,9 @@ from zoneinfo import ZoneInfo
 from .annotation import AnnotationMixin
 from .common import strip_invisible
 from .constants import PLUGIN_NAME, _STATE_CAP
+from .current_self import CurrentSelfMixin
+from .crypto import StorageCryptoMixin
+from .external_material import ExternalMaterialMixin
 from .illustration import IllustrationMixin
 from .imaging import ImagingMixin
 from .log import logger
@@ -22,7 +25,14 @@ from .storage import StorageMixin
 
 
 class MemoryDiaryCore(
-    StorageMixin, ServiceMixin, ImagingMixin, IllustrationMixin, AnnotationMixin
+    StorageCryptoMixin,
+    StorageMixin,
+    ServiceMixin,
+    ImagingMixin,
+    IllustrationMixin,
+    AnnotationMixin,
+    CurrentSelfMixin,
+    ExternalMaterialMixin,
 ):
     """插件业务核心，可被 main.py 的 Star 子类直接继承。"""
 
@@ -47,6 +57,8 @@ class MemoryDiaryCore(
         "日记",
         "写日记",
         "查看日记",
+        "回忆",
+        "recall",
         "删除日记",
         "日记状态",
         "日记范围",
@@ -119,6 +131,9 @@ class MemoryDiaryCore(
         self._watch_state: dict = {}
         # 防止同一会话并发触发自动写日记
         self._writing: set = set()
+        # 哨兵后台写作任务（terminate 时取消并等待，避免卸载后继续写盘/通知）
+        self._diary_tasks: set = set()
+        self._diary_task_owners: dict = {}
         # 日记操作冷却：sender_id -> 上次写日记/删日记的时间
         self._op_last: dict = {}
         # 签名密钥内存缓存（None 表示尚未加载；加载失败保持 None 并拒绝签名操作）
@@ -153,6 +168,7 @@ class MemoryDiaryCore(
         # ---- 插图（v0.6）----
         # 后台生图任务集合（terminate 时取消，避免卸载后还在写 zip）
         self._image_tasks: set = set()
+        self._image_task_owners: dict = {}
         # 本地生图通道类型缓存（url -> "sdwebui"/"comfy"，探测一次即可）
         self._image_local_kind: dict = {}
         # 全局并发生图上限（image_concurrency；首次调度时惰性创建）
@@ -208,6 +224,10 @@ class MemoryDiaryCore(
             await self._seed_auto_users_from_conversations()
         except Exception as e:
             logger.warning(f"[memory_diary] 从会话库补齐自动写日记用户失败: {e}")
+        try:
+            self._reconcile_diary_encryption()
+        except Exception as e:
+            logger.warning(f"[memory_diary] 日记加密状态协调异常: {e}")
         self._start_auto_diary_task()
 
     # ------------------------- 时间 -------------------------
@@ -310,9 +330,18 @@ class MemoryDiaryCore(
                 pass
             except Exception as e:
                 logger.warning(f"[memory_diary] 停止自动写日记任务异常: {e}")
+        # 哨兵后台写作：取消并等待全部退出，不允许卸载后继续写盘或发通知
+        diary_tasks = list(getattr(self, "_diary_tasks", None) or [])
+        for diary_task in diary_tasks:
+            diary_task.cancel()
+        if diary_tasks:
+            await asyncio.gather(*diary_tasks, return_exceptions=True)
+        self._diary_tasks = set()
+        self._diary_task_owners.clear()
         # 插图后台任务：先取消再逐个等退出，避免卸载后还在改 zip/发消息
         image_tasks = list(getattr(self, "_image_tasks", None) or [])
         self._image_tasks = set()
+        self._image_task_owners.clear()
         self._image_semaphore = None
         for itask in image_tasks:
             itask.cancel()

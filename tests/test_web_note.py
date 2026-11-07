@@ -41,6 +41,12 @@ async def _post(plugin, payload) -> dict:
 def _make_token(plugin, source="dsh", sender=SENDER) -> str:
     token = plugin.create_external_token(sender, source)
     assert token, "凭证创建失败"
+    records = plugin._load_external_tokens()
+    for rec in records:
+        rec.pop("api_version", None)
+        rec.pop("legacy_direct", None)
+        rec.pop("scope", None)
+    assert plugin._save_external_tokens(records)
     return token
 
 
@@ -415,12 +421,12 @@ async def test_diary_token_command_flow():
         )
         assert any("dsh" in t and "在用" in t for t in out), out
         assert token not in "\n".join(out), "列表泄露了凭证本体"
-        # 新办的凭证真能用
+        # 新办凭证默认只有素材 v2 权限，不能 legacy 直写
         r = await _post(plugin, {
             "token": token, "source": "dsh", "day": TODAY,
             "text": "指令办的凭证", "ext_id": "cmd-1",
         })
-        assert r["status"] == 200, r
+        assert r["status"] == 403, r
         # 吊销后即失效
         out = await inst.run_handler(
             "diary_token", make_event("/日记凭证 吊销 1", sender_id=SENDER,
@@ -618,7 +624,7 @@ async def test_bundle_roundtrip_preserves_provenance_idempotency():
         )
         try:
             dst = dst_world.refactor.plugin
-            owner, key, entries, images, annotations, provenance = (
+            owner, key, entries, images, annotations, provenance, current_self, materials, anchor_archive = (
                 dst._verify_bundle(bundle)
             )
             assert provenance is not None, (

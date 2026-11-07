@@ -149,6 +149,17 @@ class AnnotationCommandsMixin:
                     )
                 controller.stop()
                 return
+            if low in ("否决", "拒绝", "不同意", "否", "reject"):
+                if self.reject_annotation(sender_id, ann_id):
+                    await ev.send(
+                        ev.plain_result("📖 已否决这条新认识；记录保留，但不会再注入或写回交接信。")
+                    )
+                else:
+                    await ev.send(
+                        ev.plain_result("📖 保存失败，批注没有改动。")
+                    )
+                controller.stop()
+                return
             if low in ("悬置", "暂缓", "先放着", "defer"):
                 if self.defer_annotation(sender_id, ann_id):
                     await ev.send(
@@ -167,7 +178,7 @@ class AnnotationCommandsMixin:
                 return
             await ev.send(
                 ev.plain_result(
-                    "📖 没看懂～回复「确认」写回、「悬置」先放着，或「取消」退出。"
+                    "📖 没看懂～回复「确认」写回、「否决」不采用、「悬置」先放着，或「取消」退出。"
                 )
             )
             controller.keep(timeout=60, reset_timeout=True)

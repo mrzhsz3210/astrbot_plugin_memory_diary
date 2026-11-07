@@ -111,6 +111,7 @@ async def test_help_command_private_and_group_addressing():
         # v0.6：帮助菜单新增 /查看批注、/写回批注（同样在差分前被归一掉）
         assert "/查看批注" in raw_help[0]
         assert "/写回批注" in raw_help[0]
+        assert "/回忆 [全部|私人随笔] 关键词" in raw_help[0]
         assert "私聊专用" in raw_help[0].split("/查看批注")[1][:40]
         assert value["group_at_other"] == []
         assert value["group_require_no_at"] == []
@@ -1018,8 +1019,10 @@ async def test_persona_voice_for_notices_and_diary_system_prompt():
                 "entries": inst.entries(SENDER),
             }
 
-        pair = await world.run_pair(scenario, label="persona voice")
-        value = pair.value
+        pair = await world.run_pair(
+            scenario, label="persona voice", compare_value=False, compare_state=False
+        )
+        value = pair.refactor
         assert value["memo"][0].startswith("我记下啦～")
         assert value["written"][0].startswith("日记写好啦～")
         assert value["persona_in_memo_system"] is True
@@ -1048,35 +1051,27 @@ def _refactor_constants():
     )
 
 
-def test_diary_system_prompt_keeps_four_section_contract():
+def test_diary_system_prompt_uses_four_optional_dimensions():
     prompt = _refactor_constants().DIARY_SYSTEM_PROMPT
-    # ① 必须明确「四个部分」
-    assert "四个部分" in prompt
-    # ② 顺序固定且必须严格遵守
-    assert "顺序" in prompt and "严格遵守" in prompt
-    # ③ 小标题由 AI 按人设自由起名
-    assert "小标题" in prompt
-    assert "人设" in prompt
-    assert "由你自由发挥" in prompt
-    # P3-6：小标题不得用「——」包裹，避免与日记片段分隔条混淆
-    assert "——" in prompt and "分隔条" in prompt
-    # 复查补丁：用户画像必须是拟人化观察，而不是字段清单/档案表/项目符号列表
+    assert "四个参考维度" in prompt
+    assert "不是四个必填栏目" in prompt
+    assert "由你决定写哪些维度、按什么顺序" in prompt
+    assert "【无日记】" in prompt
+    assert "具体锚点" in prompt
+    assert "<explicit>" in prompt and "偏召回" in prompt
+    assert "小标题" in prompt and "人设" in prompt
+    assert "小标题不要加「——」包裹" in prompt
     assert "字段清单" in prompt
     assert "像人类观察" in prompt
-    assert "项目符号" in prompt
-    assert "编号列表" in prompt
-    assert "不得编造" in prompt
+    assert "项目符号" in prompt and "编号列表" in prompt
+    assert "不编造" in prompt
 
 
-def test_diary_system_prompt_keeps_four_section_order():
-    """顺序必须是「时间 → 画像 → 评价与感受 → 叮嘱」，改顺序会破坏日记结构。"""
+def test_diary_system_prompt_does_not_require_old_section_order():
     prompt = _refactor_constants().DIARY_SYSTEM_PROMPT
-    idx_time = prompt.find("起止时间")
-    idx_profile = prompt.find("用户画像")
-    idx_eval = prompt.find("真实看法与评价")
-    idx_remind = prompt.find("叮嘱下一个自己")
-    assert -1 not in (idx_time, idx_profile, idx_eval, idx_remind)
-    assert idx_time < idx_profile < idx_eval < idx_remind
+    assert "四个部分的功能与顺序必须严格遵守" not in prompt
+    for dimension in ("这段时间发生了什么", "新观察", "感受、想法或变化", "重新考虑什么"):
+        assert dimension in prompt
 
 
 def test_brief_prompt_is_not_four_section():

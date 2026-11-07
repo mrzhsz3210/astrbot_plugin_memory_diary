@@ -390,14 +390,15 @@ async def test_annotation_quota_by_body_length():
 async def test_annotation_cfg_normalizes_illegal_values():
     async with World(config={}) as world:
         plugin = _plugin(world)
+        plugin.config.pop("annotation_enabled", None)
         cfg = plugin._annotation_cfg()
         assert cfg == {
-            "annotation_enabled": False,
+            "annotation_enabled": True,
             "annotation_max_per_round": 5,
             "annotation_question_hint": True,
             "annotation_timeout": 30,
         }, cfg
-        assert plugin._annotations_enabled() is False
+        assert plugin._annotations_enabled() is True
 
         plugin.config.update(
             {

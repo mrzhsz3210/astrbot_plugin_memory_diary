@@ -235,3 +235,30 @@ def test_import_preflight_size_limit_and_timeout_hint():
         "doImport 未按 file.size 判上限"
     )
     assert "可能已经导入完成" in js, "timeout 失败时缺少「可能已导入，请刷新确认」提示"
+
+
+def test_search_and_material_panels_use_password_gate_and_retry():
+    js = _read("app.js")
+    search_fn = js[js.index("async function runSearch(") :]
+    search_fn = search_fn[: search_fn.index("async function loadMaterials(")]
+    assert "gatedGet(`search/${currentKey}`" in search_fn
+    assert "if (r === null) return;" in search_fn
+
+    materials_fn = js[js.index("async function loadMaterials(") :]
+    materials_fn = materials_fn[: materials_fn.index("await loadPrefs()")]
+    assert "gatedGet(`materials/${currentKey}`" in materials_fn
+    assert "if (r === null) return;" in materials_fn
+
+    post_fn = js[js.index("async function gatedPost(") :]
+    post_fn = post_fn[: post_fn.index("/* ---------- 查看密码：顶栏的锁按钮")]
+    for marker in (
+        "bridge.apiPost", "...authParams()", "r.need_password",
+        "PASSWORD_REQUIRED", "PASSWORD_WRONG", "acquireToken", "continue",
+    ):
+        assert marker in post_fn, f"gatedPost 缺少 {marker}"
+    assert re.search(r"guard\s*=\s*0;\s*guard\s*<\s*5", post_fn)
+
+    action_fn = js[js.index('$("materialResults").addEventListener("click"') :]
+    action_fn = action_fn[: action_fn.index("try {", action_fn.index("await loadMaterials()"))]
+    assert "gatedPost(`materials/${currentKey}/action`" in action_fn
+    assert "if (!r || r.ok !== true)" in action_fn

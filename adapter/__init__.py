@@ -10,6 +10,7 @@ from .cmd_annotation import AnnotationCommandsMixin
 from .cmd_delete import DeleteCommandsMixin
 from .cmd_help_persona import HelpPersonaCommandsMixin
 from .cmd_memo import MemoCommandsMixin
+from .cmd_search import SearchCommandsMixin
 from .cmd_settings import SettingsCommandsMixin
 from .cmd_transfer import TransferCommandsMixin
 from .cmd_view import ViewCommandsMixin
@@ -20,6 +21,8 @@ from .lifecycle import LifecycleMixin
 from .web_diary import WebDiaryApiMixin
 from .web_export import WebExportApiMixin
 from .web_note import WebNoteApiMixin
+from .web_material import WebMaterialApiMixin
+from .web_search import WebSearchApiMixin
 from .web_prefs import WebPrefsApiMixin
 
 # 组合顺序：都排在 MemoryDiaryCore 之前（与拆分前"方法定义在主类上"的覆盖关系一致）。
@@ -29,6 +32,7 @@ AdapterMixins = (
     GateMixin,
     HelpPersonaCommandsMixin,
     MemoCommandsMixin,
+    SearchCommandsMixin,
     WriteCommandsMixin,
     ViewCommandsMixin,
     AnnotationCommandsMixin,
@@ -40,6 +44,8 @@ AdapterMixins = (
     WebExportApiMixin,
     WebPrefsApiMixin,
     WebNoteApiMixin,
+    WebMaterialApiMixin,
+    WebSearchApiMixin,
 )
 
 __all__ = ["AdapterMixins"]

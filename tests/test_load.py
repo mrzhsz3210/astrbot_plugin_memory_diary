@@ -152,6 +152,12 @@ async def test_instantiation_uses_star_tools_data_dir_and_registers_web_apis():
         routes += ["/astrbot_plugin_memory_diary/note"]
         # v0.6.2 P3-7 新增「查看密码换短期令牌」路由（baseline 没有该接口）
         routes += ["/astrbot_plugin_memory_diary/unlock/<file_key>"]
+        routes += [
+            "/astrbot_plugin_memory_diary/material",
+            "/astrbot_plugin_memory_diary/materials/<file_key>",
+            "/astrbot_plugin_memory_diary/materials/<file_key>/action",
+            "/astrbot_plugin_memory_diary/search/<file_key>",
+        ]
         compare.assert_equal(sorted(routes), routes_new, "web API routes")
         handler_names = sorted(r[1].__name__ for r in base.ctx.registered_web_apis)
         # v0.5.5 新增 web_export_all / web_export_all_local handler
@@ -164,6 +170,9 @@ async def test_instantiation_uses_star_tools_data_dir_and_registers_web_apis():
         handler_names += ["web_external_note"]
         # v0.6.2 P3-7 新增 web_unlock handler
         handler_names += ["web_unlock"]
+        handler_names += [
+            "web_external_material", "web_list_materials", "web_update_material", "web_search_diaries"
+        ]
         compare.assert_equal(
             sorted(handler_names),
             sorted(r[1].__name__ for r in new.ctx.registered_web_apis),

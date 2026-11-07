@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>记忆日记 · 日记本</title>
-    <link rel="stylesheet" href="./style.css" />
+    <link rel="stylesheet" href="./style.css?v=0.7.0-evidence" />
   </head>
   <body>
     <header id="topbar">
@@ -23,6 +23,8 @@
           <button data-kind="paper" data-paper="default" class="paper-item">默认纸纹</button>
           <button data-kind="paper" data-paper="upload" class="paper-item">上传图片…</button>
           <button data-kind="paper" data-paper="custom" class="paper-item" id="paperUseCustom" disabled>使用自定义图片</button>
+          <button data-paper-theme="warm" class="paper-item theme-item" aria-pressed="true">暖白米纸（默认）</button>
+          <button data-paper-theme="classic" class="paper-item theme-item" aria-pressed="false">经典黄底</button>
         </div>
       </div>
       <div class="paper-ctl">
@@ -44,8 +46,39 @@
         </div>
       </div>
       <button id="btnBatchDelete" class="ctl danger" title="删除目录里勾选的日期（不可恢复，建议先导出备份）" disabled>🗑 批量删除</button>
+      <button id="btnSearch" class="ctl" aria-expanded="false" aria-controls="searchTools">搜索 / 时间轴</button>
+      <button id="btnMaterials" class="ctl" aria-expanded="false" aria-controls="materialTools">待吸收素材</button>
       <button id="btnRefresh" class="ctl">⟳ 刷新</button>
     </header>
+
+    <section id="toolsPanel" class="tools-panel" hidden>
+      <div id="searchTools">
+        <div class="tool-row">
+          <input id="searchQuery" type="search" placeholder="原文关键词，多个词为 AND" />
+          <input id="searchDay" type="date" title="按日期筛选" />
+          <select id="searchEvidenceType" title="证据类型">
+            <option value="user">用户相关（默认）</option>
+            <option value="self">AI 私人随笔</option>
+            <option value="mixed">混合段落</option>
+            <option value="external">外部素材</option>
+            <option value="unknown">未分级</option>
+            <option value="all">全部</option>
+          </select>
+          <select id="searchMode"><option value="">全部模式</option><option value="full">完整</option><option value="brief">简记</option><option value="life">随笔</option><option value="external">外部</option><option value="legacy">旧格式</option></select>
+          <select id="searchOrigin"><option value="">全部来源</option><option value="private">私聊</option><option value="group">群聊</option></select>
+          <select id="searchAnnotations"><option value="">批注不限</option><option value="true">有批注</option><option value="false">无批注</option></select>
+          <select id="searchImages"><option value="">插图不限</option><option value="true">有插图</option><option value="false">无插图</option></select>
+          <button id="btnRunSearch" class="ctl">查找证据</button>
+        </div>
+        <div id="searchStatus" class="tool-status"></div>
+        <div id="searchResults" class="tool-results"></div>
+        <button id="btnSearchMore" class="ctl" hidden>下一页</button>
+      </div>
+      <div id="materialTools" hidden>
+        <div class="tool-row"><select id="materialStatus"><option value="">全部状态</option><option value="pending">pending</option><option value="deferred">deferred</option><option value="absorbed">absorbed</option><option value="discarded">discarded</option><option value="expired">expired</option></select><button id="btnLoadMaterials" class="ctl">刷新素材</button></div>
+        <div id="materialResults" class="tool-results"></div>
+      </div>
+    </section>
 
     <main id="stage">
       <div id="empty" class="empty" hidden>
@@ -115,6 +148,6 @@
 
     <div id="toast" class="toast" hidden></div>
 
-    <script type="module" src="./app.js"></script>
+    <script type="module" src="./app.js?v=0.7.0-evidence"></script>
   </body>
 </html>

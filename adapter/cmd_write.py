@@ -7,7 +7,9 @@
 
 from astrbot.api.event import AstrMessageEvent
 
+from ..memory_diary.constants import ERR_NO_DIARY
 from ..memory_diary.log import logger
+from ..memory_diary.scope import scope_from_event
 
 
 class WriteCommandsMixin:
@@ -101,7 +103,7 @@ class WriteCommandsMixin:
                 return
 
         full_before = self._full_diary_count_today(
-            sender_id, bool(event.get_group_id())
+            sender_id, str(scope_from_event(event))
         )
         # 双向互斥：手动写期间也要占住 _writing。只做开头的“检查”是不够的——
         # 手动写要等 LLM 生成（数秒到数十秒），这期间哨兵/每天定时的自动写仍会
@@ -117,11 +119,14 @@ class WriteCommandsMixin:
                 umo,
                 sender_id,
                 sender_name,
-                is_group=bool(event.get_group_id()),
+                is_group=scope_from_event(event).is_group,
+                scope=str(scope_from_event(event)),
                 requested_mode=requested_mode,
             )
         finally:
             self._writing.discard(sender_id)
+        if err == ERR_NO_DIARY:
+            return
         if err:
             # 对话式的婉拒（没新内容/今天随笔已写过）走人设口吻；技术性报错保持固定文案，保证信息准确
             conversational = err.startswith(("距离上次", "今天的随笔"))
@@ -167,7 +172,7 @@ class WriteCommandsMixin:
             max_full = 1
         if requested_mode == "full" and max_full > 0:
             full_after = self._full_diary_count_today(
-                sender_id, bool(event.get_group_id())
+                sender_id, str(scope_from_event(event))
             )
             if full_after > full_before:
                 remaining = max(0, max_full - full_after)

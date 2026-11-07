@@ -214,7 +214,9 @@ class FakeProvider:
             {
                 "prompt": prompt or "",
                 "system_prompt": system_prompt or "",
-                "kwargs": {k: v for k, v in kwargs.items() if k == "contexts"},
+                "kwargs": {
+                    k: v for k, v in kwargs.items() if k in ("contexts", "max_tokens")
+                },
             }
         )
         if self.fail_with is not None:

@@ -35,10 +35,12 @@ from .constants import (
     ANNOTATION_REPLY_TITLE_MAX,
     ANNOTATION_SELF_PLACEHOLDER,
     ANNOTATION_SUMMARY_MAX,
+    REFLECTION_ANNOTATION_PROMPT,
     ANNOTATION_TITLE_MAX,
     ANNOTATION_VIEW_MAX,
 )
 from .log import logger
+from .token_estimator import estimate_text
 
 
 class AnnotationMixin:
@@ -54,8 +56,11 @@ class AnnotationMixin:
     # ------------------------- 配置与基础 -------------------------
 
     def _annotations_enabled(self) -> bool:
-        """批注总开关（默认关闭；关闭时全链路零额外调用、零行为变化）。"""
-        return bool(self.config.get("annotation_enabled", False))
+        """批注总开关（默认开启；显式关闭时全链路零额外调用、零行为变化）。"""
+        return bool(self.config.get("annotation_enabled", True))
+
+    def _reflection_annotations_enabled(self) -> bool:
+        return bool(self.config.get("reflection_annotation_enabled", True))
 
     def _annotation_cfg(self) -> dict:
         """把配置归一化成批注配置 dict（非法值回退默认，绝不抛）。"""
@@ -207,6 +212,8 @@ class AnnotationMixin:
         )
         for key, value in replacements:
             prompt = prompt.replace(key, value)
+        if self._reflection_annotations_enabled():
+            prompt += REFLECTION_ANNOTATION_PROMPT
         return prompt
 
     def _anchorable_entry_text(self, sender_id: str, entry_name: str,
@@ -462,19 +469,29 @@ class AnnotationMixin:
                 seen.add(key)
                 ann_id = self._unique_annotation_id(f"ann_{today}_{seq}", used_ids)
                 used_ids.add(ann_id)
-                accepted.append(
-                    {
-                        "id": ann_id,
-                        "round": round_id,
-                        "anchor": anchor,
-                        "entry": f"{entry_day}.md",
-                        "created_at": now_iso,
-                        "note": note,
-                        "is_question": self._as_bool(item.get("is_question")),
-                        "status": "open",
-                        "reply": None,
-                    }
-                )
+                record = {
+                    "id": ann_id,
+                    "round": round_id,
+                    "anchor": anchor,
+                    "entry": f"{entry_day}.md",
+                    "created_at": now_iso,
+                    "note": note,
+                    "is_question": self._as_bool(item.get("is_question")),
+                    "status": "open",
+                    "reply": None,
+                }
+                if self._reflection_annotations_enabled():
+                    content_type = str(item.get("content_type") or "observation")
+                    if content_type not in ("fact", "observation", "speculation", "self"):
+                        content_type = "observation"
+                    reflection_kind = str(item.get("reflection_kind") or "ordinary")
+                    if reflection_kind not in ("ordinary", "fact"):
+                        reflection_kind = "ordinary"
+                    record["content_type"] = content_type
+                    record["reflection_kind"] = reflection_kind
+                    if reflection_kind == "fact":
+                        record["status"] = "pending_confirmation"
+                accepted.append(record)
                 seq += 1
             if not accepted:
                 return {**result, "reason": "no_valid"}
@@ -518,6 +535,10 @@ class AnnotationMixin:
             return "已解"
         if status == "deferred":
             return "悬置"
+        if status == "pending_confirmation":
+            return "待确认"
+        if status == "rejected":
+            return "已否决"
         return "未解"
 
     @staticmethod
@@ -600,13 +621,12 @@ class AnnotationMixin:
             lines.append("")
         return "\n".join(lines).rstrip()
 
-    def _annotation_inject_block(self, sender_id: str,
-                                 char_cap: int = None) -> str:
-        """随日记一起注入的批注块；无批注/关闭/验签失败 → ""（日记照常注入）。
+    def _annotation_inject_block(
+        self, sender_id: str, char_cap: int = None, token_cap: int = None
+    ) -> str:
+        """随日记注入批注；字符与 token 预算不足时裁掉最旧批注。
 
-        char_cap：本轮还能给批注块的字数（由调用方按"日记已占多少注入预算"算）。
-        None = 用类默认上限 1500；< 100 时返回 ""（预算不足就不注入，避免把
-        日记挤出 inject_max_chars；批注仍可用 /查看批注 翻看）。
+        任一预算都无法容纳纪律文本时返回空串，日记注入不受影响。
         """
         try:
             if not self._annotations_enabled():
@@ -617,9 +637,12 @@ class AnnotationMixin:
                 else max(0, int(char_cap))
             )
             if char_cap is not None and cap < 100:
-                # 预算已被日记占满：本轮不注入批注（只记日志，不打扰用户）
                 logger.info("[memory_diary] 注入预算不足，本轮跳过页边批注块")
                 return ""
+            if token_cap is not None:
+                token_cap = max(0, int(token_cap))
+                if estimate_text(ANNOTATION_INJECT_RULES) > token_cap:
+                    return ""
             data, status = self.load_annotations(sender_id)
             if status == "missing":
                 return ""
@@ -637,16 +660,28 @@ class AnnotationMixin:
                 )
                 or ANNOTATION_DEFAULT_TITLE
             )
-            # 预算保险丝：超出字数上限时从最旧的一条开始丢，至少留一条
             while selected:
                 block = self._render_inject_block(title, selected)
-                if len(block) <= cap or len(selected) == 1:
+                combined = block + "\n\n" + ANNOTATION_INJECT_RULES
+                within_tokens = token_cap is None or estimate_text(combined) <= token_cap
+                if (len(block) <= cap and within_tokens) or len(selected) == 1:
                     break
                 selected = selected[1:]
             block = self._render_inject_block(title, selected)
             if len(block) > cap:
                 block = block[:cap].rstrip()
-            return block + "\n\n" + ANNOTATION_INJECT_RULES
+            combined = block + "\n\n" + ANNOTATION_INJECT_RULES
+            if token_cap is not None and estimate_text(combined) > token_cap:
+                low, high = 0, len(block)
+                while low <= high:
+                    size = (low + high) // 2
+                    candidate = block[:size].rstrip() + "\n\n" + ANNOTATION_INJECT_RULES
+                    if estimate_text(candidate) <= token_cap:
+                        combined = candidate
+                        low = size + 1
+                    else:
+                        high = size - 1
+            return combined
         except Exception as e:  # noqa: BLE001 - 注入绝不能因批注失败
             logger.warning(f"[memory_diary] 组装批注注入块失败，本轮不注入: {e}")
             return ""
@@ -654,13 +689,15 @@ class AnnotationMixin:
     # ------------------------- /查看批注 -------------------------
 
     def _select_view_annotations(self, data: dict) -> list:
-        """`/查看批注` 的展示集合：本轮注入时产生的 + 所有未解决/悬置的。"""
+        """展示本轮批注，以及所有未解、待确认、悬置或已否决记录。"""
         last_round = str(data.get("last_round") or "")
         records = [
             x
             for x in data.get("annotations") or []
             if str(x.get("round") or "") == last_round
-            or x.get("status") in ("open", "deferred")
+            or x.get("status") in (
+                "open", "deferred", "pending_confirmation", "rejected"
+            )
         ]
         records.sort(key=lambda x: str(x.get("created_at") or ""))
         deduped, seen = [], set()
@@ -788,14 +825,14 @@ class AnnotationMixin:
     # ------------------------- /写回批注 -------------------------
 
     def _select_writeback_annotations(self, sender_id: str):
-        """可写回批注（open/deferred，按时间升序）。返回 (列表, status)。"""
+        """可写回或确认：普通未解/悬置与事实级待确认批注。"""
         data, status = self.load_annotations(sender_id)
         if status != "ok":
             return [], status
         items = [
             x
             for x in data.get("annotations") or []
-            if x.get("status") in ("open", "deferred")
+            if x.get("status") in ("open", "deferred", "pending_confirmation")
         ]
         items.sort(key=lambda x: str(x.get("created_at") or ""))
         return items[-ANNOTATION_VIEW_MAX:], status
@@ -932,7 +969,7 @@ class AnnotationMixin:
         )
         if speculation:
             lines.append(f"· 其中推测：{speculation}")
-        lines += ["", "回复「确认」写回；回复「悬置」先放着；回复「取消」不写。"]
+        lines += ["", "回复「确认」写回；回复「否决」不采用；回复「悬置」先放着；回复「取消」退出。"]
         return "\n".join(lines)
 
     def apply_annotation_reply(self, sender_id: str, ann_id: str,
@@ -958,7 +995,7 @@ class AnnotationMixin:
         if not reply["summary"]:
             return False
 
-        hit = {"found": False, "count": 0}
+        hit = {"found": False, "count": 0, "entry": ""}
 
         def _mut(data: dict):
             # P2-8：id 契约是全局唯一；旧数据可能残留重复 id（撞号历史），
@@ -971,6 +1008,7 @@ class AnnotationMixin:
                     item["status"] = "resolved"
                     item["reply"] = reply
                     hit["found"] = True
+                    hit["entry"] = str(item.get("entry") or "")
             data["updated_at"] = self._now_iso()
             return data
 
@@ -980,8 +1018,31 @@ class AnnotationMixin:
                 f"[memory_diary] 批注 id 重复（{ann_id} 命中 {hit['count']} 条），"
                 "已只写回第一条；建议运行一次数据修复"
             )
-        # P2-2：id 不存在时不能报"成功"（否则用户以为写回了、实际什么都没写）
+        if ok and hit["found"] and self._reflection_annotations_enabled():
+            source = f"diaries/{hit['entry']}" if hit["entry"] else ""
+            if not self.append_current_self_pending(sender_id, reply["summary"], source):
+                logger.warning("[memory_diary] 已确认结论未能写入交接信（批注已保存）")
         return bool(ok and hit["found"])
+
+    def reject_annotation(self, sender_id: str, ann_id: str) -> bool:
+        """用户否决：保留批注与状态，但注入时不再生效。"""
+        ann_id = str(ann_id or "").strip()
+        if not ann_id:
+            return False
+        hit = False
+
+        def _mut(data: dict):
+            nonlocal hit
+            for item in data.get("annotations") or []:
+                if str(item.get("id") or "") == ann_id:
+                    item["status"] = "rejected"
+                    hit = True
+                    break
+            data["updated_at"] = self._now_iso()
+            return data
+
+        ok, _ = self.update_annotations(sender_id, _mut)
+        return bool(ok and hit)
 
     def defer_annotation(self, sender_id: str, ann_id: str) -> bool:
         """悬置：status=deferred（下一轮 reset 仍会作为路标带回来）。"""

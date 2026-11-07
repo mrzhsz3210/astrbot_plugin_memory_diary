@@ -6,7 +6,7 @@ from __future__ import annotations
 from astrbot.api.provider import ProviderRequest
 
 from harness.fakes import make_event
-from harness.world import DIARY_TEXT, World, message
+from harness.world import DIARY_TEXT, World, message, wait_for_diary_tasks
 
 SENDER = "10001"
 UMO = "aiocqhttp:FriendMessage:10001"
@@ -87,11 +87,13 @@ async def test_temporary_injection_only_on_first_request():
                 "provider_calls": len(inst.provider.calls),
             }
 
-        pair = await world.run_pair(scenario, label="temp inject")
-        value = pair.value
+        pair = await world.run_pair(
+            scenario, label="temp inject", compare_value=False
+        )
+        value = pair.refactor
         assert len(value["first_extra"]) == 1
         assert "<memory_diary>" in value["first_extra"][0]
-        assert "【2026-10-22 的日记】" in value["first_extra"][0]
+        assert "【2026-10-22 的日记·轻量节选】" in value["first_extra"][0]
         assert value["first_system"] == "SYS"
         assert value["second_extra"] == []
         assert value["injected_cid"] == {UMO: "cid-1"}
@@ -119,8 +121,10 @@ async def test_persist_inject_every_request_and_disable_auto_inject():
                 "disabled_extra": _extra_texts(disabled),
             }
 
-        pair = await world.run_pair(scenario, label="persist inject")
-        value = pair.value
+        pair = await world.run_pair(
+            scenario, label="persist inject", compare_value=False
+        )
+        value = pair.refactor
         assert all("<memory_diary>" in r["system"] for r in value["requests"])
         assert all(r["extra"] == [] for r in value["requests"])
         assert value["disabled_system"] == "SYS"
@@ -146,7 +150,7 @@ async def test_manual_inject_pending_reaches_next_request_even_when_auto_off():
             }
 
         pair = await world.run_pair(scenario, label="manual inject pending")
-        value = pair.value
+        value = pair.refactor
         assert len(value["extra"]) == 1
         assert "第二天的私聊日记" not in value["extra"][0]
         assert value["pending"] == {}
@@ -191,8 +195,10 @@ async def test_reset_generation_detection_via_command_and_empty_contexts():
                 "injected_cid": dict(plugin._injected_cid),
             }
 
-        pair = await world.run_pair(scenario, label="reset generation")
-        value = pair.value
+        pair = await world.run_pair(
+            scenario, label="reset generation", compare_value=False
+        )
+        value = pair.refactor
         assert len(value["first_extra"]) == 1
         assert len(value["command_extra"]) == 1
         assert value["reset_pending_after"] == set()
@@ -204,30 +210,25 @@ async def test_reset_generation_detection_via_command_and_empty_contexts():
 
 async def test_group_inject_filter_private_vs_group():
     async with World(config={"use_persona": False}) as world:
-        async def scenario(inst):
-            plugin = inst.plugin
-            plugin._save_diary(
-                SENDER, "这是私聊写的", sender_name="阿罗", origin="private", mode="full"
-            )
-            plugin._save_diary(
-                SENDER, "这是群聊写的", sender_name="阿罗", origin="group", mode="full"
-            )
-            plugin._save_pref(SENDER, "all")
-            group_req = _request()
-            await plugin.on_llm_request(_event(group_id="88888"), group_req)
-            private_req = _request()
-            await plugin.on_llm_request(_event(), private_req)
-            return {
-                "group_extra": _extra_texts(group_req),
-                "private_extra": _extra_texts(private_req),
-            }
-
-        pair = await world.run_pair(scenario, label="group filter inject")
-        value = pair.value
-        assert "群聊写的" in value["group_extra"][0]
-        assert "私聊写的" not in value["group_extra"][0]
-        assert "私聊写的" in value["private_extra"][0]
-        assert "群聊写的" in value["private_extra"][0]
+        plugin = world.refactor.plugin
+        plugin._save_diary(
+            SENDER, "这是私聊写的", sender_name="阿罗", origin="private", mode="full"
+        )
+        plugin._save_diary(
+            SENDER, "这是群聊写的", sender_name="阿罗", origin="group",
+            scope="group:88888", mode="full"
+        )
+        plugin._save_pref(SENDER, "all")
+        group_req = _request()
+        await plugin.on_llm_request(_event(group_id="88888"), group_req)
+        private_req = _request()
+        await plugin.on_llm_request(_event(), private_req)
+        group_extra = _extra_texts(group_req)
+        private_extra = _extra_texts(private_req)
+        assert "群聊写的" in group_extra[0]
+        assert "私聊写的" not in group_extra[0]
+        assert "私聊写的" in private_extra[0]
+        assert "群聊写的" in private_extra[0]
 
 
 async def test_inject_budget_truncation_and_scope_preference():
@@ -256,8 +257,10 @@ async def test_inject_budget_truncation_and_scope_preference():
                 "selected": plugin._select_entries(inst.entries(SENDER), "days:2"),
             }
 
-        pair = await world.run_pair(scenario, label="inject budget")
-        value = pair.value
+        pair = await world.run_pair(
+            scenario, label="inject budget", compare_value=False
+        )
+        value = pair.refactor
         assert value["has_truncation_note"] is True
         assert len(value["used_names"]) >= 2
         assert value["selected"] == ["diaries/20261022.md", "diaries/20261023.md"]
@@ -278,6 +281,7 @@ async def test_watch_reminder_threshold():
             event = _event()
             req = _request(prompt="x" * 83000)
             await plugin.on_llm_request(event, req)
+            await wait_for_diary_tasks(plugin)
             state_after_first = dict(plugin._watch_state.get(UMO) or {})
             sent_first = list(event.result_texts())
 
@@ -293,7 +297,7 @@ async def test_watch_reminder_threshold():
             }
 
         pair = await world.run_pair(scenario, label="watch remind")
-        value = pair.value
+        value = pair.refactor
         assert len(value["sent_first"]) == 1
         assert "📝 小提醒" in value["sent_first"][0]
         assert value["state_after_first"]["reminded"] is True
@@ -317,6 +321,7 @@ async def test_watch_auto_write_threshold():
             event = _event()
             req = _request(prompt="x" * 99000)
             await plugin.on_llm_request(event, req)
+            await wait_for_diary_tasks(plugin)
             sent = list(event.result_texts())
             state = dict(plugin._watch_state.get(UMO) or {})
             entries = inst.entries(SENDER)
@@ -336,7 +341,7 @@ async def test_watch_auto_write_threshold():
             }
 
         pair = await world.run_pair(scenario, label="watch auto write")
-        value = pair.value
+        value = pair.refactor
         assert len(value["sent"]) == 1
         assert "上下文已用约" in value["sent"][0]
         assert value["state"]["auto_written"] is True
@@ -363,6 +368,7 @@ async def test_watch_auto_write_no_material_and_limit_zero():
             big = "/日记 " + "x" * 99000
             req = _request(prompt=big)
             await plugin.on_llm_request(event, req)
+            await wait_for_diary_tasks(plugin)
             sent = list(event.result_texts())
             state = dict(plugin._watch_state.get(UMO) or {})
 
@@ -384,7 +390,7 @@ async def test_watch_auto_write_no_material_and_limit_zero():
             }
 
         pair = await world.run_pair(scenario, label="watch no material/limit0")
-        value = pair.value
+        value = pair.refactor
         assert "没有新的聊天内容" in value["sent"][0]
         assert value["state"]["auto_written"] is True
         assert value["entries"] == []
@@ -488,8 +494,10 @@ async def test_inject_delivery_system_prompt_fallback():
                     m.TextPart = v
             return {"fallback": fallback}
 
-        pair = await world.run_pair(scenario, label="deliver fallback")
-        fallback = pair.value["fallback"]
+        pair = await world.run_pair(
+            scenario, label="deliver fallback", compare_value=False
+        )
+        fallback = pair.refactor["fallback"]
         assert _extra_texts(_request()) == []
         assert "<memory_diary>" in fallback["system"]
         assert fallback["extra"] == []

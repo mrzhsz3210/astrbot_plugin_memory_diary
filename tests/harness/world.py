@@ -51,6 +51,7 @@ DEFAULT_CONFIG = {
     "use_persona": True,
     "enable_auto_diary": False,
     "auto_diary_time": "22:00",
+    "auto_write_notify": True,
     "empty_diary_as_life": True,
     "show_diary_after_write": False,
     "inject_default_days": 7,
@@ -62,6 +63,10 @@ DEFAULT_CONFIG = {
     "group_require_at": False,
     "extra_instruction": "",
     "max_full_diaries_per_day": 1,
+    "annotation_enabled": False,
+    "current_self_enabled": False,
+    "current_self_rewrite_every": 4,
+    "reflection_annotation_enabled": False,
     "web_diary_brand": "TA",
     "diary_timezone": "Asia/Shanghai",
 }
@@ -83,6 +88,17 @@ def _as_list(value) -> list:
 
 def message(role: str, content: str) -> dict:
     return {"role": role, "content": content}
+
+
+async def wait_for_diary_tasks(plugin) -> None:
+    """等待哨兵后台写作落盘；旧基线没有任务集时直接返回。"""
+    import asyncio
+
+    while True:
+        tasks = [task for task in getattr(plugin, "_diary_tasks", set()) if not task.done()]
+        if not tasks:
+            return
+        await asyncio.gather(*tasks)
 
 
 class Instance:
@@ -354,6 +370,7 @@ class World:
         "· /查看批注 —— 私聊专用：查看本轮读日记时留下的批注与所有未解/悬置的批注\n"
         "· /写回批注 —— 私聊专用：把聊明白的批注写回日记（需确认，可悬置）\n"
     )
+    _HELP_RECALL_LINE_V07 = "· /回忆 [全部|私人随笔] 关键词 —— 默认查找用户相关证据，可显式回查全部类型或 AI 私人随笔\n"
 
     def normalise_text(self, text: str, inst: Instance) -> str:
         replacements = [
@@ -362,9 +379,18 @@ class World:
             (str(inst.captured_dir), "<CAPTURED_DIR>"),
             (str(self.tmp), "<WORLD_TMP>"),
         ]
-        out = text.replace(self._INJECT_TEMPLATE_V055_SENTENCE, "")
+        out = text.replace(
+            "以下是你在上一段记忆结束前写给未来自己的日记。请先阅读并吸收其中的用户画像、经历与叮嘱，然后自然地继续与用户相处。除非用户主动要求查看，不要向用户复述日记全文。",
+            "以下是你在上一段记忆结束前写给未来自己的日记。请先阅读并吸收其中的用户画像与叮嘱，然后自然地继续与用户相处。除非用户主动要求查看，不要向用户复述日记全文。",
+        )
+        out = out.replace(self._INJECT_TEMPLATE_V055_SENTENCE, "")
+        out = out.replace(
+            "其中的小标题是你按自己的人设起的名字。旧日记可能依次包含时间范围 / 用户画像 / 评价与感受 / 给未来的叮嘱；新日记可自由取舍维度、顺序与篇幅，不要补写缺失栏目。\n\n",
+            "",
+        )
         out = out.replace(self._HELP_IMAGE_LINE_V06, "")
         out = out.replace(self._HELP_ANNOTATION_LINES_V06, "")
+        out = out.replace(self._HELP_RECALL_LINE_V07, "")
         for needle, marker in replacements:
             out = out.replace(needle, marker)
             out = out.replace(needle.replace("\\", "\\\\"), marker)

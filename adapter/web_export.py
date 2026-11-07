@@ -40,7 +40,7 @@ class WebExportApiMixin:
         if gate is not None:
             return None, gate
         try:
-            with zipfile.ZipFile(path) as z:
+            with self._diary_zip(path) as z:
                 entries = [n for n in z.namelist() if self.ENTRY_NAME_RE.match(n)]
             if not entries:
                 return None, _web_error("这个用户还没有日记", status_code=400)

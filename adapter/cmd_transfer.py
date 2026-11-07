@@ -249,7 +249,7 @@ class TransferCommandsMixin:
             except FileNotFoundError:
                 pass
             try:
-                owner_id, key, entries, images, annotations, provenance = (
+                owner_id, key, entries, images, annotations, provenance, current_self, materials, anchor_archive = (
                     self._verify_bundle(Path(downloaded))
                 )
                 sender_name = ""
@@ -260,7 +260,8 @@ class TransferCommandsMixin:
                 mode = self._install_bundle(
                     ev.get_sender_id(), owner_id, key, entries, sender_name,
                     images=images, annotations=annotations,
-                    provenance=provenance,
+                    provenance=provenance, current_self=current_self, materials=materials,
+                    anchor_archive=anchor_archive,
                 )
                 n_days = len(entries)
                 if mode == "same_key":

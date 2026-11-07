@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from astrbot.api.provider import ProviderRequest
 
 from harness.fakes import make_event
-from harness.world import DIARY_TEXT, World, message
+from harness.world import DIARY_TEXT, World, message, wait_for_diary_tasks
 
 SENDER_A = "10001"
 SENDER_B = "10002"
@@ -88,10 +88,12 @@ def _ack(plugin, event, resp=None):
 
 def _seed_group_diaries(plugin) -> None:
     plugin._save_diary(
-        SENDER_A, BODY_A, sender_name="阿罗", origin="group", mode="full"
+        SENDER_A, BODY_A, sender_name="阿罗", origin="group",
+        scope=f"group:{GROUP}", mode="full"
     )
     plugin._save_diary(
-        SENDER_B, BODY_B, sender_name="阿堵", origin="group", mode="full"
+        SENDER_B, BODY_B, sender_name="阿堵", origin="group",
+        scope=f"group:{GROUP}", mode="full"
     )
 
 
@@ -205,6 +207,7 @@ async def test_group_sentinel_writes_diary_for_each_member():
         await plugin.on_llm_request(event_a, _request(prompt="x" * 99000))
         event_b = _group_event(sender_id=SENDER_B, sender_name="阿堵")
         await plugin.on_llm_request(event_b, _request(prompt="x" * 99000))
+        await wait_for_diary_tasks(plugin)
 
         assert inst.entries(SENDER_A) == ["diaries/20261023.md"], "A 应被哨兵写日记"
         assert inst.entries(SENDER_B) == ["diaries/20261023.md"], (

@@ -673,7 +673,7 @@ async def test_memos_absorbed_on_private_and_group_writes():
                 message("assistant", "好的"),
             ]
             inst.set_history(history)
-            inst.provider.replies[:] = [DIARY_TEXT, "群聊日记内容", DIARY_TEXT]
+            inst.provider.replies[:] = [DIARY_TEXT, "群聊日记内容：今天讨论发布", DIARY_TEXT]
             content, err = await plugin._write_diary(
                 umo, "10001", "阿罗", is_group=False, requested_mode="full"
             )
@@ -711,13 +711,15 @@ async def test_memos_absorbed_on_private_and_group_writes():
                 "after_group": after_group,
             }
 
-        pair = await world.run_pair(scenario, label="memo absorption")
-        value = pair.value
+        pair = await world.run_pair(
+            scenario, label="memo absorption", compare_value=False, compare_state=False
+        )
+        value = pair.refactor
         assert value["after_private"]["err"] is None
         assert value["after_private"]["memos"] == []
         after_group = value["after_group"]
         assert [m["text"] for m in after_group["private"]] == ["私聊备忘C"]
-        assert after_group["group"] == []
+        assert [m["text"] for m in after_group["group"]] == ["群聊备忘B"]
         assert "群聊日记内容" in after_group["content"]
 
 

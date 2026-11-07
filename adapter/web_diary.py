@@ -44,6 +44,8 @@ class WebDiaryApiMixin:
             "日记本：列出有日记的用户")
         reg(f"/{PLUGIN_NAME}/days/<file_key>", self.web_list_days, ["GET"],
             "日记本：列出某用户的日记日期")
+        reg(f"/{PLUGIN_NAME}/search/<file_key>", self.web_search_diaries, ["GET"],
+            "日记本：时间轴、筛选与本地关键词证据搜索")
         reg(f"/{PLUGIN_NAME}/day/<file_key>/<day>", self.web_read_day, ["GET"],
             "日记本：读取某天的日记")
         reg(f"/{PLUGIN_NAME}/export/<file_key>", self.web_export, ["GET"],
@@ -77,7 +79,13 @@ class WebDiaryApiMixin:
         # 外部写入（v0.6.2，issue #3）：面向无面板会话的本地程序，走 AstrBot
         # v1 API key + 插件写入凭证双闸，实现见 adapter/web_note.py
         reg(f"/{PLUGIN_NAME}/note", self.web_external_note, ["POST"],
-            "外部写入：凭写入凭证给日记追加段落（幂等、只追加、fail-closed）")
+            "旧外部直写：仅兼容没有 API 版本字段的旧凭证")
+        reg(f"/{PLUGIN_NAME}/material", self.web_external_material, ["POST"],
+            "外部素材 v2：写入签名待吸收队列")
+        reg(f"/{PLUGIN_NAME}/materials/<file_key>", self.web_list_materials, ["GET"],
+            "日记本：查看待吸收素材")
+        reg(f"/{PLUGIN_NAME}/materials/<file_key>/action", self.web_update_material, ["POST"],
+            "日记本：重试或明确丢弃素材")
 
     @staticmethod
     def _valid_file_key(file_key: str) -> bool:
@@ -167,6 +175,8 @@ class WebDiaryApiMixin:
         方把请求体里的 pw 传进来（pw=None 时沿用 query，保证既有行为逐字节不变）。
         for_download=True 时（bridge.download 期望文件响应）用错误而非 JSON 表达。
         """
+        if not self._is_allowed(owner_id):
+            return _web_error("该用户不在插件白名单内", status_code=403)
         rec = self._view_password_rec(owner_id)
         if rec is None:
             return None
@@ -211,6 +221,8 @@ class WebDiaryApiMixin:
             if err == "OWNER_UNKNOWN":
                 return _web_json({"need_owner": True})
             return _web_error(f"无法确认日记主人：{err}", status_code=400)
+        if not self._is_allowed(owner):
+            return _web_error("该用户不在插件白名单内", status_code=403)
         rec = self._view_password_rec(owner)
         if rec is not None:
             pw = str(payload.get("pw") or "").strip()
@@ -236,9 +248,11 @@ class WebDiaryApiMixin:
                 if owner_map is None:
                     owner_map = self._load_owner_map()
                 owner = owner_map.get(file_key, "")
+            if owner and not self._is_allowed(owner):
+                continue
             day_count, latest = 0, ""
             try:
-                with zipfile.ZipFile(path) as z:
+                with self._diary_zip(path) as z:
                     days = sorted(
                         n for n in z.namelist() if self.ENTRY_NAME_RE.match(n)
                     )
@@ -274,8 +288,12 @@ class WebDiaryApiMixin:
         path = self.data_dir / f"diary_{file_key}.zip"
         if not path.exists():
             return _web_error("日记文件不存在", status_code=404)
+        owner, _nick = self._zip_owner_info(path)
+        owner = owner or self._load_owner_map().get(file_key, "")
+        if not self._is_allowed(owner):
+            return _web_error("该用户不在插件白名单内", status_code=403)
         try:
-            with zipfile.ZipFile(path) as z:
+            with self._diary_zip(path) as z:
                 bad = z.testzip()
                 if bad is not None:
                     return _web_error(f"日记文件损坏（{bad} CRC 校验失败）",
@@ -391,12 +409,13 @@ class WebDiaryApiMixin:
             # P2-1：上传本体限 32MB（压缩态）；解压后总量/压缩比双闸在
             # _verify_bundle 里，zip bomb 在校验前不会整体进内存
             await upload.save(tmp, max_bytes=32 * 1024 * 1024)
-            owner_id, key, entries, images, annotations, provenance = (
+            owner_id, key, entries, images, annotations, provenance, current_self, materials, anchor_archive = (
                 self._verify_bundle(tmp)
             )
             mode = self._install_bundle(
                 owner_id, owner_id, key, entries, check_owner=False,
                 images=images, annotations=annotations, provenance=provenance,
+                current_self=current_self, materials=materials, anchor_archive=anchor_archive,
             )
             logger.info(
                 f"[memory_diary] Web 页面导入迁移包成功："
