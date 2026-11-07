@@ -43,7 +43,7 @@ const FONT_FAMILIES = [
 ];
 const FONT_SIZE_MIN = 13;
 const FONT_SIZE_MAX = 22;
-let prefs = { font_size: 16, font_family: "kai", paper: "default", backdrop: "default" };
+let prefs = { font_size: 16, font_family: "kai", paper: "default", backdrop: "default", paper_theme: "warm" };
 
 /* 查看密码的短时凭证（v0.6.2 契约 3）：解锁 POST /unlock/<file_key> 换取 token，
  * 之后所有读接口用 query 参数 `tk` 携带（宿主 bridge 的 api:get/api:post 不支持
@@ -92,6 +92,12 @@ function setImageUrl(kind, url) {
 
 function applyPrefs() {
   const root = document.documentElement.style;
+  document.documentElement.dataset.paperTheme = prefs.paper_theme;
+  for (const item of document.querySelectorAll(".theme-item[data-paper-theme]")) {
+    const active = item.dataset.paperTheme === prefs.paper_theme;
+    item.classList.toggle("active", active);
+    item.setAttribute("aria-pressed", String(active));
+  }
   root.setProperty("--d-font-size", prefs.font_size + "px");
   const fam =
     FONT_FAMILIES.find((f) => f.key === prefs.font_family) || FONT_FAMILIES[0];
@@ -101,15 +107,43 @@ function applyPrefs() {
 }
 
 let saveTimer = null;
+let cancelPendingSave = null;
 function savePrefs() {
+  if (cancelPendingSave) cancelPendingSave(false);
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
-    try {
-      await bridge.apiPost("prefs/save", { prefs });
-    } catch (e) {
-      console.warn("偏好保存失败", e);
-    }
-  }, 400);
+  return new Promise((resolve) => {
+    cancelPendingSave = resolve;
+    saveTimer = setTimeout(async () => {
+      cancelPendingSave = null;
+      const requestedTheme = prefs.paper_theme;
+      try {
+        const r = await bridge.apiPost("prefs/save", { prefs });
+        if (!r || r.saved !== true) throw new Error("偏好保存响应异常");
+        if (
+          r.prefs &&
+          ["warm", "classic"].includes(r.prefs.paper_theme) &&
+          prefs.paper_theme === requestedTheme
+        ) {
+          prefs.paper_theme = r.prefs.paper_theme;
+          applyPrefs();
+        }
+        resolve(true);
+      } catch (e) {
+        console.warn("偏好保存失败", e);
+        toast("偏好已临时生效，但保存失败，刷新后可能恢复", 5000);
+        resolve(false);
+      }
+    }, 400);
+  });
+}
+
+function setPaperTheme(theme) {
+  if (!["warm", "classic"].includes(theme)) return false;
+  prefs.paper_theme = theme;
+  applyPrefs();
+  const saving = savePrefs();
+  closeMenus();
+  return saving;
 }
 
 function changeFontSize(delta) {
@@ -148,6 +182,9 @@ async function loadPrefs() {
       }
       if (r.prefs.backdrop === "default" || r.prefs.backdrop === "custom") {
         prefs.backdrop = r.prefs.backdrop;
+      }
+      if (["warm", "classic"].includes(r.prefs.paper_theme)) {
+        prefs.paper_theme = r.prefs.paper_theme;
       }
     }
     if (typeof r.brand === "string" && r.brand) {
@@ -611,6 +648,36 @@ async function gatedGet(endpoint, params = {}, { reason = "" } = {}) {
     return r;
   }
   toast("读取失败：身份校验没有通过，请点「⟳ 刷新」重试", 5000);
+  return null;
+}
+
+/* POST 与 gatedGet 共用同一套短期令牌和解锁流程；令牌放在请求体 tk 字段。 */
+async function gatedPost(endpoint, body = {}, { reason = "" } = {}) {
+  const request = () => bridge.apiPost(endpoint, { ...body, ...authParams() });
+  for (let guard = 0; guard < 5; guard += 1) {
+    let r;
+    try {
+      r = await request();
+    } catch (e) {
+      const msg = e.message || "";
+      if (!msg.includes("PASSWORD_REQUIRED") && !msg.includes("PASSWORD_WRONG")) {
+        throw e;
+      }
+      clearSessionToken(currentKey);
+      updateLockUI();
+      if (!(await acquireToken({ reason }))) return null;
+      continue;
+    }
+    if (r && (r.need_password || r.need_owner)) {
+      const needOwner = Boolean(r.need_owner);
+      clearSessionToken(currentKey);
+      updateLockUI();
+      if (!(await acquireToken({ reason, needOwner }))) return null;
+      continue;
+    }
+    return r;
+  }
+  toast("操作失败：身份校验没有通过，请刷新后重试", 5000);
   return null;
 }
 
@@ -1800,6 +1867,100 @@ await bridge.ready();
 $("btnFontSmaller").addEventListener("click", () => changeFontSize(-1));
 $("btnFontLarger").addEventListener("click", () => changeFontSize(1));
 $("btnFontFamily").addEventListener("click", cycleFontFamily);
+/* ---------- 本地时间轴 / 待吸收素材 ---------- */
+let searchOffset = 0;
+let searchTotal = 0;
+let activeTool = null;
+let materialsLoaded = false;
+
+function syncToolButtons() {
+  $("btnSearch").setAttribute("aria-expanded", String(activeTool === "search"));
+  $("btnMaterials").setAttribute("aria-expanded", String(activeTool === "materials"));
+}
+
+function closeTools(restoreFocus = true) {
+  const previous = activeTool;
+  $("toolsPanel").hidden = true;
+  $("searchTools").hidden = true;
+  $("materialTools").hidden = true;
+  activeTool = null;
+  syncToolButtons();
+  if (restoreFocus && previous) {
+    $(previous === "search" ? "btnSearch" : "btnMaterials").focus();
+  }
+}
+
+function openTools(kind) {
+  if (!["search", "materials"].includes(kind)) return;
+  if (activeTool === kind) {
+    closeTools();
+    return;
+  }
+  activeTool = kind;
+  $("toolsPanel").hidden = false;
+  $("searchTools").hidden = kind !== "search";
+  $("materialTools").hidden = kind !== "materials";
+  syncToolButtons();
+  if (kind === "materials" && !materialsLoaded) {
+    materialsLoaded = true;
+    void loadMaterials();
+  }
+  $(kind === "search" ? "searchQuery" : "materialStatus").focus();
+}
+
+async function runSearch(reset = true) {
+  if (!currentKey) return;
+  if (reset) searchOffset = 0;
+  const params = {
+    q: $("searchQuery").value.trim(), day: $("searchDay").value,
+    evidence_type: $("searchEvidenceType").value,
+    mode: $("searchMode").value, origin: $("searchOrigin").value,
+    has_annotations: $("searchAnnotations").value, has_images: $("searchImages").value,
+    offset: searchOffset, ...authParams(),
+  };
+  try {
+    const r = await gatedGet(`search/${currentKey}`, params, {
+      reason: "搜索日记需要查看密码，请输入。",
+    });
+    if (r === null) return;
+    searchTotal = r.total || 0;
+    if (reset) $("searchResults").innerHTML = "";
+    const html = (r.results || []).map((item) => {
+      const evidenceType = escapeAttr(item.evidence_type || "unknown");
+      const sourceNote = item.source_status === "partial" ? " · 来源未完整匹配" :
+        (item.source_status === "tampered" ? " · 来源侧车验签失败" : "");
+      return `<article class="evidence-card"><button class="evidence-day" data-day="${escapeAttr(item.day)}">${escapeHtml(item.day)} · ${escapeHtml(item.source)} · ${escapeHtml(item.scope)}</button>` +
+        `<div class="evidence-mode"><span class="evidence-badge evidence-${evidenceType}">${escapeHtml(item.evidence_label || "未分级（旧记录）")}</span>${item.has_explicit ? '<span class="evidence-explicit">显式交代</span>' : ""} · ${escapeHtml(item.mode)}${item.has_annotations ? " · 有批注" : ""}${item.has_images ? " · 有插图" : ""}${sourceNote}</div>` +
+        `<p>${escapeHtml(item.snippet)}</p><small>${escapeHtml(item.entry)}</small></article>`;
+    }).join("");
+    $("searchResults").insertAdjacentHTML("beforeend", html);
+    $("searchStatus").textContent = `共 ${searchTotal} 条证据${r.tampered ? "；部分篡改条目已跳过，来源异常标为未分级" : ""}。无命中不代表没有相关记忆。`;
+    searchOffset = r.next_offset === null || r.next_offset === undefined ? searchTotal : r.next_offset;
+    $("btnSearchMore").hidden = searchOffset >= searchTotal;
+  } catch (e) {
+    $("searchStatus").textContent = `搜索失败：${e.message || e}`;
+  }
+}
+
+async function loadMaterials() {
+  if (!currentKey) return;
+  try {
+    const r = await gatedGet(`materials/${currentKey}`, {
+      status: $("materialStatus").value, ...authParams(),
+    }, { reason: "查看待吸收素材需要查看密码，请输入。" });
+    if (r === null) return;
+    $("materialResults").innerHTML = (r.items || []).map((item) =>
+      `<article class="evidence-card"><div>${escapeHtml(item.source)} · ${escapeHtml(item.scope)} · ${escapeHtml(item.status)}</div>` +
+      `<small>${escapeHtml(item.submitted_at)} · ${escapeHtml(item.id)}</small><p>${escapeHtml(item.text || "（正文已过期清除）")}</p>` +
+      `<small>${escapeHtml(item.reason || "")}${item.absorbed_entry ? " · " + escapeHtml(item.absorbed_entry) : ""}</small>` +
+      (["pending", "deferred"].includes(item.status) ? ` <button class="ctl material-action" data-id="${escapeAttr(item.id)}" data-action="discard">明确丢弃</button>` : "") +
+      (item.status === "deferred" ? ` <button class="ctl material-action" data-id="${escapeAttr(item.id)}" data-action="retry">重试</button>` : "") + `</article>`
+    ).join("") || "<p>当前筛选下没有素材。</p>";
+  } catch (e) {
+    $("materialResults").textContent = `素材读取失败：${e.message || e}`;
+  }
+}
+
 await loadPrefs();
 await loadImageData("paper");
 await loadImageData("backdrop");
@@ -1831,10 +1992,15 @@ document.addEventListener("click", (e) => {
   if (e.target.closest(".page-left") || e.target.closest("#btnToc")) return;
   closeToc();
 });
-for (const item of document.querySelectorAll(".paper-item")) {
+for (const item of document.querySelectorAll(".paper-item[data-kind]")) {
   item.addEventListener("click", () =>
     onImageMenuClick(item.dataset.kind, item.dataset.paper)
   );
+}
+for (const item of document.querySelectorAll(".theme-item[data-paper-theme]")) {
+  item.addEventListener("click", () => {
+    void setPaperTheme(item.dataset.paperTheme);
+  });
 }
 $("paperInput").addEventListener("change", async (e) => {
   await onImageFileChosen("paper", e.target.files[0]);
@@ -1846,6 +2012,12 @@ $("backdropInput").addEventListener("change", async (e) => {
 });
 $("userSelect").addEventListener("change", async (e) => {
   currentKey = e.target.value;
+  materialsLoaded = false;
+  closeTools(false);
+  $("searchResults").innerHTML = "";
+  $("searchStatus").textContent = "";
+  searchOffset = 0;
+  searchTotal = 0;
   // 切用户：loadDays 内部会先换代次（navToken）并清空旧目录/正文，在途的
   // 翻页结果会被丢弃，不会出现「目录是新用户、正文是旧用户」的错位页面。
   await loadDays();
@@ -1892,6 +2064,11 @@ document.addEventListener("keydown", (e) => {
     }
     return; // 对话框打开时不响应翻页快捷键
   }
+  if (e.key === "Escape" && activeTool) {
+    e.preventDefault();
+    closeTools();
+    return;
+  }
   // 焦点在表单控件里时，方向键属于控件本身：在「选择用户」下拉框上按 ←/→
   // 会切换用户（原生行为），若再冒泡到这里还会同时翻页 → 左右两页来自不同用户。
   const target = e.target;
@@ -1923,6 +2100,37 @@ let annResizeTimer = null;
 window.addEventListener("resize", () => {
   clearTimeout(annResizeTimer);
   annResizeTimer = setTimeout(repositionActiveAnnCard, 120);
+});
+$("btnSearch").addEventListener("click", () => openTools("search"));
+$("btnMaterials").addEventListener("click", () => openTools("materials"));
+$("btnRunSearch").addEventListener("click", () => runSearch(true));
+$("btnSearchMore").addEventListener("click", () => runSearch(false));
+$("searchQuery").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") runSearch(true);
+});
+$("searchResults").addEventListener("click", async (event) => {
+  const button = event.target.closest(".evidence-day");
+  if (!button) return;
+  const index = days.findIndex((item) => item.day === button.dataset.day);
+  if (index >= 0) await showDay(index);
+});
+$("btnLoadMaterials").addEventListener("click", loadMaterials);
+$("materialStatus").addEventListener("change", loadMaterials);
+$("materialResults").addEventListener("click", async (event) => {
+  const button = event.target.closest(".material-action");
+  if (!button) return;
+  try {
+    const r = await gatedPost(`materials/${currentKey}/action`, {
+      id: button.dataset.id, action: button.dataset.action,
+    }, { reason: "处理待吸收素材需要查看密码，请输入。" });
+    if (!r || r.ok !== true) {
+      if (r) toast("操作失败：素材状态没有改变");
+      return;
+    }
+    await loadMaterials();
+  } catch (e) {
+    toast(`操作失败：${e.message || e}`);
+  }
 });
 
 try {

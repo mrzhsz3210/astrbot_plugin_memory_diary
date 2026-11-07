@@ -22,6 +22,7 @@ class WebPrefsApiMixin:
     # 界面偏好（字号/字体）：iframe 沙箱没有 localStorage，
     # 存到数据目录、按管理面板账号分开；视图加载时读取，改动即保存。
     _VIEW_FONT_FAMILIES = ("kai", "song", "sans")
+    _VIEW_PAPER_THEMES = ("warm", "classic")
 
     def _view_prefs_path(self) -> Path:
         return self.data_dir / "web_view_prefs.json"
@@ -56,6 +57,9 @@ class WebPrefsApiMixin:
         family = str(prefs.get("font_family", ""))
         if family in self._VIEW_FONT_FAMILIES:
             clean["font_family"] = family
+        paper_theme = str(prefs.get("paper_theme", ""))
+        if paper_theme in self._VIEW_PAPER_THEMES:
+            clean["paper_theme"] = paper_theme
         paper = str(prefs.get("paper", ""))
         if paper in ("default", "custom"):
             clean["paper"] = paper

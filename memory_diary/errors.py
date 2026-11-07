@@ -11,3 +11,11 @@ class DiaryTamperedError(Exception):
 
 class DiaryCorruptError(Exception):
     """日记 zip 损坏：已隔离备份，在人工处理前拒绝覆盖写入。"""
+
+
+class DiaryDecryptionError(Exception):
+    """密文认证失败、口令错误或格式不支持；不得按 ZIP 损坏隔离。"""
+
+
+class DiaryPassphraseRequired(DiaryDecryptionError):
+    """读取或开启加密所需口令缺失/长度不足。"""

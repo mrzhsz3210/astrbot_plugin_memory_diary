@@ -29,7 +29,7 @@ from .memory_diary.log import logger
     "astrbot_plugin_memory_diary",
     "mrzhsz3210",
     "指令/定时自动触发写日记（用户画像 / 对用户的评价 / 给未来自己的叮嘱），新上下文自动读取日记，上下文将满时自动提醒，支持每天定时自动写完整日记。",
-    "v0.6.2",
+    "v0.7.0",
 )
 class MemoryDiaryPlugin(*AdapterMixins, MemoryDiaryCore, Star):
     """AstrBot 插件入口：只保留注册与 handler 薄壳，实现见 adapter/ 与 memory_diary/。"""
@@ -86,6 +86,29 @@ class MemoryDiaryPlugin(*AdapterMixins, MemoryDiaryCore, Star):
         """写日记：默认简记；/日记 完整 写完整篇；/日记 简记 强制简记。"""
         async for result in self._handle_write_diary_cmd(event):
             yield result
+
+    # ------------------------- 按需搜索 -------------------------
+    # 实现：adapter/cmd_search.py
+
+    @filter.command("回忆", alias={"recall"})
+    async def recall(self, event: AstrMessageEvent):
+        """查找历史证据。用法：/回忆 [全部|私人随笔] 关键词 [更多关键词]"""
+        async for result in self._handle_recall(event):
+            yield result
+
+    @filter.llm_tool(name="memory_diary_search")
+    async def memory_diary_search(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        day: str = "",
+        max_results: int = 5,
+        evidence_type: str = "user",
+    ) -> str:
+        """搜索当前用户与作用域的日记证据。evidence_type 可选 user/self/all/mixed/external/unknown。"""
+        return await self._handle_memory_diary_search(
+            event, query, day, max_results, evidence_type
+        )
 
     # ------------------------- 指令：查看日记 -------------------------
     # 实现：adapter/cmd_view.py

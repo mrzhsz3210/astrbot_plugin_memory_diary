@@ -22,10 +22,11 @@ VIEW_DIR = env.REFACTOR_DIR / "views" / "diary-book"
 PACKAGE_ROOT = env.REFACTOR_DIR
 
 EXPECTED_ANNOTATION_CONFIG = {
-    "annotation_enabled": ("bool", False),
+    "annotation_enabled": ("bool", True),
     "annotation_max_per_round": ("int", 5),
     "annotation_question_hint": ("bool", True),
     "annotation_timeout": ("int", 30),
+    "reflection_annotation_enabled": ("bool", True),
 }
 ANNOTATION_KEYS_TAIL = list(EXPECTED_ANNOTATION_CONFIG)
 
@@ -252,9 +253,9 @@ def test_conf_schema_annotation_keys_types_defaults_and_conditions():
     assert keys[-2:] == ["diary_timezone", "enable_context_watch"], (
         f"配置页最后两项应为日记时区与已废弃兼容项，实际 {keys[-2:]}"
     )
-    assert keys[-6:-2] == ANNOTATION_KEYS_TAIL, (
+    assert keys[-7:-2] == ANNOTATION_KEYS_TAIL, (
         f"批注配置项应紧跟插图配置项之后（时区之前），顺序为 {ANNOTATION_KEYS_TAIL}，"
-        f"实际 {keys[-6:-2]}"
+        f"实际 {keys[-7:-2]}"
     )
     for key, (expected_type, expected_default) in EXPECTED_ANNOTATION_CONFIG.items():
         item = schema[key]
@@ -267,15 +268,15 @@ def test_conf_schema_annotation_keys_types_defaults_and_conditions():
         assert item.get("description", "").strip(), f"{key} 缺少 description"
         assert item.get("hint", "").strip(), f"{key} 缺少 hint"
     assert "condition" not in schema["annotation_enabled"], "总开关不应有显示条件"
-    for key in ("annotation_max_per_round", "annotation_question_hint", "annotation_timeout"):
+    for key in ANNOTATION_KEYS_TAIL[1:]:
         condition = schema[key].get("condition") or {}
         assert condition.get("annotation_enabled") is True, (
             f"{key} 缺少 condition.annotation_enabled=true：{condition!r}"
         )
     slider = schema["annotation_max_per_round"].get("slider") or {}
     assert (slider.get("min"), slider.get("max")) == (1, 5)
-    # 默认关闭（设计拍板）：管理员必须显式开启
-    assert schema["annotation_enabled"]["default"] is False
+    # 默认开启；需要零额外调用时由管理员显式关闭
+    assert schema["annotation_enabled"]["default"] is True
 
 
 def test_annotation_cfg_defaults_match_conf_schema_defaults():
@@ -287,7 +288,7 @@ def test_annotation_cfg_defaults_match_conf_schema_defaults():
             return world.refactor.plugin._annotation_cfg()
 
     cfg = asyncio.run(_run())
-    assert cfg["annotation_enabled"] is False
+    assert cfg["annotation_enabled"] is True
     assert cfg["annotation_max_per_round"] == 5
     assert cfg["annotation_question_hint"] is True
     assert cfg["annotation_timeout"] == 30
@@ -298,7 +299,7 @@ def test_readme_has_annotation_commands_and_section():
     # §7.1 指令表两行
     assert "`/查看批注`" in readme, "README §7.1 缺少 /查看批注"
     assert "`/写回批注`" in readme, "README §7.1 缺少 /写回批注"
-    # §10.13 批注配置章节 + 四个 bullet（顺序与 schema 一致）
+    # §10.13 批注配置章节 + 五个 bullet（顺序与 schema 一致）
     assert "### 10.13 批注配置（v0.6）" in readme
     start = readme.index("### 10.13 批注配置（v0.6）")
     end = readme.index("### 10.14 多用户与隐私")
@@ -312,13 +313,14 @@ def test_readme_has_annotation_commands_and_section():
         "每轮最多生成几条批注",
         "疑问句软引导",
         "批注生成超时",
+        "启用记忆反思批注",
     ]
     found = []
     for line in section.splitlines():
         if line.startswith("- **"):
             label = line[4:].split("**", 1)[0]
             found.append(label)
-    assert len(found) == 4, f"§10.13 应有 4 个配置 bullet，实际 {found!r}"
+    assert found == expected_prefixes, f"§10.13 配置 bullet 不符：{found!r}"
     for label, prefix in zip(found, expected_prefixes):
         assert label.startswith(prefix), (
             f"§10.13 bullet 顺序/label 不符：{label!r}（应以 {prefix!r} 开头）"

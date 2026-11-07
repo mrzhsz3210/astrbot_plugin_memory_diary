@@ -45,6 +45,20 @@ def _drop_json_field(raw: bytes, field: str) -> bytes:
     return raw
 
 
+def _drop_memo_scopes(raw: bytes) -> bytes:
+    try:
+        data = json.loads(raw)
+        memos = data.get("memos") if isinstance(data, dict) else None
+        if not isinstance(memos, list):
+            return raw
+        for memo in memos:
+            if isinstance(memo, dict):
+                memo.pop("scope", None)
+        return json.dumps(data, ensure_ascii=False).encode("utf-8")
+    except Exception:
+        return raw
+
+
 def stable_repr(value, _depth: int = 0) -> str:
     """Deterministic repr usable in assertion messages."""
     if _depth > 8:
@@ -77,7 +91,23 @@ def _first_difference(a: bytes, b: bytes, width: int = 60) -> str:
     )
 
 
+def _legacy_segment_info(value):
+    if isinstance(value, list):
+        return [_legacy_segment_info(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _legacy_segment_info(item)
+            for key, item in value.items()
+            if not (
+                ({"mode", "scene", "absorbed"} <= set(value) and key in {"origin", "scope"})
+                or ({"time", "text", "scene"} <= set(value) and key == "scope")
+            )
+        }
+    return value
+
+
 def assert_equal(expected, actual, label: str = "value") -> None:
+    actual = _legacy_segment_info(actual)
     if expected == actual:
         return
     if isinstance(expected, bytes) and isinstance(actual, bytes):
@@ -114,6 +144,8 @@ def normalise_bytes(raw: bytes, data_dir: Path, tmp_root: Path | None = None) ->
     # 两边比较前统一删掉该键（只在 JSON 里命中，zip 条目不受影响）。
     if b'"last_material_hash"' in text:
         text = _drop_json_field(text, "last_material_hash")
+    if b'"memos"' in text and b'"scope"' in text:
+        text = _drop_memo_scopes(text)
     return text
 
 

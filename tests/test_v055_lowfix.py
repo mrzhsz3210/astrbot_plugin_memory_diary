@@ -306,7 +306,7 @@ async def test_export_import_roundtrip_with_trailing_whitespace_entry():
             # 修前：_verify_bundle 先 strip 再验签 -> 这里抛“迁移包可能被改动过”
             # v0.6：返回 5 元组 (owner, key, entries, images, annotations, provenance)，
             # 这篇日记没有插图、也没有批注侧车 → images={} / annotations=None
-            owner, key, entries, images, annotations, _prov = plugin._verify_bundle(bundle)
+            owner, key, entries, images, annotations, _prov, _current_self, _materials, _anchor_archive = plugin._verify_bundle(bundle)
             assert owner == SENDER
             assert entries[entry] == raw
             assert images == {}, f"没有插图的迁移包 images 应为空，实际 {images!r}"

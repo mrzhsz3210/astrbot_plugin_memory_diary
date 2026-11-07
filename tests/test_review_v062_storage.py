@@ -42,6 +42,12 @@ async def _post(plugin, payload) -> dict:
 def _make_token(plugin, source="dsh", sender=SENDER) -> str:
     token = plugin.create_external_token(sender, source)
     assert token, "凭证创建失败"
+    records = plugin._load_external_tokens()
+    for rec in records:
+        rec.pop("api_version", None)
+        rec.pop("legacy_direct", None)
+        rec.pop("scope", None)
+    assert plugin._save_external_tokens(records)
     return token
 
 

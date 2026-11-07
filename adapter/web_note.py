@@ -138,8 +138,17 @@ class WebNoteApiMixin:
         token = str(payload.get("token") or "").strip()
         rec = self.resolve_external_token(token)
         if rec is None:
+            owner = self.external_token_owner(token)
+            if owner and not self._is_allowed(owner):
+                return self._note_err("OWNER_NOT_ALLOWED", "该用户不在插件白名单内", 403)
             return self._note_err("UNAUTHORIZED", "凭证缺失或无效", 401)
         owner = str(rec.get("owner") or "").strip()
+        if "api_version" in rec or "legacy_direct" in rec:
+            return self._note_err(
+                "LEGACY_DIRECT_FORBIDDEN",
+                "新凭证只能写入待吸收素材队列，请改用 /material 接口",
+                403,
+            )
         source = str(payload.get("source") or "").strip()
         if not source or source != str(rec.get("source") or ""):
             return self._note_err(

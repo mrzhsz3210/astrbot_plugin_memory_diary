@@ -15,7 +15,7 @@ from astrbot.api.provider import ProviderRequest
 
 from harness import env
 from harness.fakes import make_event
-from harness.world import DIARY_TEXT, FIXED_NOW, World, message
+from harness.world import DIARY_TEXT, FIXED_NOW, World, message, wait_for_diary_tasks
 
 SENDER = "10001"
 UMO = "aiocqhttp:FriendMessage:10001"
@@ -58,11 +58,29 @@ async def test_scheduled_write_silent_when_notify_off():
         assert inst.ctx.sent_messages == []
 
 
-async def test_scheduled_write_notifies_by_default():
-    """定时路径-开启（未配置该键 = 默认 true）：与 v0.6.0 行为一致。"""
+async def test_scheduled_write_silent_by_default():
+    """老配置缺少该键时，定时路径从 v0.7.0 起默认静默。"""
     async with World(config={"use_persona": False}) as world:
         inst = world.refactor
-        assert "auto_write_notify" not in inst.config
+        plugin = inst.plugin
+        plugin.config.pop("auto_write_notify", None)
+        plugin.config["enable_auto_diary"] = True
+        plugin.config["auto_diary_time"] = "22:00"
+        inst.set_now(FIXED_NOW.replace(hour=22, minute=0))
+        plugin._auto_users = {SENDER: {"umo": UMO, "name": "阿罗"}}
+        inst.set_history(_material_history())
+        inst.provider.replies[:] = [DIARY_TEXT]
+        await plugin._auto_diary_tick()
+        assert inst.entries(SENDER) == ["diaries/20261023.md"]
+        assert inst.ctx.sent_messages == []
+
+
+async def test_scheduled_write_notifies_when_enabled():
+    """定时路径显式开启后保留写完告知。"""
+    async with World(
+        config={"use_persona": False, "auto_write_notify": True}
+    ) as world:
+        inst = world.refactor
         plugin = inst.plugin
         plugin.config["enable_auto_diary"] = True
         plugin.config["auto_diary_time"] = "22:00"
@@ -77,7 +95,7 @@ async def test_scheduled_write_notifies_by_default():
 
 
 async def test_sentinel_auto_write_silent_when_notify_off():
-    """哨兵路径-关闭：日记落盘、状态照旧，但不再发「写好了 + /reset」告知。"""
+    """哨兵路径-关闭：后台日记落盘、状态照旧，但不发写完告知。"""
     async with World(
         config={
             "use_persona": False,
@@ -93,17 +111,41 @@ async def test_sentinel_auto_write_silent_when_notify_off():
         inst.provider.replies[:] = [DIARY_TEXT]
         event = _event()
         await plugin.on_llm_request(event, _request(prompt="x" * 99000))
+        await wait_for_diary_tasks(plugin)
         assert inst.entries(SENDER) == ["diaries/20261023.md"]
         assert event.result_texts() == []
         state = plugin._watch_state.get(UMO) or {}
         assert state.get("auto_written") is True
 
 
-async def test_sentinel_auto_write_notifies_by_default():
-    """哨兵路径-开启：保留「上下文已用约 X% + 日记写好了 + /reset」告知。"""
+async def test_sentinel_auto_write_silent_by_default():
+    """老配置缺少该键时，哨兵后台写作默认静默。"""
     async with World(
         config={
             "use_persona": False,
+            "context_token_limit": 60000,
+            "remind_ratio": 0.75,
+            "auto_ratio": 0.9,
+        }
+    ) as world:
+        inst = world.refactor
+        plugin = inst.plugin
+        plugin.config.pop("auto_write_notify", None)
+        inst.set_history([message("user", "历史消息")])
+        inst.provider.replies[:] = [DIARY_TEXT]
+        event = _event()
+        await plugin.on_llm_request(event, _request(prompt="x" * 99000))
+        await wait_for_diary_tasks(plugin)
+        assert inst.entries(SENDER) == ["diaries/20261023.md"]
+        assert event.result_texts() == []
+
+
+async def test_sentinel_auto_write_notifies_when_enabled():
+    """哨兵路径显式开启后保留「上下文已用约 X% + 日记写好了 + /reset」告知。"""
+    async with World(
+        config={
+            "use_persona": False,
+            "auto_write_notify": True,
             "context_token_limit": 60000,
             "remind_ratio": 0.75,
             "auto_ratio": 0.9,
@@ -115,6 +157,7 @@ async def test_sentinel_auto_write_notifies_by_default():
         inst.provider.replies[:] = [DIARY_TEXT]
         event = _event()
         await plugin.on_llm_request(event, _request(prompt="x" * 99000))
+        await wait_for_diary_tasks(plugin)
         sent = event.result_texts()
         assert inst.entries(SENDER) == ["diaries/20261023.md"]
         assert len(sent) == 1
@@ -176,6 +219,7 @@ async def test_no_material_reset_hint_still_sent_when_notify_off():
         plugin = inst.plugin
         event = _event()
         await plugin.on_llm_request(event, _request(prompt="/日记 " + "x" * 99000))
+        await wait_for_diary_tasks(plugin)
         sent = event.result_texts()
         assert inst.entries(SENDER) == []
         assert len(sent) == 1
@@ -194,7 +238,7 @@ def test_conf_schema_and_i18n_declare_auto_write_notify():
     assert keys.index("auto_write_notify") == keys.index("auto_diary_time") + 1
     cfg = schema["auto_write_notify"]
     assert cfg["type"] == "bool"
-    assert cfg["default"] is True
+    assert cfg["default"] is False
     assert cfg["condition"] == {"enable_auto_diary": True}
     assert cfg["description"] == "自动写日记完成后告知用户"
     assert cfg["hint"]

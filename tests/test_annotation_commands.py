@@ -257,7 +257,7 @@ async def test_writeback_confirm_flow_writes_signed_reply():
         assert "其中推测：也许那晚她还有别的话没说。" in text, (
             f"草稿的推测分区文案不对：{text[-300:]!r}"
         )
-        assert "回复「确认」写回；回复「悬置」先放着；回复「取消」不写。" in text
+        assert "回复「确认」写回；回复「否决」不采用；回复「悬置」先放着；回复「取消」退出。" in text
         assert "已确认写回" in text
 
         loaded, status = plugin.load_annotations(SENDER)
@@ -417,7 +417,7 @@ async def test_annotation_draft_text_partitions_confirmed_and_speculation():
         for needle in ("锚于：", "批注：", "回复标题：主人的回复", "摘要：用户确认过的事实。"):
             assert needle in text, f"草稿缺少 {needle!r}：{text!r}"
         assert "其中推测" not in text, "没有推测时不应出现推测分区"
-        assert "回复「确认」写回；回复「悬置」先放着；回复「取消」不写。" in text
+        assert "回复「确认」写回；回复「否决」不采用；回复「悬置」先放着；回复「取消」退出。" in text
 
         draft["speculation_marked"] = "也许她当时在等回信。"
         text2 = plugin.annotation_draft_text(ann, draft)

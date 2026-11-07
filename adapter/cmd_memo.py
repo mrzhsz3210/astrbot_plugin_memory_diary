@@ -8,6 +8,7 @@
 from astrbot.api.event import AstrMessageEvent
 
 from ..memory_diary.log import logger
+from ..memory_diary.scope import scope_from_event
 from .compat import SessionController, session_waiter, _SESSION_WAITER_OK
 
 
@@ -43,9 +44,12 @@ class MemoCommandsMixin:
             )
             return
 
-        is_group = bool(event.get_group_id())
+        is_group = scope_from_event(event).is_group
         total, saved = self._append_memo(
-            sender_id, note, scene="group" if is_group else "private"
+            sender_id,
+            note,
+            scene="group" if is_group else "private",
+            scope=str(scope_from_event(event)),
         )
         if not saved:
             # P2-5 修复：保存失败必须明说，不能谎报"已记下"

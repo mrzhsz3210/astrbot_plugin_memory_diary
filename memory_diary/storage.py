@@ -22,10 +22,13 @@ from .common import safe_key, sniff_image_ext, strip_invisible
 from .constants import IMAGE_MAX_BYTES, TOKEN_CALIBRATION_FILE
 from .errors import (
     DiaryCorruptError,
+    DiaryDecryptionError,
     DiaryKeyUnavailable,
     DiaryTamperedError,
 )
 from .log import logger
+from .scope import memory_scope, parse_scope, readable_scopes
+from .token_estimator import estimate_text
 
 
 class StorageMixin:
@@ -70,7 +73,9 @@ class StorageMixin:
     #   · 主密钥不可用      → no_key（验不了 = 不可信）
     ANNOTATIONS_ENTRY = "annotations.json"
     ANNOTATIONS_SIG_ENTRY = "sigs/annotations.json.sig"
-    ANNOTATION_STATUSES = ("open", "resolved", "deferred")
+    ANNOTATION_STATUSES = (
+        "open", "resolved", "deferred", "pending_confirmation", "rejected"
+    )
     # 容量上限：长期运行批注只增不减会拖慢注入与展示，超出后先丢最旧的已解批注
     ANNOTATIONS_MAX_RECORDS = 500
 
@@ -143,7 +148,7 @@ class StorageMixin:
 
     @classmethod
     def _segment_info(cls, header: str) -> dict:
-        """从分隔条推断模式/场景/是否已被完整篇吸收。"""
+        """从分隔条推断模式、来源作用域与是否已被完整篇吸收。"""
         h = header or ""
         if "随笔" in h or "无新对话" in h:
             mode = "life"
@@ -151,33 +156,43 @@ class StorageMixin:
             mode = "brief"
         else:
             mode = "full"
-        if "写于群聊" in h:
-            scene = "group"
+        origin = "group" if "写于群聊" in h else "private"
+        if origin == "group":
+            match = re.search(r"(?:^|\s·\s)群:([^\s·]+)(?=\s·|\s——|$)", h)
+            scope = memory_scope("group", match.group(1) if match else "legacy-unknown").value
         else:
-            scene = "private"  # 旧格式无场景标记，按私聊处理
-        return {"mode": mode, "scene": scene, "absorbed": "已吸收" in h}
+            scope = "private"
+        return {
+            "mode": mode,
+            "scene": origin,
+            "origin": origin,
+            "scope": scope,
+            "absorbed": "已吸收" in h,
+        }
 
     def _briefs_for_scene(self, content: str, scene: str) -> list:
-        """返回当前场景下尚未被完整篇吸收的简记片段。"""
+        """返回当前作用域下尚未被完整篇吸收的简记片段。"""
+        wanted = parse_scope(scene).value
         out = []
         for seg in self._segments(content):
             info = self._segment_info(seg["header"])
             if (
                 info["mode"] == "brief"
                 and not info["absorbed"]
-                and info["scene"] == scene
+                and info["scope"] == wanted
             ):
                 out.append(seg)
         return out
 
     def _full_count_for_scene(self, content: str, scene: str) -> int:
-        """统计当天当前场景已写了几篇完整日记（旧格式首篇也算完整）。"""
-        count = 0
-        for seg in self._segments(content):
-            info = self._segment_info(seg["header"])
-            if info["mode"] == "full" and info["scene"] == scene:
-                count += 1
-        return count
+        """统计当天当前作用域已写了几篇完整日记。"""
+        wanted = parse_scope(scene).value
+        return sum(
+            1
+            for seg in self._segments(content)
+            if (info := self._segment_info(seg["header"]))["mode"] == "full"
+            and info["scope"] == wanted
+        )
 
     @staticmethod
     def _mark_absorbed(content: str, headers: list) -> str:
@@ -447,11 +462,13 @@ class StorageMixin:
 
     def list_images(self, sender_id: str) -> list:
         """列出该用户 zip 内全部 images/ 条目（升序）。"""
+        if not self._is_allowed(sender_id):
+            return []
         path = self._diary_path(sender_id)
         if not path.exists():
             return []
         try:
-            with zipfile.ZipFile(path) as z:
+            with self._diary_zip(path) as z:
                 return sorted(n for n in z.namelist() if self.IMAGE_NAME_RE.match(n))
         except zipfile.BadZipFile:
             logger.error(
@@ -470,6 +487,8 @@ class StorageMixin:
         day/seq 由调用方给（日期 + 当日序号），desc 是 LLM 画面描述，
         必须经过 _sanitize_image_desc；撞名用内容哈希前 6 位兜底。
         """
+        if not self._is_allowed(sender_id):
+            return ""
         data = bytes(data or b"")
         if not data:
             raise ValueError("图片内容为空")
@@ -513,7 +532,7 @@ class StorageMixin:
         data_dict: dict = {}
         if path.exists():
             try:
-                with zipfile.ZipFile(path) as z:
+                with self._diary_zip(path) as z:
                     bad = z.testzip()
                     if bad is not None:
                         raise zipfile.BadZipFile(f"CRC 校验失败: {bad}")
@@ -557,6 +576,8 @@ class StorageMixin:
         - "no_key"   主密钥不可用（验签做不了）。
         读取时 CRC 损坏也按 missing 降级（图片是装饰，不能连累正文）。
         """
+        if not self._is_allowed(sender_id):
+            return None, "denied"
         name = self._image_entry(name)
         if not self._valid_image_name(name):
             return None, "missing"
@@ -564,7 +585,7 @@ class StorageMixin:
         if not path.exists():
             return None, "missing"
         try:
-            with zipfile.ZipFile(path) as z:
+            with self._diary_zip(path) as z:
                 names = set(z.namelist())
                 if name not in names:
                     return None, "missing"
@@ -598,7 +619,7 @@ class StorageMixin:
         if not path.exists() or len(day) != 8:
             return 0
         try:
-            with zipfile.ZipFile(path) as z:
+            with self._diary_zip(path) as z:
                 data = {n: z.read(n) for n in z.namelist()}
         except Exception as e:
             logger.warning(f"[memory_diary] 读取日记 zip 失败，插图未清理: {e}")
@@ -634,7 +655,7 @@ class StorageMixin:
         if not path.exists():
             return False
         try:
-            with zipfile.ZipFile(path) as z:
+            with self._diary_zip(path) as z:
                 names = set(z.namelist())
                 if entry_name not in names:
                     return False
@@ -798,19 +819,24 @@ class StorageMixin:
                 )
             else:
                 is_question = bool(raw_question)
-            normalized.append(
-                {
-                    "id": str(item.get("id") or ""),
-                    "round": str(item.get("round") or ""),
-                    "anchor": anchor,
-                    "entry": str(item.get("entry") or ""),
-                    "created_at": str(item.get("created_at") or ""),
-                    "note": note,
-                    "is_question": is_question,
-                    "status": status,
-                    "reply": reply,
-                }
-            )
+            record = {
+                "id": str(item.get("id") or ""),
+                "round": str(item.get("round") or ""),
+                "anchor": anchor,
+                "entry": str(item.get("entry") or ""),
+                "created_at": str(item.get("created_at") or ""),
+                "note": note,
+                "is_question": is_question,
+                "status": status,
+                "reply": reply,
+            }
+            content_type = str(item.get("content_type") or "")
+            if content_type in ("fact", "observation", "speculation", "self"):
+                record["content_type"] = content_type
+            reflection_kind = str(item.get("reflection_kind") or "")
+            if reflection_kind in ("ordinary", "fact"):
+                record["reflection_kind"] = reflection_kind
+            normalized.append(record)
         out["annotations"] = cls._trim_annotations(normalized)
         return out
 
@@ -845,11 +871,13 @@ class StorageMixin:
 
         错误标记 "" 成功（raw 可能为 None 表示条目缺失）；"tampered" 读失败。
         """
+        if not self._is_allowed(sender_id):
+            return None, "", "tampered"
         path = self._diary_path(sender_id)
         if not path.exists():
             return None, "", ""
         try:
-            with zipfile.ZipFile(path) as z:
+            with self._diary_zip(path) as z:
                 names = set(z.namelist())
                 if self.ANNOTATIONS_ENTRY not in names:
                     return None, "", ""
@@ -908,13 +936,15 @@ class StorageMixin:
 
         fail-closed：旧批注文件验签失败时**拒绝写入**，绝不替被改过的批注重签。
         """
+        if not self._is_allowed(sender_id):
+            return False
         if self._secret_key() is None:
             logger.error("[memory_diary] 签名密钥不可用，已拒绝写入批注")
             return False
         path = self._diary_path(sender_id)
         if path.exists():
             try:
-                with zipfile.ZipFile(path) as z:
+                with self._diary_zip(path) as z:
                     entries = {n: z.read(n) for n in z.namelist()}
             except Exception as e:
                 logger.warning(f"[memory_diary] 读取日记 zip 失败，批注未写入: {e}")
@@ -983,7 +1013,13 @@ class StorageMixin:
 
     @classmethod
     def _provenance_empty(cls) -> dict:
-        return {"version": 1, "updated_at": "", "entries": {}}
+        return {
+            "version": 1,
+            "updated_at": "",
+            "entries": {},
+            "no_write": [],
+            "no_write_streak": 0,
+        }
 
     @staticmethod
     def _dump_provenance(data: dict) -> bytes:
@@ -1015,18 +1051,39 @@ class StorageMixin:
 
     @classmethod
     def _normalize_provenance(cls, data) -> dict:
-        """清洗成规范 dict（不改入参）：键是 "YYYYMMDD.md"，值含 self 子串列表
-        与 external 外部写入记录（v0.6.2，幂等索引）。
-
-        容量双保险：单篇条数与总字数超限都从最旧的开始丢（列表按写入先后追加）。
-        """
+        """清洗来源、显式原话与内部“不写”记录，不改变旧条目格式。"""
         out = cls._provenance_empty()
         if not isinstance(data, dict):
             return out
         out["updated_at"] = str(data.get("updated_at") or "")[:30]
+        try:
+            out["no_write_streak"] = max(0, int(data.get("no_write_streak") or 0))
+        except (TypeError, ValueError):
+            out["no_write_streak"] = 0
+        no_write = data.get("no_write")
+        if isinstance(no_write, list):
+            for rec in no_write:
+                if not isinstance(rec, dict):
+                    continue
+                at = str(rec.get("at") or "").strip()[:30]
+                reason = str(rec.get("reason") or "").strip()[:100]
+                if not at:
+                    continue
+                cleanup_after = rec.get("cleanup_after")
+                out["no_write"].append(
+                    {
+                        "at": at,
+                        "reason": reason,
+                        "cleanup_after": (
+                            str(cleanup_after)[:30]
+                            if isinstance(cleanup_after, str) and cleanup_after
+                            else None
+                        ),
+                    }
+                )
         entries = data.get("entries")
         if not isinstance(entries, dict):
-            return out
+            entries = {}
         for key, rec in entries.items():
             name = str(key or "").strip()
             if not re.fullmatch(r"\d{8}\.md", name):
@@ -1047,17 +1104,31 @@ class StorageMixin:
                     cleaned.append(s)
                     seen.add(s)
                     total += len(s)
+            explicit, explicit_seen, explicit_total = [], set(), 0
+            raw_explicit = rec.get("explicit") if isinstance(rec, dict) else None
+            if isinstance(raw_explicit, list):
+                for item in raw_explicit:
+                    if not isinstance(item, str) or not item or item in explicit_seen:
+                        continue
+                    if len(explicit) >= cls.PROVENANCE_MAX_SELF_PER_ENTRY:
+                        break
+                    if explicit_total + len(item) > cls.PROVENANCE_MAX_SELF_CHARS:
+                        continue
+                    explicit.append(item)
+                    explicit_seen.add(item)
+                    explicit_total += len(item)
             ext = cls._normalize_external_records(
                 rec.get("external") if isinstance(rec, dict) else None
             )
-            if cleaned or ext:
+            if cleaned or explicit or ext:
                 entry = {}
                 if cleaned:
                     entry["self"] = cleaned
+                if explicit:
+                    entry["explicit"] = explicit
                 if ext:
                     entry["external"] = ext
                 out["entries"][name] = entry
-        # 外部记录总上限：跨条目从最旧的丢（at 是 ISO 串，字典序即时间序）
         all_ext = [
             (rec["at"], name, i)
             for name, entry in out["entries"].items()
@@ -1108,11 +1179,13 @@ class StorageMixin:
 
     def _read_provenance_entry(self, sender_id: str):
         """从 zip 读出来源侧车原始字节与签名。返回 (raw 或 None, actual, 错误标记)。"""
+        if not self._is_allowed(sender_id):
+            return None, "", "tampered"
         path = self._diary_path(sender_id)
         if not path.exists():
             return None, "", ""
         try:
-            with zipfile.ZipFile(path) as z:
+            with self._diary_zip(path) as z:
                 names = set(z.namelist())
                 if self.PROVENANCE_ENTRY not in names:
                     return None, "", ""
@@ -1154,13 +1227,15 @@ class StorageMixin:
 
         fail-closed：旧文件验签失败时**拒绝写入**，绝不替被改过的内容重签。
         """
+        if not self._is_allowed(sender_id):
+            return False
         if self._secret_key() is None:
             logger.error("[memory_diary] 签名密钥不可用，已拒绝写入来源侧车")
             return False
         path = self._diary_path(sender_id)
         if path.exists():
             try:
-                with zipfile.ZipFile(path) as z:
+                with self._diary_zip(path) as z:
                     entries = {n: z.read(n) for n in z.namelist()}
             except Exception as e:
                 logger.warning(f"[memory_diary] 读取日记 zip 失败，来源侧车未写入: {e}")
@@ -1240,6 +1315,71 @@ class StorageMixin:
                     have.add(s)
             data["updated_at"] = self._now().strftime("%Y-%m-%dT%H:%M:%S")
             return data
+
+        ok, _ = self.update_provenance(sender_id, _mut)
+        return ok
+
+    def record_explicit_provenance(self, sender_id: str, day: str, notes: list) -> bool:
+        """按原字符串保存用户显式交代，供审计与来源追踪。"""
+        name = f"{str(day or '').strip()[:8]}.md"
+        notes = [item for item in (notes or []) if isinstance(item, str) and item]
+        if not re.fullmatch(r"\d{8}\.md", name) or not notes:
+            return False
+
+        def _mut(data: dict):
+            rec = data["entries"].setdefault(name, {})
+            current = rec.setdefault("explicit", [])
+            have = set(current)
+            for item in notes:
+                if item not in have:
+                    current.append(item)
+                    have.add(item)
+            data["updated_at"] = self._now().strftime("%Y-%m-%dT%H:%M:%S")
+            return data
+
+        ok, _ = self.update_provenance(sender_id, _mut)
+        return ok
+
+    def record_no_write(self, sender_id: str, reason: str) -> bool:
+        """只写内部 provenance，不创建正式日记或用户可见占位。"""
+        threshold = 0
+        try:
+            threshold = max(0, int(self.config.get("no_write_alert_threshold", 0) or 0))
+        except (TypeError, ValueError):
+            pass
+
+        def _mut(data: dict):
+            data.setdefault("no_write", []).append(
+                {
+                    "at": self._now().strftime("%Y-%m-%dT%H:%M:%S"),
+                    "reason": str(reason or "模型判断本次不写")[:100],
+                    "cleanup_after": None,
+                }
+            )
+            data["no_write_streak"] = int(data.get("no_write_streak") or 0) + 1
+            data["updated_at"] = self._now().strftime("%Y-%m-%dT%H:%M:%S")
+            return data
+
+        ok, normalized = self.update_provenance(sender_id, _mut)
+        if ok and threshold and normalized.get("no_write_streak", 0) >= threshold:
+            logger.warning(
+                f"[memory_diary] 用户 {sender_id} 已连续 "
+                f"{normalized['no_write_streak']} 次不写正式日记（仅日志提醒）"
+            )
+        return ok
+
+    def record_successful_write(self, sender_id: str) -> bool:
+        """成功写日记后清零连续不写计数；本就为零时不额外重写 ZIP。"""
+        data, status = self.load_provenance(sender_id)
+        if status not in ("ok", "missing"):
+            return False
+        if not data.get("no_write_streak"):
+            return True
+
+        def _mut(current: dict):
+            current["no_write_streak"] = 0
+            current["updated_at"] = self._now().strftime("%Y-%m-%dT%H:%M:%S")
+            return current
 
         ok, _ = self.update_provenance(sender_id, _mut)
         return ok
@@ -1523,7 +1663,7 @@ class StorageMixin:
         if not path.exists():
             return 0
         try:
-            with zipfile.ZipFile(path) as z:
+            with self._diary_zip(path) as z:
                 names = set(z.namelist())
                 if self.PROVENANCE_ENTRY not in names:
                     return 0
@@ -1625,7 +1765,7 @@ class StorageMixin:
         if not days or not path.exists():
             return 0
         try:
-            with zipfile.ZipFile(path) as z:
+            with self._diary_zip(path) as z:
                 entries = {n: z.read(n) for n in z.namelist()}
         except Exception as e:
             logger.warning(f"[memory_diary] 读取日记 zip 失败，批注未清理: {e}")
@@ -1715,7 +1855,7 @@ class StorageMixin:
         entries, unsigned = [], []
         if path.exists():
             try:
-                with zipfile.ZipFile(path) as z:
+                with self._diary_zip(path) as z:
                     names = set(z.namelist())
                     for n in names:
                         if not self.ENTRY_NAME_RE.match(n):
@@ -1743,6 +1883,8 @@ class StorageMixin:
         P2-13：缺签名/签名丢失的条目也会列出（供指令层提示验签失败并允许删除），
         它们的内容由 _load_entry 判 tampered、不会展示；写路径仍 fail-closed。
         """
+        if not self._is_allowed(sender_id):
+            return []
         return self._entries_status(sender_id)["entries"]
 
     def _corrupt_notice(self, sender_id: str) -> str:
@@ -1755,7 +1897,7 @@ class StorageMixin:
         if not path.exists():
             return ""
         try:
-            with zipfile.ZipFile(path) as z:
+            with self._diary_zip(path) as z:
                 bad = z.testzip()
                 if bad is not None:
                     logger.error(
@@ -1787,9 +1929,11 @@ class StorageMixin:
         合法日记误判成「被篡改」（fail-closed 误伤）——所以这里先验原文、
         返回前再 strip。
         """
+        if not self._is_allowed(sender_id):
+            return "", True
         path = self._diary_path(sender_id)
         try:
-            with zipfile.ZipFile(path) as z:
+            with self._diary_zip(path) as z:
                 raw = z.read(entry_name).decode("utf-8")
                 try:
                     actual = z.read(self._sig_entry(entry_name)).decode("utf-8").strip()
@@ -1882,6 +2026,8 @@ class StorageMixin:
         P3-8：解析失败不再静默当空——记 warning 并备份坏文件，写入侧拒绝覆盖；
         「文件不存在」仍按空数据（旧行为）。
         """
+        if not self._is_allowed(sender_id):
+            return {}
         data, _ok = self._read_pref_file(sender_id)
         return data
 
@@ -1895,6 +2041,8 @@ class StorageMixin:
         注意：会**就地**删除传入 dict 里的废弃字段（last_material_hash），
         调用方传入的都应是本函数域内新建/新加载的 dict，不要复用它。
         """
+        if not self._is_allowed(sender_id):
+            return False
         try:
             p = self._pref_path(sender_id)
             # P3-8：先确认现有文件不是损坏的——否则整文件读-改-写会拿空 dict 覆盖真实数据
@@ -1985,17 +2133,31 @@ class StorageMixin:
 
     @staticmethod
     def _memo_scene(memo: dict) -> str:
-        """备忘的场景：无标记的旧数据视为私聊（宁严勿宽）。"""
+        scope = str(memo.get("scope") or "")
+        if scope:
+            return "group" if scope.startswith("group:") else "private"
         s = memo.get("scene")
         return s if s in ("private", "group") else "private"
 
-    def _load_memos(self, sender_id: str, scene: str = "") -> list:
-        """读取备忘；scene 为 "private"/"group" 时按场景过滤（"" 表示全部）。"""
+    @classmethod
+    def _memo_scope(cls, memo: dict) -> str:
+        scope = str(memo.get("scope") or "")
+        if scope:
+            return parse_scope(scope).value
+        return "group:legacy-unknown" if cls._memo_scene(memo) == "group" else "private"
+
+    def _load_memos(self, sender_id: str, scene: str = "", scope: str = "") -> list:
+        """读取备忘；具体群只返回本群，旧群备忘不会自动进入任何群。"""
+        if not self._is_allowed(sender_id):
+            return []
         memos = self._load_pref_data(sender_id).get("memos")
         if not isinstance(memos, list):
             return []
         memos = [m for m in memos if isinstance(m, dict) and m.get("text")]
-        if scene in ("private", "group"):
+        if scope:
+            wanted = parse_scope(scope).value
+            memos = [m for m in memos if self._memo_scope(m) == wanted]
+        elif scene in ("private", "group"):
             memos = [m for m in memos if self._memo_scene(m) == scene]
         return memos
 
@@ -2006,37 +2168,46 @@ class StorageMixin:
             r"</\s*memory_diary\s*>", "< /memory_diary>", text, flags=re.IGNORECASE
         )
 
-    def _append_memo(self, sender_id: str, text: str, scene: str = "private") -> tuple:
-        """追加一条备忘，返回 (该场景当前待写入条数, 是否保存成功)。"""
+    def _append_memo(
+        self, sender_id: str, text: str, scene: str = "private", scope: str = ""
+    ) -> tuple:
+        """追加一条备忘，返回 (该作用域当前待写入条数, 是否保存成功)。"""
+        if not self._is_allowed(sender_id):
+            return 0, False
+        current = parse_scope(scope or scene).value
         data = self._load_pref_data(sender_id)
         memos = self._load_memos(sender_id)
-        memos.append(
-            {
-                "time": self._now().strftime("%Y-%m-%d %H:%M"),
-                "text": self._sanitize_closing_tags(text.strip()),
-                "scene": scene if scene in ("private", "group") else "private",
-            }
-        )
-        # 每个场景各保留最新 20 条，挤掉该场景最旧的，另一场景不受影响
+        record = {
+            "time": self._now().strftime("%Y-%m-%d %H:%M"),
+            "text": self._sanitize_closing_tags(text.strip()),
+            "scene": "group" if current.startswith("group:") else "private",
+        }
+        if scope:
+            record["scope"] = current
+        memos.append(record)
         capped = []
-        for sc in ("private", "group"):
-            capped += [m for m in memos if self._memo_scene(m) == sc][
-                -self._MEMO_LIMIT :
+        for item_scope in dict.fromkeys(self._memo_scope(m) for m in memos):
+            capped += [m for m in memos if self._memo_scope(m) == item_scope][
+                -self._MEMO_LIMIT:
             ]
         data["memos"] = capped
         ok = self._save_pref_data(sender_id, data)
-        total = len(
-            [m for m in capped if self._memo_scene(m) == self._memo_scene(memos[-1])]
-        )
+        total = len([m for m in capped if self._memo_scope(m) == current])
         return total, ok
 
     def _clear_memos(
-        self, sender_id: str, scenes: tuple = ("private", "group")
+        self, sender_id: str, scenes: tuple = ("private", "group"), scopes: tuple = ()
     ) -> bool:
-        """清除指定场景的备忘（默认全部）。写日记只清已吸收进日记的场景。返回是否保存成功。"""
+        """清除指定作用域的备忘；群共享不会扩大清理范围。"""
+        if not self._is_allowed(sender_id):
+            return False
         data = self._load_pref_data(sender_id)
         memos = self._load_memos(sender_id)
-        kept = [m for m in memos if self._memo_scene(m) not in scenes]
+        if scopes:
+            wanted = {parse_scope(scope).value for scope in scopes}
+            kept = [m for m in memos if self._memo_scope(m) not in wanted]
+        else:
+            kept = [m for m in memos if self._memo_scene(m) not in scenes]
         if kept:
             data["memos"] = kept
         else:
@@ -2115,27 +2286,83 @@ class StorageMixin:
     # 日记片段分隔条（如 "—— 当天 20:30 补记 · 写于群聊 ——"、"—— 14:05 · 写于私聊 ——"）
     _SEG_HEADER_RE = re.compile(r"^—— .+ ——$")
 
-    def _filter_segments_for_group(self, content: str) -> str:
-        """群聊注入过滤：只保留标注"写于群聊"的片段（含其分隔条）。
-
-        没有场景标记的片段（旧版本写的）一律视为私聊来源，不注入群聊——宁可少注入，不泄露。
-        """
-        segments: list = []  # (header 或 None, [正文行])
-        cur_header, cur_lines = None, []
-        for line in content.split("\n"):
-            if self._SEG_HEADER_RE.match(line.strip()):
-                segments.append((cur_header, cur_lines))
-                cur_header, cur_lines = line.strip(), []
-            else:
-                cur_lines.append(line)
-        segments.append((cur_header, cur_lines))
-
+    def _filter_segments_for_scope(self, content: str, scope) -> str:
+        """只保留当前私聊/群聊可读片段；未知来源群始终 fail-closed。"""
+        allowed = set(readable_scopes(scope, self.config.get("group_share_map", "")))
         kept = []
-        for header, lines in segments:
-            if header and "写于群聊" in header:
-                body = "\n".join(lines).strip("\n")
+        for seg in self._segments(content):
+            header = seg["header"]
+            info = self._segment_info(header)
+            if info["scope"] not in allowed:
+                continue
+            body = seg["text"].strip("\n")
+            if header:
                 kept.append(f"{header}\n\n{body}" if body.strip() else header)
+            elif body.strip():
+                kept.append(body)
         return "\n\n".join(kept)
+
+    def _filter_segments_for_group(self, content: str) -> str:
+        """兼容旧调用；未提供群 ID 时只允许旧的未编号群段落。"""
+        return self._filter_segments_for_scope(content, "group:legacy-unknown")
+
+    def _lightweight_excerpt(self, content: str) -> str:
+        """保留原文中的首尾段落与明确锚点，不生成新的 AI 摘要。"""
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", content) if p.strip()]
+        units = []
+        pending = ""
+        for index, paragraph in enumerate(paragraphs):
+            if pending:
+                paragraph = pending + "\n" + paragraph
+                pending = ""
+            is_heading = bool(
+                self._SEG_HEADER_RE.match(paragraph)
+                or re.fullmatch(r"#{1,6}\s+[^\n]{1,80}", paragraph)
+                or re.fullmatch(r"[【\[][^\n]{1,40}[】\]]", paragraph)
+            )
+            if is_heading and index + 1 < len(paragraphs):
+                pending = paragraph
+            else:
+                units.append(paragraph)
+        if pending:
+            units.append(pending)
+        if len(units) <= 2:
+            return "\n\n".join(units)
+
+        anchor_re = re.compile(
+            r"<explicit\b|「[^」]+」|“[^”]+”|\"[^\"]+\"|‘[^’]+’|"
+            r"\d{4}\s*[-/年.]\s*\d{1,2}\s*[-/月.]\s*\d{1,2}|"
+            r"\d{1,2}\s*月\s*\d{1,2}\s*日|\d{1,2}\s*(?:点|时)[:：半]?\d*|"
+            r"今天|昨天|明天|上周|本周|周[一二三四五六日天]|"
+            r"参加|去了|完成|发布|考试|会议|讨论|决定|约定|遇到|发生"
+        )
+        anchors = {i for i, unit in enumerate(units) if anchor_re.search(unit)}
+        selected = anchors | {0, len(units) - 1}
+        if sum(len(units[i]) + 2 for i in selected) > 1600:
+            kept = []
+            for index in sorted(selected, key=lambda i: (i not in anchors, i)):
+                candidate = sorted(kept + [index])
+                if len("\n\n".join(units[i] for i in candidate)) <= 1600:
+                    kept = candidate
+            selected = set(kept)
+        if not selected:
+            return units[-1][-1600:]
+        return "\n\n".join(unit for i, unit in enumerate(units) if i in selected)
+
+    @staticmethod
+    def _token_tail(text: str, prefix: str, token_budget: int) -> str:
+        """取原文结尾，用二分查找满足 token 预算的最长节选。"""
+        best = ""
+        low, high = 0, len(text)
+        while low <= high:
+            size = (low + high) // 2
+            candidate = text[-size:] if size else ""
+            if estimate_text(prefix + candidate) <= token_budget:
+                best = candidate
+                low = size + 1
+            else:
+                high = size - 1
+        return best
 
     def _assemble_inject(
         self,
@@ -2144,16 +2371,19 @@ class StorageMixin:
         scope_override: str = "",
         only_names: set = None,
         exclude_names: set = None,
+        lightweight: bool = False,
+        memory_scope_value: str = "",
     ):
-        """按用户偏好/配置组装要注入的日记文本（带总量保险丝）。
+        """组装注入文本；自动路径可节选，手动路径默认保留全文通道。
 
-        in_group=True 且开启"群聊注入过滤"时，只注入群聊场景写下的片段
-        （私聊写的片段不进群聊；群聊写的片段在私聊中不受限）。
-        scope_override：/注入日记 主动指定的范围，优先于用户偏好与默认。
-        only_names：只从这些篇目中选（用于会话内去重）。
-        exclude_names：从这些篇目中排除（持久模式下排除本轮已临时注入的篇目）。
+        字符与 token 上限同时生效，新日记优先占预算，最终恢复旧到新顺序。
         返回 (text, tampered_any, used_names)；text 为空表示没有可注入内容。
         """
+        if not self._is_allowed(sender_id):
+            return "", False, []
+        current_scope = parse_scope(
+            memory_scope_value or ("group:legacy-unknown" if in_group else "private")
+        ).value
         entries = self._list_entries(sender_id)
         if not entries:
             return "", False, []
@@ -2162,8 +2392,6 @@ class StorageMixin:
         scope = scope_override or self._load_pref(sender_id) or default_scope
         targets = self._select_entries(entries, scope)
         if not targets:
-            # P2-2：显式日期范围选不中任何篇目时严格为空、绝不回退最新；
-            # 只有 days:N（默认/偏好）找不到时才回退最新一篇（刻意设计）
             if scope.startswith("range:"):
                 return "", False, []
             targets = [entries[-1]]
@@ -2176,56 +2404,93 @@ class StorageMixin:
             if not targets:
                 return "", False, []
 
-        budget = int(self.config.get("inject_max_chars", 8000) or 8000)
-        if budget <= 0:
-            budget = 8000
-        filter_group = in_group and bool(self.config.get("group_inject_filter", True))
+        try:
+            char_limit = int(self.config.get("inject_max_chars", 8000) or 8000)
+        except (TypeError, ValueError):
+            char_limit = 8000
+        if char_limit <= 0:
+            char_limit = 8000
+        try:
+            token_limit = int(self.config.get("inject_token_limit", 2400) or 2400)
+        except (TypeError, ValueError):
+            token_limit = 2400
+        if token_limit <= 0:
+            token_limit = 2400
 
-        parts, used, truncated, tampered_any, filtered_any = [], 0, False, False, False
+        truncation_note = "（注：因注入长度或 token 上限，更早的日记未全部注入；可用 /日记范围 调整、/注入日记 或 /查看日记 单独查阅。）"
+        lightweight_note = "（注：自动注入仅含原文轻量节选；完整日记可用 /注入日记 或 /查看日记 查阅。）"
+        tampered_note = "（注：部分日期的日记验签失败，已跳过。）"
+        filtered_note = "（注：私聊场景中写下的日记片段按规则未注入本次群聊。）"
+        reserved = "\n\n" + "\n\n".join(
+            (truncation_note, lightweight_note, tampered_note, filtered_note)
+        )
+        current_block = ""
+        if lightweight and not in_group:
+            current_block = self._current_self_inject_block(
+                sender_id, token_cap=min(1200, token_limit)
+            )
+        if current_block:
+            reserved = current_block + "\n\n" + reserved
+        char_budget = max(0, char_limit - len(reserved))
+        token_budget = max(0, token_limit - estimate_text(reserved))
+        filter_group = in_group
+
+        parts, truncated, tampered_any, filtered_any = [], False, False, False
         used_names = []
-        for name in reversed(targets):  # 新的优先占预算
+        for name in reversed(targets):
             content, tampered = self._load_entry(sender_id, name)
             if tampered:
                 tampered_any = True
                 continue
-            # 已被完整篇吸收的简记不再注入；原文仍保留在 zip 里可查看
             content = self._filter_absorbed_segments(content)
             if not content.strip():
                 continue
             if filter_group:
-                content = self._filter_segments_for_group(content)
+                content = self._filter_segments_for_scope(content, current_scope)
                 if not content.strip():
-                    filtered_any = True  # 这一天全是私聊片段，整天跳过
+                    filtered_any = True
                     continue
-            # 插图占位符化（设计 6.4）：图片语法换成一行文本，绝不 base64 进上下文。
-            # 放在预算计算之前：占位符比 markdown 图片语法短，按占位后长度计预算。
             content = self._image_macro_to_placeholder(content)
-            block = f"【{self._entry_label(name)} 的日记】\n{content}"
-            if used + len(block) > budget:
-                marker = "【……该日开头因长度限制被截断】\n"
-                remain = budget - used - len(marker)
-                if remain > 200:  # 预算还够放一部分：截断这篇的头部，保住结尾的"叮嘱"
-                    parts.append(marker + block[-remain:])
-                    used_names.append(name)
-                truncated = True
-                break
-            parts.append(block)
-            used_names.append(name)
-            used += len(block)
-        parts.reverse()  # 恢复时间顺序（旧→新）
-        used_names.reverse()
+            if lightweight:
+                content = self._lightweight_excerpt(content)
+            label = "日记·轻量节选" if lightweight else "日记"
+            block = f"【{self._entry_label(name)} 的{label}】\n{content}"
+            candidate = "\n\n".join(parts + [block])
+            if len(candidate) <= char_budget and estimate_text(candidate) <= token_budget:
+                parts.append(block)
+                used_names.append(name)
+                continue
 
+            marker = "【……该日开头因长度限制被截断】\n"
+            prefix = "\n\n".join(parts + [marker])
+            remain_chars = char_budget - len(prefix)
+            tail = ""
+            if remain_chars > 200 and estimate_text(prefix) < token_budget:
+                tail = self._token_tail(block, prefix, token_budget)[-remain_chars:]
+                while tail and estimate_text(prefix + tail) > token_budget:
+                    tail = tail[1:]
+            if tail:
+                parts.append(marker + tail)
+                used_names.append(name)
+            truncated = True
+            break
+
+        parts.reverse()
+        used_names.reverse()
         if not parts:
-            # P2-1：只有说明、没有正文时返回空串——避免占用"本会话已注入"名额，
-            # 也避免群聊里只看到一句没头没尾的附注
-            return "", tampered_any, []
-        text = "\n\n".join(parts)
+            return current_block, tampered_any, []
+        notes = []
         if truncated:
-            text += "\n\n（注：因注入长度上限，更早的日记未全部注入；可用 /日记范围 调整或 /查看日记 单独查阅。）"
+            notes.append(truncation_note)
+        if lightweight:
+            notes.append(lightweight_note)
         if tampered_any:
-            text += "\n\n（注：部分日期的日记验签失败，已跳过。）"
+            notes.append(tampered_note)
         if filtered_any:
-            text += "\n\n（注：私聊场景中写下的日记片段按规则未注入本次群聊。）"
+            notes.append(filtered_note)
+        if current_block:
+            parts.insert(0, current_block)
+        text = "\n\n".join(parts + notes)
         return text, tampered_any, used_names
 
     def _quarantine_corrupt(self, path: Path):
@@ -2247,29 +2512,32 @@ class StorageMixin:
             logger.error(f"[memory_diary] 日记文件损坏且隔离失败（{path}）：{e}")
             return None
 
-    @staticmethod
-    def _write_zip_atomic(path: Path, entries: dict):
-        """原子写 zip（P1-1 修复）：先写同目录临时文件并自验，再 os.replace 落位。
-
-        "w" 模式会直接截断原文件——进程在写中央目录前被杀、磁盘满时，
-        旧日记会整个损坏。原子写保证任何时刻磁盘上要么是完整的旧文件，
-        要么是完整的新文件。
-        """
-        # 临时名带 pid + 随机后缀：同进程两个协程并发写同一 zip 时，
-        # 固定 tmp 名会互相截断/覆盖（os.replace 后内容来源不定），导致日记丢失
+    def _write_zip_atomic(self, path: Path, entries: dict):
+        """内存生成并自验 ZIP，再写唯一临时文件并原子替换；加密时临时文件也非明文。"""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
+            for n, b in entries.items():
+                z.writestr(n, b)
+        plain = buffer.getvalue()
+        with zipfile.ZipFile(io.BytesIO(plain)) as z:
+            bad = z.testzip()
+            if bad is not None:
+                raise zipfile.BadZipFile(f"写入后自检失败: {bad}")
+        payload = self._encode_diary_write(plain, path)
         tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
         try:
-            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
-                for n, b in entries.items():
-                    z.writestr(n, b)
-            # 落位前自验：读回中央目录并校验每个条目的 CRC
-            with zipfile.ZipFile(tmp) as z:
+            tmp.write_bytes(payload)
+            written = tmp.read_bytes()
+            if written != payload:
+                raise OSError("写入后字节自检失败")
+            check = self._read_diary_bytes(tmp, identity=path.name)
+            with zipfile.ZipFile(io.BytesIO(check)) as z:
                 bad = z.testzip()
                 if bad is not None:
                     raise zipfile.BadZipFile(f"写入后自检失败: {bad}")
             os.replace(tmp, path)
         finally:
-            tmp.unlink(missing_ok=True)  # 已 os.replace 则不存在；失败时清理残骸
+            tmp.unlink(missing_ok=True)
 
     def _save_diary(
         self,
@@ -2282,6 +2550,8 @@ class StorageMixin:
         mode: str = "",
         absorb_headers: list = None,
         provenance_mutator=None,
+        scope: str = "",
+        material_mutator=None,
     ):
         """把一篇日记写入"当天"的文件；当天已有内容则追加（带时间分隔）。返回文件名。
 
@@ -2289,14 +2559,17 @@ class StorageMixin:
         供"群聊注入过滤"识别；旧格式迁移时不传，保持无标记。
         mode 为 "full" / "brief" / "life"，写入分隔条供后续判断模式；
         absorb_headers 是本次完整篇吸收的简记分隔条，原文保留但标记（已吸收）。
-        provenance_mutator（v0.6.2 外部写入）：可选回调，在**同一次原子重写**里
-        更新来源侧车（读-验-改-签），保证"日记段落 + 幂等索引"要么一起落盘、
-        要么一起不落——客户端中途失败重试不会产生重复条目。旧侧车验签不过时
-        整次保存拒绝（fail-closed，不替被改过的内容重签）。
+        provenance_mutator：可选回调，在**同一次原子重写**里更新来源侧车
+        （读-验-改-签），保证日记段落与外部幂等索引、self/explicit 来源要么一起
+        落盘、要么一起不落。旧侧车验签不过时整次保存拒绝（fail-closed，
+        不替被改过的内容重签）。
         """
+        if not self._is_allowed(sender_id):
+            raise PermissionError("用户不在白名单内")
         path = self._diary_path(sender_id)
         day = entry_name_hint or self._now().strftime("%Y%m%d")
         entry_name = self._md_entry(day)
+        current_scope = parse_scope(scope or origin).value if (scope or origin) else ""
         scene = {"private": "私聊", "group": "群聊"}.get(origin, "")
         # 防止日记正文闭合注入用 XML 标签
         content = self._sanitize_closing_tags(content)
@@ -2327,7 +2600,7 @@ class StorageMixin:
         sidecar_entries: dict = {}
         if path.exists():
             try:
-                with zipfile.ZipFile(path) as z:
+                with self._diary_zip(path) as z:
                     names = set(z.namelist())
                     invalid = []
                     for n in sorted(names):
@@ -2336,6 +2609,12 @@ class StorageMixin:
                             self.ANNOTATIONS_SIG_ENTRY,
                             self.PROVENANCE_ENTRY,
                             self.PROVENANCE_SIG_ENTRY,
+                            self.CURRENT_SELF_ENTRY,
+                            self.CURRENT_SELF_SIG_ENTRY,
+                            self.MATERIALS_ENTRY,
+                            self.MATERIALS_SIG_ENTRY,
+                            self.CURRENT_SELF_ARCHIVE_ENTRY,
+                            self.CURRENT_SELF_ARCHIVE_SIG_ENTRY,
                         ):
                             sidecar_entries[n] = z.read(n)
                             continue
@@ -2364,7 +2643,7 @@ class StorageMixin:
                     if invalid:
                         labels = "、".join(self._entry_label(n) for n in invalid)
                         raise DiaryTamperedError(labels)
-            except (DiaryTamperedError, DiaryKeyUnavailable):
+            except (DiaryTamperedError, DiaryKeyUnavailable, DiaryDecryptionError):
                 raise
             except Exception as e:
                 # P1-3 修复：zip 损坏（含 BadZipFile/CRC 错误）绝不静默覆盖——
@@ -2385,7 +2664,10 @@ class StorageMixin:
             )
 
         mode_label = self._MODE_LABELS.get(mode, "")
-        scene_tag = f" · 写于{scene}" if scene else ""
+        if current_scope:
+            scene = "群聊" if current_scope.startswith("group:") else "私聊"
+        scope_tag = f" · 群:{current_scope[6:]}" if scope and current_scope.startswith("group:") else ""
+        scene_tag = f" · 写于{scene}{scope_tag}" if scene else ""
         if entry_name in existing:
             now_hm = self._now().strftime("%H:%M")
             if mode_label:
@@ -2428,7 +2710,7 @@ class StorageMixin:
         out.update(sidecar_entries)
         if provenance_mutator is not None:
             # 与日记段落同一次原子重写里更新来源侧车（读-验-改-签）：
-            # 外部写入的幂等索引随条目一起落盘，中途失败重试不会重复追加。
+            # 外部幂等索引、self/explicit 来源都随条目一起落盘。
             raw = sidecar_entries.get(self.PROVENANCE_ENTRY)
             if raw is not None:
                 actual = (
@@ -2454,6 +2736,29 @@ class StorageMixin:
             out[self.PROVENANCE_SIG_ENTRY] = self._provenance_sig(
                 sender_id, praw
             ).encode("utf-8")
+        if material_mutator is not None:
+            raw = sidecar_entries.get(self.MATERIALS_ENTRY)
+            if raw is not None:
+                actual = sidecar_entries.get(self.MATERIALS_SIG_ENTRY, b"").decode(
+                    "utf-8", "ignore"
+                ).strip()
+                if not hmac.compare_digest(self._materials_sig(sender_id, raw), actual):
+                    raise DiaryTamperedError("外部素材队列")
+                try:
+                    materials = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    raise DiaryTamperedError("外部素材队列（无法解析）")
+            else:
+                materials = self._materials_empty()
+            materials = self._normalize_materials(materials)
+            result = material_mutator(materials)
+            if isinstance(result, dict):
+                materials = result
+            mraw = json.dumps(
+                self._normalize_materials(materials), ensure_ascii=False, indent=2
+            ).encode("utf-8")
+            out[self.MATERIALS_ENTRY] = mraw
+            out[self.MATERIALS_SIG_ENTRY] = self._materials_sig(sender_id, mraw).encode("utf-8")
         out[self.README_ZIP_ENTRY] = self._readme_text(sender_id, sender_name).encode(
             "utf-8"
         )
@@ -2472,7 +2777,7 @@ class StorageMixin:
 
         if path.exists():
             try:
-                with zipfile.ZipFile(path) as z:
+                with self._diary_zip(path) as z:
                     data = {n: z.read(n) for n in z.namelist()}
             except zipfile.BadZipFile:
                 return None
@@ -2631,9 +2936,22 @@ class StorageMixin:
         return None
 
     def _delete_diary(self, sender_id: str) -> bool:
+        if not self._is_allowed(sender_id):
+            return False
         # P2-4：整包删除会连 zip 内的 provenance 一起删掉——先把 external 幂等
         # 记录转存到独立墓碑侧车，否则桥重放同一 ext_id 会把已删日记整篇复活。
         self._tombstone_all_provenance(sender_id)
+        materials, material_status = self.load_external_materials(sender_id)
+        if material_status == "ok":
+            self.record_tombstones(sender_id, [
+                {
+                    "source": item["source"],
+                    "ext_id": item["ext_id"],
+                    "day": self._entry_day(item["absorbed_entry"]) if item.get("absorbed_entry") else "",
+                    "at": item.get("submitted_at", ""),
+                }
+                for item in materials["items"]
+            ])
         existed = False
         for p in (self._diary_path(sender_id), *self._legacy_diary_paths(sender_id)):
             try:
@@ -2646,11 +2964,13 @@ class StorageMixin:
 
     def _delete_entries(self, sender_id: str, names: list) -> int:
         """删除指定日期文件（含签名）。全删光时移除整个 zip。返回实际删除的天数。"""
+        if not self._is_allowed(sender_id):
+            return 0
         path = self._diary_path(sender_id)
         if not path.exists():
             return 0
         try:
-            with zipfile.ZipFile(path) as z:
+            with self._diary_zip(path) as z:
                 data = {n: z.read(n) for n in z.namelist()}
         except Exception as e:
             logger.warning(f"[memory_diary] 读取日记 zip 失败: {e}")
@@ -2680,12 +3000,29 @@ class StorageMixin:
             # 来源级联（P2-4）：该天的 <self> 来源记录随日记清理；external 幂等记录
             # 转墓碑侧车而不是直接丢——否则桥重放同一 ext_id 会让已删段落复活。
             self._tombstone_provenance_entries(sender_id, data, deleted_days)
+            materials, material_status = self.load_external_materials(sender_id)
+            if material_status == "ok":
+                self.record_tombstones(sender_id, [
+                    {
+                        "source": item["source"], "ext_id": item["ext_id"],
+                        "day": self._entry_day(item["absorbed_entry"]),
+                        "at": item.get("submitted_at", ""),
+                    }
+                    for item in materials["items"]
+                    if item.get("absorbed_entry")
+                    and self._entry_day(item["absorbed_entry"]) in deleted_days
+                ])
 
         remaining_days = [
             n for n in data if self.ENTRY_NAME_RE.match(n) and n not in remove
         ]
         try:
             if not remaining_days:
+                if material_status == "ok":
+                    self.record_tombstones(sender_id, [
+                        {"source": item["source"], "ext_id": item["ext_id"], "at": item.get("submitted_at", "")}
+                        for item in materials["items"]
+                    ])
                 path.unlink(missing_ok=True)  # 一天都不剩 → 整个 zip 删掉
             else:
                 out = {n: b for n, b in data.items() if n not in remove}
@@ -2871,6 +3208,9 @@ class StorageMixin:
         images = {}
         annotations = None
         provenance = None
+        current_self = None
+        materials = None
+        anchor_archive = None
         with zipfile.ZipFile(io.BytesIO(diary_bytes)) as dz:
             self._check_zip_limits(dz, "迁移包里的日记文件")
             bad = dz.testzip()
@@ -2928,12 +3268,72 @@ class StorageMixin:
                 if not hmac.compare_digest(pexpected, pactual):
                     raise ValueError("来源侧车验签失败，迁移包可能被改动过")
                 provenance = praw
+            if self.CURRENT_SELF_ENTRY in dnames:
+                craw = dz.read(self.CURRENT_SELF_ENTRY)
+                if self.CURRENT_SELF_SIG_ENTRY not in dnames:
+                    raise ValueError("交接信缺少签名，迁移包可能被改动过")
+                cactual = dz.read(self.CURRENT_SELF_SIG_ENTRY).decode(
+                    "utf-8", "ignore"
+                ).strip()
+                cexpected = hmac.new(
+                    sign_key,
+                    owner_id.encode("utf-8")
+                    + b"\n"
+                    + self.CURRENT_SELF_ENTRY.encode("utf-8")
+                    + b"\n"
+                    + craw,
+                    hashlib.sha256,
+                ).hexdigest()
+                if not hmac.compare_digest(cexpected, cactual):
+                    raise ValueError("交接信验签失败，迁移包可能被改动过")
+                try:
+                    self._normalize_current_self(json.loads(craw.decode("utf-8")))
+                except Exception:
+                    raise ValueError("交接信无法解析，迁移包可能被改动过")
+                current_self = craw
+            if self.MATERIALS_ENTRY in dnames:
+                mraw = dz.read(self.MATERIALS_ENTRY)
+                if self.MATERIALS_SIG_ENTRY not in dnames:
+                    raise ValueError("外部素材队列缺少签名，迁移包可能被改动过")
+                mactual = dz.read(self.MATERIALS_SIG_ENTRY).decode("utf-8", "ignore").strip()
+                mexpected = hmac.new(
+                    sign_key,
+                    owner_id.encode() + b"\n" + self.MATERIALS_ENTRY.encode() + b"\n" + mraw,
+                    hashlib.sha256,
+                ).hexdigest()
+                if not hmac.compare_digest(mexpected, mactual):
+                    raise ValueError("外部素材队列验签失败，迁移包可能被改动过")
+                try:
+                    self._normalize_materials(json.loads(mraw.decode("utf-8")))
+                except Exception:
+                    raise ValueError("外部素材队列无法解析，迁移包可能被改动过")
+                materials = mraw
+            if self.CURRENT_SELF_ARCHIVE_ENTRY in dnames:
+                araw = dz.read(self.CURRENT_SELF_ARCHIVE_ENTRY)
+                if self.CURRENT_SELF_ARCHIVE_SIG_ENTRY not in dnames:
+                    raise ValueError("锚点归档缺少签名，迁移包可能被改动过")
+                aactual = dz.read(self.CURRENT_SELF_ARCHIVE_SIG_ENTRY).decode("utf-8", "ignore").strip()
+                aexpected = hmac.new(
+                    sign_key,
+                    owner_id.encode() + b"\n" + self.CURRENT_SELF_ARCHIVE_ENTRY.encode() + b"\n" + araw,
+                    hashlib.sha256,
+                ).hexdigest()
+                if not hmac.compare_digest(aexpected, aactual):
+                    raise ValueError("锚点归档验签失败，迁移包可能被改动过")
+                self._normalize_anchor_archive(json.loads(araw.decode("utf-8")))
+                anchor_archive = araw
             for n in sorted(dnames):
                 if n in (
                     self.ANNOTATIONS_ENTRY,
                     self.ANNOTATIONS_SIG_ENTRY,
                     self.PROVENANCE_ENTRY,
                     self.PROVENANCE_SIG_ENTRY,
+                    self.CURRENT_SELF_ENTRY,
+                    self.CURRENT_SELF_SIG_ENTRY,
+                    self.MATERIALS_ENTRY,
+                    self.MATERIALS_SIG_ENTRY,
+                    self.CURRENT_SELF_ARCHIVE_ENTRY,
+                    self.CURRENT_SELF_ARCHIVE_SIG_ENTRY,
                 ):
                     continue
                 if self.IMAGE_NAME_RE.match(n):
@@ -2979,14 +3379,19 @@ class StorageMixin:
                         f"日记 {self._entry_label(n)} 验签失败，迁移包可能被改动过"
                     )
                 entries[n] = content
-        if not entries:
+        if not entries and materials is None and anchor_archive is None:
             raise ValueError("迁移包里没有任何日记")
-        return owner_id, user_key, entries, images, annotations, provenance
+        return (
+            owner_id, user_key, entries, images, annotations, provenance, current_self,
+            materials, anchor_archive
+        )
 
     def _install_bundle(self, sender_id: str, owner_id: str, user_key: bytes,
                         entries: dict, sender_name: str = "",
                         check_owner: bool = True, images: dict = None,
-                        annotations: dict = None, provenance: bytes = None) -> str:
+                        annotations: dict = None, provenance: bytes = None,
+                        current_self: bytes = None, materials: bytes = None,
+                        anchor_archive: bytes = None) -> str:
         """把验签通过的迁移包安放到位。返回模式：same_key / resign（仅作提示用）。
 
         现行机制不再收养主密钥：日记一律用本机派生的主人钥匙重新签名。
@@ -2999,6 +3404,8 @@ class StorageMixin:
         check_owner：QQ 指令侧必须为 True（装进别人账号的日记永远验不过签）；
         Web 日记本页面是管理员操作，安装后仍绑定原主人 QQ，传 False。
         """
+        if not self._is_allowed(owner_id):
+            raise ValueError("该用户不在插件白名单内，已拒绝导入")
         if check_owner and owner_id != sender_id:
             raise ValueError(
                 "这份日记的主人 QQ 号和你不一致——签名绑定了原主人的 QQ 号，"
@@ -3046,6 +3453,21 @@ class StorageMixin:
             out[self.PROVENANCE_SIG_ENTRY] = self._provenance_sig(
                 sender_id, provenance
             ).encode("utf-8")
+        if current_self:
+            out[self.CURRENT_SELF_ENTRY] = current_self
+            out[self.CURRENT_SELF_SIG_ENTRY] = self._current_self_sig(
+                sender_id, current_self
+            ).encode("utf-8")
+        if materials:
+            out[self.MATERIALS_ENTRY] = materials
+            out[self.MATERIALS_SIG_ENTRY] = self._materials_sig(
+                sender_id, materials
+            ).encode("utf-8")
+        if anchor_archive:
+            out[self.CURRENT_SELF_ARCHIVE_ENTRY] = anchor_archive
+            out[self.CURRENT_SELF_ARCHIVE_SIG_ENTRY] = self._current_self_archive_sig(
+                sender_id, anchor_archive
+            ).encode("utf-8")
         self._write_zip_atomic(target, out)
         return mode
 
@@ -3053,7 +3475,7 @@ class StorageMixin:
         """从 zip 内 说明.txt 解析（主人QQ, 昵称）；缺失返回空串。"""
         owner, nick = "", ""
         try:
-            with zipfile.ZipFile(path) as z:
+            with self._diary_zip(path) as z:
                 txt = z.read(self.README_ZIP_ENTRY).decode("utf-8", "replace")
             m = re.search(r"^用户ID：(\S+)\s*$", txt, re.M)
             if m:
@@ -3140,11 +3562,25 @@ class StorageMixin:
                 and rec.get("enabled")
                 and hmac.compare_digest(str(rec.get("hash") or ""), want)
             ):
-                return rec
+                return rec if self._is_allowed(rec.get("owner")) else None
         return None
 
-    def create_external_token(self, sender_id: str, source: str, label: str = ""):
-        """新办一枚写入凭证。返回明文 token（仅此处出现一次），失败返回 None。"""
+    def external_token_owner(self, token: str) -> str:
+        """仅用于把白名单拒绝与普通 401 区分；不授予任何读写权限。"""
+        want = self._external_token_hash(str(token or "").strip())
+        for rec in self._load_external_tokens():
+            if isinstance(rec, dict) and rec.get("enabled") and hmac.compare_digest(
+                str(rec.get("hash") or ""), want
+            ):
+                return str(rec.get("owner") or "")
+        return ""
+
+    def create_external_token(
+        self, sender_id: str, source: str, label: str = "", scope: str = "private"
+    ):
+        """新办 v2 素材凭证；旧凭证缺少版本字段时才有 legacy 直写权限。"""
+        if not self._is_allowed(sender_id):
+            return None
         recs = self._load_external_tokens()
         active = [
             r
@@ -3162,6 +3598,9 @@ class StorageMixin:
                 "label": str(label or "").strip()[:32],
                 "created_at": self._now().strftime("%Y-%m-%dT%H:%M:%S"),
                 "enabled": True,
+                "api_version": 2,
+                "legacy_direct": False,
+                "scope": parse_scope(scope).value,
             }
         )
         if not self._save_external_tokens(recs):
@@ -3212,7 +3651,7 @@ class StorageMixin:
         if key is None:
             return "", "签名密钥不可用"
         try:
-            with zipfile.ZipFile(path) as z:
+            with self._diary_zip(path) as z:
                 names = set(z.namelist())
                 entries = sorted(n for n in names if self.ENTRY_NAME_RE.match(n))
                 if not entries:
@@ -3353,7 +3792,7 @@ class StorageMixin:
             "exported_at": self._now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         with zipfile.ZipFile(export_path, "w", zipfile.ZIP_DEFLATED) as z:
-            z.write(diary_path, diary_path.name)
+            z.writestr(diary_path.name, self._read_diary_bytes(diary_path))
             z.writestr("user_key.txt", uk.hex())
             z.writestr(
                 "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2)

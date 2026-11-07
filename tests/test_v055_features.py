@@ -157,9 +157,11 @@ async def test_whitelist_blocks_injection_and_sentinel():
     ) as world:
         inst = world.refactor
         plugin = inst.plugin
+        plugin.config["allowed_users"] = ""
         plugin._save_diary(
             OTHER, DIARY_TEXT, sender_name="阿堵", origin="private", mode="full"
         )
+        plugin.config["allowed_users"] = SENDER
         # 名单外用户：超大上下文也不注入、不触发哨兵
         req = _request(prompt="聊" * 99000)
         ev = _event(sender_id=OTHER)
@@ -866,17 +868,15 @@ async def test_zero_width_reset_is_detected():
 # ---------------------------------------------------------------------------
 
 
-def test_inject_template_states_persona_headings():
-    from harness import world as world_module
-
+def test_inject_template_accepts_old_and_free_structure_diaries():
     const = importlib.import_module(
         _main_mod.__name__.rsplit(".", 1)[0] + ".memory_diary.constants"
     )
     template = const.INJECT_TEMPLATE
     assert "小标题" in template and "人设" in template
-    # 与差分豁免删除的句子完全一致：句子一旦被改/删，差分仍然看不出，
-    # 这条断言就是那条文案的唯一告警点。
-    assert world_module.World._INJECT_TEMPLATE_V055_SENTENCE in template
+    assert "旧日记" in template and "新日记" in template
+    assert "自由取舍维度、顺序与篇幅" in template
+    assert "不要补写缺失栏目" in template
 
 
 # ---------------------------------------------------------------------------
@@ -1073,13 +1073,16 @@ _CONF_README_ORDER = [
     "context_token_limit", "remind_ratio", "auto_ratio",
     "token_estimation_v2", "token_calibration_enabled",
     # 10.5 新会话读日记（注入）
-    "enable_auto_inject", "inject_default_days", "inject_max_chars",
-    "group_inject_filter", "persist_inject",
+    "enable_auto_inject", "local_search_enabled", "inject_default_days", "inject_max_chars",
+    "inject_token_limit", "group_inject_filter", "group_share_map",
+    "external_material_retention_days", "storage_encryption_enabled",
+    "storage_encryption_passphrase", "persist_inject",
     # 10.6 写作
     "enable_auto_diary", "auto_diary_time", "auto_write_notify",
     "empty_diary_as_life",
     "max_full_diaries_per_day", "max_history_messages",
     "group_history_multiplier", "write_min_ratio", "extra_instruction",
+    "no_write_alert_threshold", "current_self_enabled", "current_self_rewrite_every",
     # 10.7 隐私与安全
     "allowed_users", "show_diary_after_write",
     # 10.8 反馈风格
@@ -1101,7 +1104,7 @@ _CONF_README_ORDER = [
     "vision_api_base", "vision_api_key", "vision_api_model",
     # 10.13 批注配置（v0.6，顺序与 README bullet 一致）
     "annotation_enabled", "annotation_max_per_round",
-    "annotation_question_hint", "annotation_timeout",
+    "annotation_question_hint", "annotation_timeout", "reflection_annotation_enabled",
     # 10.16 时区与兼容项（配置页最后，废弃项是最后一个）
     "diary_timezone", "enable_context_watch",
 ]
@@ -1113,9 +1116,15 @@ _CONF_LABEL_PREFIXES = [
     ("改进版 token 估算", "token_estimation_v2"),
     ("token 估算自动校准", "token_calibration_enabled"),
     ("新会话自动读取日记", "enable_auto_inject"),
+    ("本地时间轴与关键词搜索", "local_search_enabled"),
     ("默认注入最近几天的日记", "inject_default_days"),
     ("注入日记的最大字符数", "inject_max_chars"),
+    ("注入日记的 token 上限", "inject_token_limit"),
     ("群聊注入过滤", "group_inject_filter"),
+    ("单向群共享", "group_share_map"),
+    ("外部素材保留天数", "external_material_retention_days"),
+    ("静态加密日记 ZIP", "storage_encryption_enabled"),
+    ("静态加密口令", "storage_encryption_passphrase"),
     ("注入持久化", "persist_inject"),
     ("每天定时自动写完整日记", "enable_auto_diary"),
     ("自动写日记时间", "auto_diary_time"),
@@ -1126,6 +1135,9 @@ _CONF_LABEL_PREFIXES = [
     ("群聊素材倍率", "group_history_multiplier"),
     ("手动写日记的最低上下文占用", "write_min_ratio"),
     ("写日记的附加要求", "extra_instruction"),
+    ("连续不写日志提醒阈值", "no_write_alert_threshold"),
+    ("启用「当前的我」交接信", "current_self_enabled"),
+    ("交接信每几篇整篇重写", "current_self_rewrite_every"),
     ("允许使用插件的用户", "allowed_users"),
     ("写完后展示日记全文", "show_diary_after_write"),
     ("人设口吻", "use_persona"),
@@ -1164,6 +1176,7 @@ _CONF_LABEL_PREFIXES = [
     ("每轮最多生成几条批注", "annotation_max_per_round"),
     ("疑问句软引导", "annotation_question_hint"),
     ("批注生成超时", "annotation_timeout"),
+    ("启用记忆反思批注", "reflection_annotation_enabled"),
 ]
 
 

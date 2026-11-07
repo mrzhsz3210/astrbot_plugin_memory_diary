@@ -13,6 +13,7 @@ main.py                         插件注册 + 组装 + @filter.* 入口薄壳�
 │   ├── gate.py                 指令闸门：多 AI 防冲突、白名单一次性提示、参数解析/不可见字符
 │   ├── cmd_help_persona.py     /日记帮助、/形象
 │   ├── cmd_memo.py             /记一下、/查看备忘、/删除备忘
+│   ├── cmd_search.py           /回忆、memory_diary_search（继承 event 身份/作用域）
 │   ├── cmd_write.py            /写日记
 │   ├── cmd_view.py             /查看日记 + QQ 图文穿插发送
 │   ├── cmd_annotation.py       /查看批注、/写回批注
@@ -23,6 +24,8 @@ main.py                         插件注册 + 组装 + @filter.* 入口薄壳�
 │   │                           on_llm_response（token 校准）
 │   ├── web_diary.py            日记本 Web：路由注册、密码闸、读日记/插图、导入、批量删除
 │   ├── web_export.py           日记本 Web：导出、一键备份、保存到本机下载目录
+│   ├── web_search.py           时间轴/筛选/证据搜索；web_material.py：素材管理
+│   ├── web_note.py             legacy /note；web_material.py：v2 /material
 │   └── web_prefs.py            日记本 Web：界面偏好、自定义纸张/背景板
 └── memory_diary/               领域核心（不 import astrbot，可单独测试）
     ├── constants.py            提示词、注入模板、默认值
@@ -33,7 +36,13 @@ main.py                         插件注册 + 组装 + @filter.* 入口薄壳�
     │                           迁移包导入导出、Web 数据、图片入 zip（v0.6）、
     │                           批注侧车 annotations.json（v0.6）
     ├── service.py              会话历史 → 写作素材 → LLM 写作 → 保存、
-    │                           上下文哨兵、token 校准（EWMA）、每天定时自动写日记
+    │                           上下文哨兵后台任务、token 校准（EWMA）、每天定时自动写日记
+    ├── writing.py              DiaryResult 解析、不写决策、锚点校验与显式记忆识别（v0.7）
+    ├── current_self.py         交接信签名对象、滚段/整篇重写、活动锚点与原文归档
+    ├── scope.py                MemoryScope、具体群隔离与单向共享（v0.7 收口）
+    ├── search.py               验签原文的内存关键词证据检索，不建索引
+    ├── external_material.py    签名素材队列、状态机、保留期与 AI 吸收契约
+    ├── crypto.py               可选整 ZIP AES-256-GCM / Scrypt 静态加密与原子转换
     ├── token_estimator.py      纯函数 token 估算：分类加权 + 消息/工具/多模态开销（v0.5.5）
     ├── imaging.py              生图通道：本地 SD-WebUI / ComfyUI、云端 OpenAI 兼容
     │                           images API、尺寸/超时/参考图退化、用量记账（v0.6 插图）

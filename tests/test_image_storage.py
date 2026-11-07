@@ -440,11 +440,10 @@ async def test_export_import_bundle_preserves_image_bytes():
         src_plugin, name, data, entries, bundle = await _make_bundle_with_image(src_world)
 
         result = src_plugin._verify_bundle(bundle)
-        assert isinstance(result, tuple) and len(result) == 6, (
-            f"_verify_bundle 应返回 6 元组 "
-            f"(owner, key, entries, images, annotations, provenance)，实际 {result!r}"
+        assert isinstance(result, tuple) and len(result) == 9, (
+            f"_verify_bundle 应返回 9 元组（含锚点归档），实际 {result!r}"
         )
-        owner, user_key, bundle_entries, images, annotations, provenance = result
+        owner, user_key, bundle_entries, images, annotations, provenance, current_self, materials, anchor_archive = result
         assert annotations is None, (
             f"没有批注侧车的迁移包 annotations 应为 None，实际 {annotations!r}"
         )
@@ -502,7 +501,7 @@ async def test_verify_bundle_old_package_without_images_is_backward_compatible()
         entries = plugin._list_entries(SENDER)
         bundle = plugin._build_export_bundle(SENDER, inst.diary_path(SENDER), entries)
 
-        owner, user_key, bundle_entries, images, annotations, _prov = plugin._verify_bundle(
+        owner, user_key, bundle_entries, images, annotations, _prov, _current_self, _materials, _anchor_archive = plugin._verify_bundle(
             bundle
         )
         assert owner == SENDER
@@ -517,7 +516,7 @@ async def test_install_bundle_writes_image_signatures_with_local_key():
         config=img_config()
     ) as dst_world:
         src_plugin, name, data, _entries, bundle = await _make_bundle_with_image(src_world)
-        _owner, user_key, bundle_entries, images, _annotations, _prov = src_plugin._verify_bundle(
+        _owner, user_key, bundle_entries, images, _annotations, _prov, _current_self, _materials, _anchor_archive = src_plugin._verify_bundle(
             bundle
         )
 

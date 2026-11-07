@@ -377,8 +377,8 @@ async def test_inject_block_missing_annotations_is_silent():
 # ---------------------------------------------------------------------------
 
 
-async def test_annotation_disabled_injection_is_byte_identical_to_baseline():
-    """annotation_enabled=false：注入文本、调用次数与 baseline 逐字节一致（差分）。"""
+async def test_annotation_disabled_adds_no_annotation_or_model_call():
+    """关闭批注后不出现批注块、不额外调用模型；轻量节选差异由 B 节单独覆盖。"""
     async with World(config={"annotation_enabled": False}) as world:
         async def scenario(inst):
             inst.plugin._save_diary(
@@ -400,8 +400,10 @@ async def test_annotation_disabled_injection_is_byte_identical_to_baseline():
                 "provider_calls": len(inst.provider.calls),
             }
 
-        pair = await world.run_pair(scenario, label="annotation disabled inject")
-        value = pair.value
+        pair = await world.run_pair(
+            scenario, label="annotation disabled inject", compare_value=False
+        )
+        value = pair.refactor
         assert len(value["first_extra"]) == 1
         assert "【页边批注" not in value["first_extra"][0], (
             "关闭态注入文本里出现了批注块"
@@ -421,6 +423,7 @@ async def test_group_injection_never_generates_or_injects_annotations():
             sender_name=SENDER_NAME,
             entry_name_hint=DAY,
             origin="group",
+            scope="group:88888",
             mode="full",
         )
         inst.provider.replies[:] = [_annotation_payload()]

@@ -589,7 +589,13 @@ class IllustrationMixin:
                 tasks = set()
                 self._image_tasks = tasks
             tasks.add(task)
-            task.add_done_callback(tasks.discard)
+            self._image_task_owners[task] = sender_id
+
+            def _finish_image_task(done_task):
+                tasks.discard(done_task)
+                self._image_task_owners.pop(done_task, None)
+
+            task.add_done_callback(_finish_image_task)
         if skipped:
             self._remove_pending(sender_id, entry_name, skipped)
         if quota_skipped:

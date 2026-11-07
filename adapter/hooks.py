@@ -11,6 +11,8 @@ from astrbot.api.provider import ProviderRequest
 from ..memory_diary.common import strip_trailing_decorations
 from ..memory_diary.constants import INJECT_TEMPLATE
 from ..memory_diary.log import logger
+from ..memory_diary.scope import scope_from_event
+from ..memory_diary.token_estimator import estimate_text
 from .compat import TextPart
 
 # P2-12：老版本 AstrBot 4.x 没有 on_llm_response 钩子（main.py 末尾按 hasattr
@@ -33,6 +35,16 @@ class EventHooksMixin:
             pass
         # 附录 A 修复：白名单外用户在私聊发指令时给一次性提示（群聊/普通闲聊静默）
         await self._maybe_hint_whitelist_denied(event)
+        sender_id = str(event.get_sender_id() or "")
+        if not self._is_allowed(sender_id):
+            self._auto_users.pop(sender_id, None)
+            for task in list(getattr(self, "_diary_tasks", set())):
+                if self._diary_task_owners.get(task) == sender_id:
+                    task.cancel()
+            for task in list(getattr(self, "_image_tasks", set())):
+                if self._image_task_owners.get(task) == sender_id:
+                    task.cancel()
+            return
         # 登记私聊会话（供每天定时自动写日记主动通知），并惰性启动后台任务
         try:
             self._remember_auto_user(event)
@@ -104,8 +116,18 @@ class EventHooksMixin:
             if budget <= 0:
                 budget = 8000
             char_cap = min(1500, max(0, budget - len(diary or "") - 400))
+            try:
+                token_budget = int(self.config.get("inject_token_limit", 2400) or 2400)
+            except (TypeError, ValueError):
+                token_budget = 2400
+            if token_budget <= 0:
+                token_budget = 2400
+            template_overhead = estimate_text(INJECT_TEMPLATE.format(diary="")) + 2
+            token_cap = max(
+                0, token_budget - estimate_text(diary or "") - template_overhead
+            )
             return self._annotation_inject_block(
-                sender_id, char_cap=char_cap
+                sender_id, char_cap=char_cap, token_cap=token_cap
             ) or ""
         except Exception as e:
             logger.warning(f"[memory_diary] 批注注入块读取失败，已跳过: {e}")
@@ -181,7 +203,8 @@ class EventHooksMixin:
         # 2) 注入日记（自动 + 手动追加）
         try:
             sender_id = event.get_sender_id()
-            in_group = bool(event.get_group_id())
+            current_scope = str(scope_from_event(event))
+            in_group = scope_from_event(event).is_group
             umo = event.unified_msg_origin
             cid = await self._curr_cid(umo)
             # P1-4：注入去重/代际状态按 (umo, sender) 命名空间化；私聊键就是 umo
@@ -208,6 +231,7 @@ class EventHooksMixin:
                     extra, _, extra_names = self._assemble_inject(
                         sender_id,
                         in_group=in_group,
+                        memory_scope_value=current_scope,
                         scope_override=scope,
                         only_names=new_names,
                     )
@@ -229,7 +253,11 @@ class EventHooksMixin:
                 # 代价是每轮都消耗日记的 token。
                 # P2-12：本轮已被手动追加注入过的篇目不再重复塞进 system_prompt。
                 diary, tampered_any, names = self._assemble_inject(
-                    sender_id, in_group=in_group, exclude_names=pending_names
+                    sender_id,
+                    in_group=in_group,
+                    memory_scope_value=current_scope,
+                    exclude_names=pending_names,
+                    lightweight=True,
                 )
                 if diary:
                     # 持久模式每轮都注入日记：批注只在"本代际首次注入"时同步生成一次，
@@ -266,7 +294,11 @@ class EventHooksMixin:
             if self._injected_cid.get(state_key) == cid:
                 return
             diary, tampered_any, names = self._assemble_inject(
-                sender_id, in_group=in_group, exclude_names=pending_names
+                sender_id,
+                in_group=in_group,
+                memory_scope_value=current_scope,
+                exclude_names=pending_names,
+                lightweight=True,
             )
             if not diary:
                 if tampered_any:
