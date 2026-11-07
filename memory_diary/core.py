@@ -21,6 +21,7 @@ from .illustration import IllustrationMixin
 from .imaging import ImagingMixin
 from .log import logger
 from .service import ServiceMixin
+from .search_index import SearchIndexCache
 from .storage import StorageMixin
 
 
@@ -180,6 +181,11 @@ class MemoryDiaryCore(
         self._image_last_notice = ""
         # 白名单拒绝提示已发过的身份（附录 A 修复：每个身份只提示一次，防刷屏）
         self._whitelist_hint_sent: set = set()
+        # 每个 sender 独立的内存派生索引；不写入磁盘，卸载时统一关闭
+        self._search_index = SearchIndexCache(max_entries=4)
+
+    def _invalidate_search_index(self, sender_id: str) -> None:
+        self._search_index.invalidate(str(sender_id))
 
     # ------------------------- 白名单 -------------------------
 
@@ -363,3 +369,4 @@ class MemoryDiaryCore(
         self._pending_estimates.clear()
         self._last_context_used.clear()
         self._whitelist_hint_sent.clear()
+        self._search_index.close()

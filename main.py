@@ -29,7 +29,7 @@ from .memory_diary.log import logger
     "astrbot_plugin_memory_diary",
     "mrzhsz3210",
     "指令/定时自动触发写日记（用户画像 / 对用户的评价 / 给未来自己的叮嘱），新上下文自动读取日记，上下文将满时自动提醒，支持每天定时自动写完整日记。",
-    "v0.7.0",
+    "v0.7.2",
 )
 class MemoryDiaryPlugin(*AdapterMixins, MemoryDiaryCore, Star):
     """AstrBot 插件入口：只保留注册与 handler 薄壳，实现见 adapter/ 与 memory_diary/。"""
@@ -105,7 +105,13 @@ class MemoryDiaryPlugin(*AdapterMixins, MemoryDiaryCore, Star):
         max_results: int = 5,
         evidence_type: str = "user",
     ) -> str:
-        """搜索当前用户与作用域的日记证据。evidence_type 可选 user/self/all/mixed/external/unknown。"""
+        """搜索当前用户与作用域的日记证据并返回原文出处。evidence_type 可选 user/self/all/mixed/external/unknown。
+
+        参数选择必须匹配问题：询问 AI 自己写的私人随笔、生活随笔或内心记录时使用 self，
+        不要使用默认 user；需要跨类型核实使用 all。同日可能同时存在多种证据类型，
+        单一类型或单组关键词未命中时，不得断言当天没有相关内容或植物、事件等证据不存在；
+        应说明当前筛选范围，必要时再用 all 或正确类型复核。FTS 是词法检索，不是语义真相。
+        """
         return await self._handle_memory_diary_search(
             event, query, day, max_results, evidence_type
         )

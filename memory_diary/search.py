@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""验签原文的按需本地关键词搜索；不创建持久化索引。"""
+"""验签原文的按需证据检索；内存 FTS 失败时回退线性关键词搜索。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import re
 import unicodedata
 
 from .constants import ANNOTATION_SELF_PLACEHOLDER
+from .log import logger
 from .scope import readable_scopes
 
 EVIDENCE_LABELS = {
@@ -125,10 +126,9 @@ def _evidence_selected(classified: str, requested: str) -> bool:
     return classified == requested
 
 
-def search_diaries(
+def _collect_search_documents(
     plugin,
     sender_id: str,
-    query: str = "",
     *,
     scope: str = "",
     day: str = "",
@@ -136,15 +136,9 @@ def search_diaries(
     origin: str = "",
     has_annotations=None,
     has_images=None,
-    offset: int = 0,
-    limit: int = 20,
     evidence_type: str = "user",
 ):
-    """返回统一证据结果；scope 为空仅供已鉴权的管理端跨场景检索。"""
-    if not plugin._is_allowed(sender_id) or not bool(plugin.config.get("local_search_enabled", True)):
-        return {"results": [], "total": 0, "tampered": False, "disabled": True}
     requested = normalize_evidence_type(evidence_type)
-    keywords = [normalize_search_text(part) for part in str(query or "").split() if part]
     allowed = set(readable_scopes(scope, plugin.config.get("group_share_map", ""))) if scope else None
     annotations, ann_status = plugin.load_annotations(sender_id)
     annotated_days = {
@@ -156,10 +150,8 @@ def search_diaries(
         provenance, provenance_status = plugin.load_provenance(sender_id)
     except Exception:
         provenance, provenance_status = {"entries": {}}, "tampered"
-    provenance_entries = (
-        provenance.get("entries") if provenance_status == "ok" else {}
-    )
-    results = []
+    provenance_entries = provenance.get("entries") if provenance_status == "ok" else {}
+    documents = []
     tampered_any = ann_status == "tampered" or provenance_status == "tampered"
     for entry in reversed(plugin._list_entries(sender_id)):
         entry_day = plugin._entry_day(entry)
@@ -178,7 +170,7 @@ def search_diaries(
         ]
         matched_spans = {span for spans in segment_spans for span in spans}
         unmatched_spans = [span for span in day_spans if span not in matched_spans]
-        for segment, local_spans in zip(segments, segment_spans):
+        for segment_index, (segment, local_spans) in enumerate(zip(segments, segment_spans), 1):
             info = plugin._segment_info(segment["header"])
             if allowed is not None and info["scope"] not in allowed:
                 continue
@@ -194,11 +186,8 @@ def search_diaries(
             if unmatched_spans and (not matched_spans or local_spans):
                 source_status = "partial"
             prepared = classify_search_segment(
-                segment["text"],
-                mode=segment_mode,
-                header=header,
-                provenance=local_record,
-                source_status=source_status,
+                segment["text"], mode=segment_mode, header=header,
+                provenance=local_record, source_status=source_status,
                 evidence_type=requested,
             )
             if not _evidence_selected(prepared["evidence_type"], requested):
@@ -213,34 +202,112 @@ def search_diaries(
                 continue
             if has_images is not None and images != bool(has_images):
                 continue
-            normalized = normalize_search_text(prepared["search_text"])
-            if not all(keyword in normalized for keyword in keywords):
-                continue
             source = "私聊" if info["origin"] == "private" else info["scope"]
             external = re.search(r"外部·([^）]+)", header)
             if external:
                 source = external.group(1)
-            snippet_keywords = keywords
-            if prepared["self_masked"]:
-                display_normalized = normalize_search_text(prepared["display_text"])
-                if any(keyword not in display_normalized for keyword in keywords):
-                    snippet_keywords = [normalize_search_text(ANNOTATION_SELF_PLACEHOLDER)]
-            results.append({
+            private_text = (
+                prepared["raw_text"]
+                if prepared["evidence_type"] in ("self", "mixed")
+                else prepared["display_text"]
+            )
+            documents.append({
+                "segment_id": f"{entry}#{segment_index}",
                 "entry": entry,
                 "day": entry_day,
                 "segment_header": header,
                 "scope": info["scope"],
+                "origin": info["origin"],
                 "mode": segment_mode,
                 "source": source,
-                "snippet": evidence_snippet(prepared["display_text"], snippet_keywords),
-                "has_annotations": annotated,
-                "has_images": images,
+                "text": prepared["display_text"],
+                "private_text": private_text,
+                "display_text": prepared["display_text"],
                 "evidence_type": prepared["evidence_type"],
-                "evidence_label": EVIDENCE_LABELS[prepared["evidence_type"]],
                 "has_explicit": prepared["has_explicit"],
                 "self_masked": prepared["self_masked"],
+                "has_annotations": annotated,
+                "has_images": images,
                 "source_status": prepared["source_status"],
             })
+    return documents, tampered_any
+
+
+def _linear_documents(documents: list[dict], keywords: list[str], evidence_type: str):
+    from .search_index import document_matches
+
+    private = evidence_type in ("self", "all")
+    return [
+        doc for doc in documents
+        if document_matches(doc, keywords, private=private)
+    ]
+
+
+def _result_document(doc: dict, keywords: list[str]) -> dict:
+    snippet_keywords = keywords
+    if doc["self_masked"]:
+        display_normalized = normalize_search_text(doc["display_text"])
+        if any(keyword not in display_normalized for keyword in keywords):
+            snippet_keywords = [normalize_search_text(ANNOTATION_SELF_PLACEHOLDER)]
+    return {
+        "entry": doc["entry"],
+        "segment_id": doc["segment_id"],
+        "day": doc["day"],
+        "segment_header": doc["segment_header"],
+        "scope": doc["scope"],
+        "mode": doc["mode"],
+        "source": doc["source"],
+        "snippet": evidence_snippet(doc["display_text"], snippet_keywords),
+        "has_annotations": doc["has_annotations"],
+        "has_images": doc["has_images"],
+        "evidence_type": doc["evidence_type"],
+        "evidence_label": EVIDENCE_LABELS[doc["evidence_type"]],
+        "has_explicit": doc["has_explicit"],
+        "self_masked": doc["self_masked"],
+        "source_status": doc["source_status"],
+    }
+
+
+def search_diaries(
+    plugin,
+    sender_id: str,
+    query: str = "",
+    *,
+    scope: str = "",
+    day: str = "",
+    mode: str = "",
+    origin: str = "",
+    has_annotations=None,
+    has_images=None,
+    offset: int = 0,
+    limit: int = 20,
+    evidence_type: str = "user",
+):
+    """返回统一证据结果；scope 为空仅供已鉴权的管理端跨场景检索。"""
+    if not plugin._is_allowed(sender_id):
+        plugin._invalidate_search_index(sender_id)
+        return {"results": [], "total": 0, "tampered": False, "disabled": True}
+    if not bool(plugin.config.get("local_search_enabled", True)):
+        return {"results": [], "total": 0, "tampered": False, "disabled": True}
+    requested = normalize_evidence_type(evidence_type)
+    keywords = [normalize_search_text(part) for part in str(query or "").split() if part]
+    documents, tampered_any = _collect_search_documents(
+        plugin, sender_id, scope=scope, day=day, mode=mode, origin=origin,
+        has_annotations=has_annotations, has_images=has_images,
+        evidence_type=requested,
+    )
+    ranked = documents
+    if keywords:
+        try:
+            ranked = plugin._search_index.search(
+                sender_id, documents, query, evidence_type=requested
+            )
+        except Exception as exc:
+            plugin._search_index.invalidate(sender_id)
+            plugin._search_index.note_fallback()
+            logger.warning(f"[memory_diary] 内存检索索引不可用，已回退线性搜索: {exc}")
+            ranked = _linear_documents(documents, keywords, requested)
+    results = [_result_document(doc, keywords) for doc in ranked]
     total = len(results)
     start = max(0, int(offset or 0))
     size = min(100, max(1, int(limit or 20)))

@@ -40,7 +40,9 @@ main.py                         插件注册 + 组装 + @filter.* 入口薄壳�
     ├── writing.py              DiaryResult 解析、不写决策、锚点校验与显式记忆识别（v0.7）
     ├── current_self.py         交接信签名对象、滚段/整篇重写、活动锚点与原文归档
     ├── scope.py                MemoryScope、具体群隔离与单向共享（v0.7 收口）
-    ├── search.py               验签原文的内存关键词证据检索，不建索引
+    ├── search.py               统一证据检索、文档构建与线性回退
+    ├── search_index.py         按 sender 隔离的内存 SQLite FTS、BM25、LRU 与失效
+    ├── search_assist.py        严格 JSON 辅助边界与明确历史指代识别
     ├── external_material.py    签名素材队列、状态机、保留期与 AI 吸收契约
     ├── crypto.py               可选整 ZIP AES-256-GCM / Scrypt 静态加密与原子转换
     ├── token_estimator.py      纯函数 token 估算：分类加权 + 消息/工具/多模态开销（v0.5.5）
