@@ -1277,6 +1277,7 @@ class StorageMixin:
         except Exception as e:
             logger.warning(f"[memory_diary] 来源侧车写入失败: {e}")
             return False
+        self._invalidate_search_index(sender_id)
         return True
 
     def update_provenance(self, sender_id: str, mutator):
@@ -2763,6 +2764,7 @@ class StorageMixin:
             "utf-8"
         )
         self._write_zip_atomic(path, out)
+        self._invalidate_search_index(sender_id)
         return entry_name
 
     def _migrate_legacy(self, sender_id: str):
@@ -2960,6 +2962,7 @@ class StorageMixin:
                     existed = True
             except Exception as e:
                 logger.warning(f"[memory_diary] 删除文件失败（{p}）: {e}")
+        self._invalidate_search_index(sender_id)
         return existed
 
     def _delete_entries(self, sender_id: str, names: list) -> int:
@@ -3030,6 +3033,7 @@ class StorageMixin:
         except Exception as e:
             logger.warning(f"[memory_diary] 删除日记条目失败: {e}")
             return 0
+        self._invalidate_search_index(sender_id)
         return len([n for n in remove if n.endswith(".md")])
 
     # ------------------------- 操作冷却 -------------------------
@@ -3469,6 +3473,7 @@ class StorageMixin:
                 sender_id, anchor_archive
             ).encode("utf-8")
         self._write_zip_atomic(target, out)
+        self._invalidate_search_index(sender_id)
         return mode
 
     def _zip_owner_info(self, path: Path):

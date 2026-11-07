@@ -49,10 +49,37 @@
     "default": true
   },
   "local_search_enabled": {
-    "description": "本地时间轴与关键词搜索",
+    "description": "本地时间轴与证据搜索",
     "type": "bool",
-    "hint": "默认开启：按需检索验签后的原文，支持 /回忆、模型工具 memory_diary_search 和 Web 时间轴；不建立索引、不额外调用模型。关闭不影响 /查看日记 和 /注入日记",
+    "hint": "默认开启：按需检索验签后的原文，支持 /回忆、模型工具 memory_diary_search 和 Web 时间轴；优先使用内存 SQLite FTS 词法索引，异常时回退线性搜索。索引不落盘、不额外调用模型。关闭不影响 /查看日记 和 /注入日记",
     "default": true
+  },
+  "search_query_expansion_enabled": {
+    "description": "检索查询扩展（高级，默认关闭）",
+    "type": "bool",
+    "hint": "仅在主动 /回忆 或模型工具检索时，把当前查询、sender/scope 与私聊最近少量上下文（最多 1200 字符）发给当前 LLM，最多生成 4 组关键词；每次检索最多额外调用 1 次。模型不能生成证据，失败自动使用原查询。开启会产生模型费用与相应数据外发",
+    "default": false,
+    "condition": {
+      "local_search_enabled": true
+    }
+  },
+  "search_rerank_enabled": {
+    "description": "检索候选重排（高级，默认关闭）",
+    "type": "bool",
+    "hint": "仅在主动 /回忆 或模型工具检索时，把最多 20 条已过滤的候选原文片段与出处发给当前 LLM，只允许它选择候选 ID；每次检索最多额外调用 1 次，默认返回最多 5 条。失败回退 BM25 顺序。与查询扩展独立，开启会产生模型费用与相应数据外发",
+    "default": false,
+    "condition": {
+      "local_search_enabled": true
+    }
+  },
+  "context_recall_enabled": {
+    "description": "当前对话按需历史召回（高级，默认关闭）",
+    "type": "bool",
+    "hint": "仅当当前用户消息含“之前、上次、当时、几个月前、去年”等明确历史指代时检索默认用户证据；不处理运维指令和纯闲聊，不调用查询扩展或重排。每次最多注入 3 条、约 400 tokens，找不到安静跳过；不替代当前交接信与最近日记轻量注入",
+    "default": false,
+    "condition": {
+      "local_search_enabled": true
+    }
   },
   "inject_default_days": {
     "description": "默认注入最近几天的日记",
@@ -75,7 +102,7 @@
   "group_inject_filter": {
     "description": "群聊注入过滤",
     "type": "bool",
-    "hint": "开启后：在群聊的新上下文中只注入「写于群聊」的日记片段，私聊写下的片段不进群聊（反向不限：群聊片段在私聊照常注入）。无场景标记的旧日记片段视为私聊来源、不注入群聊",
+    "hint": "开启后：在群聊的新上下文中只注入「写于群聊」的日记片段，私聊写下的片段不进群聊（反向不限：群聊片段在私聊照常注入）。无场景标记的旧日记片段视为私聊来源、不注入群聊。v0.7.0 起具体群隔离为强制安全边界，旧开关不再能关闭",
     "default": true
   },
   "group_share_map": {
