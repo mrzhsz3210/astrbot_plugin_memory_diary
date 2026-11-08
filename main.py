@@ -31,7 +31,7 @@ from .memory_diary.log import logger
     "astrbot_plugin_memory_diary",
     "mrzhsz3210",
     "指令/定时自动触发写日记（用户画像 / 对用户的评价 / 给未来自己的叮嘱），新上下文自动读取日记，上下文将满时自动提醒，支持每天定时自动写完整日记。",
-    "v0.7.4",
+    "v0.7.5",
 )
 class MemoryDiaryPlugin(CompanionBridgeMixin, CompanionEvidenceMixin, *AdapterMixins, MemoryDiaryCore, Star):
     """AstrBot 插件入口：只保留注册与 handler 薄壳，实现见 adapter/ 与 memory_diary/。"""

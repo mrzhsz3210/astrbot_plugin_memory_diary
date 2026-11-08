@@ -2,7 +2,7 @@ name: astrbot_plugin_memory_diary
 display_name: 记忆日记
 short_desc: 日记叙事与上下文连续性：人设化日记、当前交接与旧证据回源
 desc: 以自传快照和人设化叙事延续共同经历：AI 为下一个自己写日记、留下批注与当前交接信，会话重置后用最近日记轻量接续；按需通过内存 SQLite FTS 定位旧证据并回源日期、场景和原文。基础功能开箱即用，高级检索扩展与候选重排默认关闭。支持群与白名单隔离、用户记录与 AI 私人随笔分类、外部素材、可导出可验证备份及可选静态加密；不引入向量依赖，不把模型生成内容当作历史证据。v0.7.3 起适配「我会永远陪着你」官方外部记忆接口（companion.external-memory.v1，7.0.7+，纯软依赖、失败降级），并可与「我会牢牢记住你」分工共存。
-version: v0.7.4
+version: v0.7.5
 author: mrzhsz3210
 repo: "https://github.com/mrzhsz3210/astrbot_plugin_memory_diary"
 astrbot_version: ">=4.0.0,<5"

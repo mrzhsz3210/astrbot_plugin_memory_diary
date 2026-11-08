@@ -55,6 +55,11 @@ from .writing import (
 )
 
 
+# 进程级自动日记循环守卫：记录当前存活的 task 与所属实例，供新实例启动时
+# 取消旧实例残留的循环（2026-11-08 修复 reload 泄漏循环重复写日记）。
+_AUTO_TASK_HOLDER: dict = {"task": None, "owner": None}
+
+
 class ServiceMixin:
     """写作编排、上下文哨兵与定时任务；由 MemoryDiaryCore 组合。"""
 
@@ -1607,12 +1612,43 @@ class ServiceMixin:
         return int(m.group(1)), int(m.group(2))
 
     def _start_auto_diary_task(self):
-        """启动后台定时任务；已启动、已终止或环境没有事件循环时安全跳过。"""
+        """启动后台定时任务；已启动、已终止或环境没有事件循环时安全跳过。
+
+        跨实例守卫：插件 reload 后旧实例的循环可能仍在后台跑（terminate 未
+        覆盖的窗口），多个循环同点触发会重复写日记（2026-11-06/07/08 实测）。
+        """
         if getattr(self, "_terminated", False):
             return
         task = getattr(self, "_auto_task", None)
         if task is not None and not task.done():
             return
+        old_task = _AUTO_TASK_HOLDER.get("task")
+        old_owner = _AUTO_TASK_HOLDER.get("owner")
+        if old_task is not None and not old_task.done() and old_owner is not self:
+            old_task.cancel()
+            _AUTO_TASK_HOLDER["task"] = None
+            logger.info("[memory_diary] 已取消旧实例残留的自动写日记任务（防同点重复触发）")
+        # 全事件循环扫杀：插件 reload 会重建模块，模块级守卫随之重置，
+        # 拦不住 reload 前泄漏的旧模块实例。协程名 *_auto_diary_loop 唯一
+        # 对应本插件后台循环，凡能确认属于其他实例的一律 cancel，跨模块也有效。
+        killed = 0
+        try:
+            for t in asyncio.all_tasks():
+                if t.done():
+                    continue
+                qual = getattr(t.get_coro(), "__qualname__", "") or ""
+                if not qual.endswith("._auto_diary_loop"):
+                    continue
+                frame = getattr(t.get_coro(), "cr_frame", None)
+                owner = getattr(frame, "f_locals", {}).get("self") if frame is not None else None
+                if owner is None or owner is self:
+                    continue
+                t.cancel()
+                killed += 1
+        except Exception as e:
+            logger.warning(f"[memory_diary] 扫描残留自动日记循环失败: {e}")
+        if killed:
+            logger.info(f"[memory_diary] 已清理 {killed} 个旧实例泄漏的自动日记循环")
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1620,6 +1656,8 @@ class ServiceMixin:
             return
         try:
             self._auto_task = loop.create_task(self._auto_diary_loop())
+            _AUTO_TASK_HOLDER["task"] = self._auto_task
+            _AUTO_TASK_HOLDER["owner"] = self
             logger.info("[memory_diary] 每天定时自动写日记后台任务已启动")
         except Exception as e:
             logger.warning(f"[memory_diary] 启动自动写日记任务失败: {e}")
@@ -1629,6 +1667,9 @@ class ServiceMixin:
         try:
             await asyncio.sleep(5)  # 等插件与配置加载稳定
             while True:
+                if getattr(self, "_terminated", False):
+                    logger.info("[memory_diary] 插件已终止，自动写日记后台任务退出")
+                    return
                 try:
                     await self._auto_diary_tick()
                 except asyncio.CancelledError:
@@ -1650,7 +1691,11 @@ class ServiceMixin:
         # P3-10：记下上一次检查时间，用来区分"启动太晚"和"事件循环被阻塞错过窗口"
         last_tick = getattr(self, "_auto_last_tick_at", None)
         self._auto_last_tick_at = now
-        state = self._auto_state or self._load_auto_state()
+        # 每次强制从磁盘重读触发状态：泄漏的旧循环实例各自持有内存缓存时，
+        # 磁盘已落盘“今天已触发”也感知不到，会同点重复触发。
+        # 检查与落盘之间没有任何 await（同步文件 IO），事件循环内天然互斥，
+        # 多个循环并发到点时只有第一个能通过检查并落盘。
+        state = self._load_auto_state()
         self._auto_state = state
         if str(state.get("last_trigger_day") or "") == today:
             # P3-9：当天已触发过。旧状态文件没有 done_senders 字段——按旧语义视为
@@ -1824,6 +1869,22 @@ class ServiceMixin:
                 skipped += 1
                 self._mark_auto_diary_done(state, sender_id)
                 continue
+            claimed = False
+            if isinstance(state, dict):
+                # 多实例同时补写时，仅重读 last_trigger_day 不够：它们仍可能看到
+                # 同一个空 done_senders。写前同步重读并认领 sender；检查与落盘间
+                # 没有 await，同一事件循环内只有一个实例能完成首次认领。
+                latest_state = self._load_auto_state()
+                if str(latest_state.get("last_trigger_day") or "") == day:
+                    latest_done = {
+                        str(s) for s in latest_state.get("done_senders") or []
+                    }
+                    if sender_id in latest_done:
+                        skipped += 1
+                        continue
+                    state = latest_state
+                self._mark_auto_diary_done(state, sender_id)
+                claimed = True
             self._writing.add(sender_id)
             diary, err = None, None
             try:
@@ -1836,7 +1897,18 @@ class ServiceMixin:
                     requested_mode="full",
                 )
             except asyncio.CancelledError:
-                # 取消/重载打断：不能把这个用户记成已完成，留给当天后续 tick 补写
+                # 取消/重载打断：撤销认领，留给当天后续 tick 补写。
+                if claimed:
+                    latest_state = self._load_auto_state()
+                    if str(latest_state.get("last_trigger_day") or "") == day:
+                        latest_done = [
+                            str(s)
+                            for s in latest_state.get("done_senders") or []
+                            if str(s) != sender_id
+                        ]
+                        latest_state["done_senders"] = latest_done
+                        self._auto_state = latest_state
+                        self._save_auto_state(latest_state)
                 raise
             except Exception as e:
                 err = f"自动写日记异常：{e}"
@@ -1856,7 +1928,8 @@ class ServiceMixin:
                 await self._notify_auto_diary_failure(umo, err)
             else:
                 skipped += 1
-            self._mark_auto_diary_done(state, sender_id)
+            if not claimed:
+                self._mark_auto_diary_done(state, sender_id)
         logger.info(
             f"[memory_diary] 每天定时自动写日记完成：成功 {wrote}，跳过 {skipped}，失败 {failed}"
         )
