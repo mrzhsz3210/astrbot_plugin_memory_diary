@@ -248,15 +248,19 @@ def test_view_css_annotation_badge_is_readable():
 def test_conf_schema_annotation_keys_types_defaults_and_conditions():
     schema = _load_schema()
     keys = list(schema.keys())
-    # v0.6.0 起「日记时区」「已废弃的启用上下文哨兵」固定在配置页最后两项；
-    # 批注配置项紧接插图配置项之后、时区之前，顺序与 README §10.13 一致。
+    # 批注紧跟插图；v0.7.3 的陪伴三项位于批注之后、固定末尾两项之前。
     assert keys[-2:] == ["diary_timezone", "enable_context_watch"], (
         f"配置页最后两项应为日记时区与已废弃兼容项，实际 {keys[-2:]}"
     )
-    assert keys[-7:-2] == ANNOTATION_KEYS_TAIL, (
-        f"批注配置项应紧跟插图配置项之后（时区之前），顺序为 {ANNOTATION_KEYS_TAIL}，"
-        f"实际 {keys[-7:-2]}"
+    annotation_start = keys.index("annotation_enabled")
+    assert keys[annotation_start - 1] == "vision_api_model"
+    assert keys[annotation_start:annotation_start + 5] == ANNOTATION_KEYS_TAIL, (
+        f"批注配置项应紧跟插图配置项之后，顺序为 {ANNOTATION_KEYS_TAIL}，"
+        f"实际 {keys[annotation_start:annotation_start + 5]}"
     )
+    assert keys[annotation_start + 5:annotation_start + 8] == [
+        "companion_bridge_enabled", "companion_yield_inject", "companion_write_evidence"
+    ]
     for key, (expected_type, expected_default) in EXPECTED_ANNOTATION_CONFIG.items():
         item = schema[key]
         assert item.get("type") == expected_type, (

@@ -66,6 +66,10 @@
 
 同时安装 LivingMemory 或 MemoryCompanion 时，建议由**记忆日记负责叙事和默认连续性**。MemoryCompanion 可保留整理、管理和检索能力，但请管理员设置 `memory_injection.enabled=false`，避免重复注入；LivingMemory 建议使用独立实例，或通过 MemoryCompanion 的迁移功能处理，不让多套记忆同时主导聊天。详细说明见[官网共存建议](https://astrbotmemorydiary.ok.kimi.link/#/admin/config)。
 
+### 与「我会永远陪着你」联动（v0.7.3 新增）
+
+适配陪伴插件 7.0.7 起的官方外部记忆接口，**纯软依赖**：没装、版本不符或连接失败时，记忆日记一切照旧。同装后，私聊里的日记注入改为对方按话题**精准召回原文片段**（带日期出处，防双注入自动让位）；对方「陪伴小屋」出现记忆日记的摘要卡；可选接收对方角色日记的签名存证副本。默认配置即为自动协作形态，无需手动调整。互补增益与边界（含 token 成本叠加、与 MemoryCompanion 同装时的单 writer 语义、对方 7.1.6 的已知注册表问题）逐条见完整文档「联动声明」一节。
+
 ## 更新说明
 
 只列 **v0.7.1 → v0.7.2** 的差异；更早历史见 `CHANGELOG.md` 与[官方网站](https://astrbotmemorydiary.ok.kimi.link)。

@@ -20,7 +20,9 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Star, register
 
 from .adapter import AdapterMixins
+from .adapter.companion_bridge import CompanionBridgeMixin
 from .adapter.compat import resolve_data_dir
+from .memory_diary.companion_evidence import CompanionEvidenceMixin
 from .memory_diary.core import MemoryDiaryCore
 from .memory_diary.log import logger
 
@@ -31,16 +33,23 @@ from .memory_diary.log import logger
     "指令/定时自动触发写日记（用户画像 / 对用户的评价 / 给未来自己的叮嘱），新上下文自动读取日记，上下文将满时自动提醒，支持每天定时自动写完整日记。",
     "v0.7.2",
 )
-class MemoryDiaryPlugin(*AdapterMixins, MemoryDiaryCore, Star):
+class MemoryDiaryPlugin(CompanionBridgeMixin, CompanionEvidenceMixin, *AdapterMixins, MemoryDiaryCore, Star):
     """AstrBot 插件入口：只保留注册与 handler 薄壳，实现见 adapter/ 与 memory_diary/。"""
 
     def __init__(self, context, config=None):
         super().__init__(context, config, data_dir=resolve_data_dir())
-        # 可视化视图（日记本页面）后端 API；不支持的 AstrBot 版本自动跳过
         try:
             self._register_web_apis()
         except Exception as e:
             logger.warning(f"[memory_diary] 注册 Web API 失败，日记本页面不可用: {e}")
+
+    async def initialize(self):
+        await super().initialize()
+        await self._companion_try_register()
+
+    async def terminate(self):
+        await self._companion_unregister()
+        await super().terminate()
 
     # ------------------------- 指令：帮助 / 形象档案 -------------------------
     # 实现：adapter/cmd_help_persona.py
@@ -100,7 +109,7 @@ class MemoryDiaryPlugin(*AdapterMixins, MemoryDiaryCore, Star):
     async def memory_diary_search(
         self,
         event: AstrMessageEvent,
-        query: str,
+        query: str = "",
         day: str = "",
         max_results: int = 5,
         evidence_type: str = "user",

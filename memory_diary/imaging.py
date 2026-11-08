@@ -497,36 +497,56 @@ class ImagingMixin:
             prompt_id = str(resp.get("prompt_id") or "")
         if not prompt_id:
             return None
-        # 轮询 /history/<prompt_id>；最多等 90 秒（上层还有整体超时兜底）
-        for _ in range(180):
-            await asyncio.sleep(0.5)
-            hist = await self._http_get(f"{base}/history/{prompt_id}", 15)
-            if not hist:
-                continue
-            try:
-                data = json.loads(hist.decode("utf-8", "ignore"))
-            except Exception:
-                continue
-            record = data.get(prompt_id) if isinstance(data, dict) else None
-            if not isinstance(record, dict):
-                continue
-            images = []
-            for node_output in (record.get("outputs") or {}).values():
-                if isinstance(node_output, dict):
-                    images.extend(node_output.get("images") or [])
-            if not images:
-                continue
-            info = images[0] if isinstance(images[0], dict) else {}
-            filename = str(info.get("filename") or "")
-            if not filename:
-                continue
-            query = (
-                f"?filename={_quote(filename)}"
-                f"&subfolder={_quote(str(info.get('subfolder') or ''))}"
-                f"&type={_quote(str(info.get('type') or 'output'))}"
+        finished = False
+        try:
+            # 轮询 /history/<prompt_id>；最多等 90 秒（上层还有整体超时兜底）
+            for _ in range(180):
+                await asyncio.sleep(0.5)
+                hist = await self._http_get(f"{base}/history/{prompt_id}", 15)
+                if not hist:
+                    continue
+                try:
+                    data = json.loads(hist.decode("utf-8", "ignore"))
+                except Exception:
+                    continue
+                record = data.get(prompt_id) if isinstance(data, dict) else None
+                if not isinstance(record, dict):
+                    continue
+                images = []
+                for node_output in (record.get("outputs") or {}).values():
+                    if isinstance(node_output, dict):
+                        images.extend(node_output.get("images") or [])
+                if not images:
+                    continue
+                info = images[0] if isinstance(images[0], dict) else {}
+                filename = str(info.get("filename") or "")
+                if not filename:
+                    continue
+                query = (
+                    f"?filename={_quote(filename)}"
+                    f"&subfolder={_quote(str(info.get('subfolder') or ''))}"
+                    f"&type={_quote(str(info.get('type') or 'output'))}"
+                )
+                result = await self._http_get(f"{base}/view{query}", 30)
+                finished = True
+                return result
+            return None
+        finally:
+            if not finished:
+                await asyncio.shield(self._comfy_cancel_best_effort(base, prompt_id))
+
+    async def _comfy_cancel_best_effort(self, base: str, prompt_id: str) -> None:
+        try:
+            result = await self._http_post_json(
+                f"{base}/queue", {"delete": [prompt_id]}, 15
             )
-            return await self._http_get(f"{base}/view{query}", 30)
-        return None
+            if result is None:
+                raise OSError("ComfyUI 未确认队列删除")
+        except Exception as exc:
+            logger.warning(
+                f"[memory_diary] ComfyUI 任务定向清理失败（prompt_id={prompt_id}）: "
+                f"{type(exc).__name__}"
+            )
 
     async def _comfy_first_checkpoint(self, base: str) -> str:
         """从 ComfyUI /object_info 取第一个可用 checkpoint 名。

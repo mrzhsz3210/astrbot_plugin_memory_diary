@@ -2,6 +2,18 @@
 
 本项目所有重要变更都会记录在此文件。
 
+## [v0.7.3] - 2026-11-08
+
+### 陪伴插件生态接入（companion.external-memory.v1）
+- **外部记忆 Provider 注册**：检测到已激活的陪伴插件（astrbot_plugin_private_companion，7.0.7 起）时，按官方契约注册 read / write / summary 三回调（provider_id `astrbot_plugin_memory_diary.memory`，priority=10，超时 5 秒）；未安装、版本不符或注册失败时全部功能与原行为逐字节一致，纯软依赖、不 import 对方代码。
+- **read 日记证据召回**：陪伴插件私聊回复准备阶段，按请求完整身份（平台 + 账号 + 用户）检索该用户的日记原文片段注入（带日期与出处，限私聊、限白名单、限预算）；异常一律返回空集，不阻塞宿主。
+- **write 角色级签名存证**：接收陪伴插件的日记/梦境/主动消息副本，按 installation + bot + role 归属、按天归档 jsonl，HMAC 签名（域分离 + 原子写入 + 验签失败拒读拒写），以 `source_plugin + memory_id` 幂等 upsert，保留 90 天到期自清；`context` 缺失或无法归属的记录拒收。存证只进不出：不参与召回、不进入提示词、日志不记正文。
+- **summary 六类计数**：按请求身份返回固定六类计数，身份不可归属时抛错（宿主显示不可用，不伪装成零）。
+- **防双注入让位**：Provider 生效期间私聊常规自动注入让位给宿主 read 管线；群聊、手动 `/注入日记`、按需历史召回与上下文哨兵不受影响。
+- **单 writer 保护**：`companion_write_evidence` 三档（auto/on/off），auto 检测到 MemoryCompanion 活跃时不注册写回调并记日志，避免静默切断其旧桥推送；on 为显式接受单 writer 语义。
+- **配置项**：新增 `companion_bridge_enabled`、`companion_yield_inject`、`companion_write_evidence` 三项；`/日记状态` 私聊侧显示陪伴存证计数。
+- **回归**：新增 16 项陪伴桥接测试（版本降级、身份隔离、幂等重放、篡改验签、过期清理、让位语义、回调有界）；全量 618 项，0 failed、0 skipped。
+
 ## [v0.7.2] - 2026-11-07
 
 ### 潜在 bug 审查与修复

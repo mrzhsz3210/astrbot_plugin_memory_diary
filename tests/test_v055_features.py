@@ -1106,7 +1106,8 @@ _CONF_README_ORDER = [
     # 10.13 批注配置（v0.6，顺序与 README bullet 一致）
     "annotation_enabled", "annotation_max_per_round",
     "annotation_question_hint", "annotation_timeout", "reflection_annotation_enabled",
-    # 10.16 时区与兼容项（配置页最后，废弃项是最后一个）
+    # 10.16 陪伴插件兼容、时区与旧兼容项（废弃项是最后一个）
+    "companion_bridge_enabled", "companion_yield_inject", "companion_write_evidence",
     "diary_timezone", "enable_context_watch",
 ]
 
@@ -1150,6 +1151,9 @@ _CONF_LABEL_PREFIXES = [
     ("（已废弃）启用上下文哨兵", "enable_context_watch"),
     ("日记本页面的称呼", "web_diary_brand"),
     ("外部来源显示名", "external_source_display"),
+    ("接入陪伴插件外部记忆", "companion_bridge_enabled"),
+    ("陪伴插件召回时让出私聊注入", "companion_yield_inject"),
+    ("陪伴记录签名存证", "companion_write_evidence"),
     ("日记时区", "diary_timezone"),
     # 10.12 插图配置与形象档案（v0.6）
     ("插图功能总开关", "image_enabled"),

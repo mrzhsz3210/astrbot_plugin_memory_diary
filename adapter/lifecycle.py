@@ -30,6 +30,10 @@ class LifecycleMixin:
             self._purge_temp_images()
         except Exception as e:
             logger.warning(f"[memory_diary] 启动清理插图临时文件失败: {e}")
+        try:
+            self._companion_evidence_expire()
+        except Exception as e:
+            logger.warning(f"[memory_diary] 启动清理过期陪伴存证失败: {e}")
         await super().initialize()
 
     def _purge_temp_images(self) -> None:

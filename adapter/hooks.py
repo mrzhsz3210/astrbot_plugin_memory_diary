@@ -35,6 +35,10 @@ class EventHooksMixin:
                 return  # 自己发的消息不算
         except Exception:
             pass
+        try:
+            self._companion_observe_event(event)
+        except Exception:
+            pass
         # 附录 A 修复：白名单外用户在私聊发指令时给一次性提示（群聊/普通闲聊静默）
         await self._maybe_hint_whitelist_denied(event)
         sender_id = str(event.get_sender_id() or "")
@@ -184,6 +188,7 @@ class EventHooksMixin:
                 f"[memory_diary] 白名单判定异常，按拒绝处理（fail-closed，本轮跳过）: {e}"
             )
             return
+        await self._companion_maybe_register()
         # 0) /reset 代际识别（P0-1 修复 + 双保险）：
         # AstrBot 4.x 的 /reset 只清空 history、不换 conversation_id，
         # 所以"新会话"不能只认 cid。两条识别路径，任一命中即视为新的一代：
@@ -239,7 +244,8 @@ class EventHooksMixin:
             logger.warning(f"[memory_diary] 上下文哨兵异常: {e}")
 
         try:
-            await self._maybe_inject_context_recall(event, req)
+            if scope_from_event(event).is_group or not self._companion_yield_active():
+                await self._maybe_inject_context_recall(event, req)
         except Exception as e:
             logger.warning(f"[memory_diary] 按需历史召回异常，已安静跳过: {e}")
 
@@ -287,6 +293,8 @@ class EventHooksMixin:
                         )
 
             if not bool(self.config.get("enable_auto_inject", True)):
+                return
+            if not in_group and self._companion_yield_active():
                 return
 
             # b) 常规注入

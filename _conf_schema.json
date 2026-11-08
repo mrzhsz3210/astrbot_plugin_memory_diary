@@ -540,6 +540,29 @@
       "annotation_enabled": true
     }
   },
+  "companion_bridge_enabled": {
+    "description": "接入陪伴插件外部记忆",
+    "type": "bool",
+    "hint": "默认开启。检测到陪伴插件 7.0.7+ 的 companion.external-memory.v1 时注册外部记忆 Provider；未安装、版本不符或注册失败时不影响原有功能",
+    "default": true
+  },
+  "companion_yield_inject": {
+    "description": "陪伴插件召回时让出私聊注入",
+    "type": "bool",
+    "hint": "默认开启。Provider 生效且本地搜索开启时，私聊常规自动注入与按需历史召回改由陪伴插件的 read 管线完成，避免双注入；群聊与手动 /注入日记 不受影响。对方关闭自动上下文时建议关闭本项",
+    "default": true
+  },
+  "companion_write_evidence": {
+    "description": "陪伴记录签名存证",
+    "type": "string",
+    "hint": "接收陪伴插件的日记/梦境/主动消息副本，按角色和日期做 HMAC 存证，保留 90 天；auto = MemoryCompanion 活跃时不注册写回调，on = 强制注册（MemoryCompanion 旧桥将不再收到这些推送），off = 不注册",
+    "default": "auto",
+    "options": [
+      "auto",
+      "on",
+      "off"
+    ]
+  },
   "diary_timezone": {
     "description": "日记时区",
     "type": "string",

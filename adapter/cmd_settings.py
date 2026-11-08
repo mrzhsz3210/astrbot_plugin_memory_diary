@@ -384,6 +384,8 @@ class SettingsCommandsMixin:
             inject_info = "无日记可注入"
         elif not bool(self.config.get("enable_auto_inject", True)):
             inject_info = "已关闭（配置面板关了自动读取）"
+        elif not in_group and self._companion_yield_active():
+            inject_info = "本会话由陪伴插件按需召回"
         elif self._injected_cid.get(state_key) == cid:
             inject_info = "本会话已注入 ✅"
         else:
@@ -421,6 +423,11 @@ class SettingsCommandsMixin:
         ]
         if calib_line:
             lines.append(calib_line)
+        evidence_total, evidence_roles = (
+            self._companion_evidence_stats() if not in_group else (0, 0)
+        )
+        if evidence_total:
+            lines.append(f"· 陪伴记录存证：{evidence_total} 条（{evidence_roles} 个角色）")
         lines += [
             f"· 阈值：提醒 {remind_pct}% / 自动写日记 {auto_pct}%",
             f"· 本会话哨兵：{watch_info}",

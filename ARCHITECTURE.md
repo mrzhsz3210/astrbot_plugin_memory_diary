@@ -9,7 +9,8 @@ main.py                         插件注册 + 组装 + @filter.* 入口薄壳�
 ├── adapter/                    AstrBot 适配层实现（可以 import astrbot），每个模块一个 mixin
 │   ├── compat.py               AstrBot 可选能力的兼容导入（At/Image/TextPart/session_waiter/web…）
 │   │                           + resolve_data_dir()
-│   ├── lifecycle.py            启动清理：残留临时导出/备份包、插图临时文件
+│   ├── lifecycle.py            启动清理：残留临时导出/备份包、插图临时文件、过期陪伴存证
+│   ├── companion_bridge.py     陪伴插件 v1 Provider 发现/注册/注销、read/write/summary 与私聊让位
 │   ├── gate.py                 指令闸门：多 AI 防冲突、白名单一次性提示、参数解析/不可见字符
 │   ├── cmd_help_persona.py     /日记帮助、/形象
 │   ├── cmd_memo.py             /记一下、/查看备忘、/删除备忘
@@ -44,6 +45,7 @@ main.py                         插件注册 + 组装 + @filter.* 入口薄壳�
     ├── search_index.py         按 sender 隔离的内存 SQLite FTS、BM25、LRU 与失效
     ├── search_assist.py        严格 JSON 辅助边界与明确历史指代识别
     ├── external_material.py    签名素材队列、状态机、保留期与 AI 吸收契约
+    ├── companion_evidence.py   陪伴记录角色级存证副本、HMAC、幂等 upsert 与 90 天清理
     ├── crypto.py               可选整 ZIP AES-256-GCM / Scrypt 静态加密与原子转换
     ├── token_estimator.py      纯函数 token 估算：分类加权 + 消息/工具/多模态开销（v0.5.5）
     ├── imaging.py              生图通道：本地 SD-WebUI / ComfyUI、云端 OpenAI 兼容
@@ -55,8 +57,9 @@ main.py                         插件注册 + 组装 + @filter.* 入口薄壳�
     └── core.py                 MemoryDiaryCore：组合上述 mixin，管理内存状态/生命周期
 ```
 
-类组合：`MemoryDiaryPlugin(*AdapterMixins, MemoryDiaryCore, Star)`。适配层 mixin
-全部排在 `MemoryDiaryCore` 之前，覆盖关系与"方法都写在主类上"时完全一致。
+类组合：`MemoryDiaryPlugin(CompanionBridgeMixin, CompanionEvidenceMixin, *AdapterMixins, MemoryDiaryCore, Star)`。
+适配层与存证领域 mixin 全部排在 `MemoryDiaryCore` 之前；`companion_evidence.py` 不 import AstrBot，
+也不被 `memory_diary/` 其他模块反向依赖。
 
 > v0.6.1 之后（第二次解耦）：v0.5.0 拆出了 `memory_diary/`，但之后的功能迭代又把
 > 指令/钩子/Web 实现堆回了 main.py（涨到 3400+ 行）。这次把它们按功能搬进

@@ -626,3 +626,74 @@ async def test_image_usage_refund_returns_quota_and_never_goes_negative():
 
         plugin._image_usage_refund()
         assert plugin._image_usage_load()["count"] == 0, "退还不能把计数减成负数"
+
+
+async def test_comfyui_timeout_deletes_only_own_prompt_from_queue():
+    async with World(config=img_config(image_local_url="http://127.0.0.1:8188")) as world:
+        plugin = _plugin(world)
+        prompt_id = "pid-timeout-cleanup"
+        queue_deletes = []
+
+        async def fake_post(url, payload, timeout, headers):
+            if url.rstrip("/").endswith("/prompt"):
+                return {"prompt_id": prompt_id}
+            if url.rstrip("/").endswith("/queue"):
+                queue_deletes.append(payload)
+                return {}
+            raise AssertionError(f"未知 POST：{url}")
+
+        async def fake_get(url, timeout, **kwargs):
+            if "/object_info/CheckpointLoaderSimple" in url:
+                return json.dumps({
+                    "CheckpointLoaderSimple": {
+                        "input": {"required": {"ckpt_name": [["test-model.safetensors"]]}}
+                    }
+                }).encode()
+            if "/history/" in url:
+                await asyncio.sleep(60)
+            raise AssertionError(f"未知 GET：{url}")
+
+        calls = _install_http(plugin, post=fake_post, get=fake_get)
+        config = plugin._image_cfg()
+        config["image_timeout"] = 0.05
+        plugin._image_cfg = lambda: config
+        assert await plugin.generate_image("超时清理", (768, 1024)) is None
+        assert queue_deletes == [{"delete": [prompt_id]}]
+        assert not any("/interrupt" in call["url"] for call in calls["post"])
+
+
+async def test_comfyui_terminate_cancels_task_and_deletes_own_prompt():
+    async with World(config=img_config(image_local_url="http://127.0.0.1:8188")) as world:
+        plugin = _plugin(world)
+        prompt_id = "pid-terminate-cleanup"
+        submitted = asyncio.Event()
+        queue_deletes = []
+
+        async def fake_post(url, payload, timeout, headers):
+            if url.rstrip("/").endswith("/prompt"):
+                submitted.set()
+                return {"prompt_id": prompt_id}
+            if url.rstrip("/").endswith("/queue"):
+                queue_deletes.append(payload)
+                return {}
+            raise AssertionError(f"未知 POST：{url}")
+
+        async def fake_get(url, timeout, **kwargs):
+            if "/object_info/CheckpointLoaderSimple" in url:
+                return json.dumps({
+                    "CheckpointLoaderSimple": {
+                        "input": {"required": {"ckpt_name": [["test-model.safetensors"]]}}
+                    }
+                }).encode()
+            if "/history/" in url:
+                await asyncio.sleep(60)
+            raise AssertionError(f"未知 GET：{url}")
+
+        calls = _install_http(plugin, post=fake_post, get=fake_get)
+        task = asyncio.create_task(plugin.generate_image("终止清理", (768, 1024)))
+        plugin._image_tasks.add(task)
+        await asyncio.wait_for(submitted.wait(), timeout=1)
+        await plugin.terminate()
+        assert task.cancelled()
+        assert queue_deletes == [{"delete": [prompt_id]}]
+        assert not any("/interrupt" in call["url"] for call in calls["post"])

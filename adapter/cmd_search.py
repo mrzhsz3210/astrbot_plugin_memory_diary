@@ -202,6 +202,8 @@ class SearchCommandsMixin:
             self.config.get("local_search_enabled", True)
         ):
             return "本地日记搜索不可用。"
+        if not str(query or "").strip():
+            return "请提供 query 关键词，例如 query='窗台 薄荷'；可选 day 与 evidence_type。"
         day = str(day or "").replace("-", "")
         if day and (len(day) != 8 or not day.isdigit()):
             return "day 必须是 YYYYMMDD 或 YYYY-MM-DD。"

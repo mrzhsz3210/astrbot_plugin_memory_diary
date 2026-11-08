@@ -343,3 +343,12 @@ async def test_self_search_long_mixed_snippet_anchors_placeholder():
         assert "〔她的私人随笔〕" in snippet
         assert self_text not in snippet
         assert len(snippet) <= 242
+
+
+async def test_memory_diary_search_empty_query_returns_guidance():
+    async with World(config={"use_persona": False}) as world:
+        plugin = world.refactor.plugin
+        result = await plugin.memory_diary_search(make_event("查日记"))
+        assert "query" in result
+        assert "关键词" in result
+        assert "evidence_type" in result

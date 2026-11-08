@@ -317,3 +317,96 @@ def search_diaries(
         "tampered": tampered_any,
         "disabled": False,
     }
+
+
+def search_diaries_multi(
+    plugin,
+    sender_id: str,
+    terms: list[str],
+    *,
+    scope: str = "",
+    limit: int = 3,
+    evidence_type: str = "all",
+    max_terms: int = 16,
+    deadline: float | None = None,
+):
+    """在一份文档快照上执行多词 OR 检索，并按快照 IDF 合并候选。"""
+    import math
+    import time
+    from .search_index import document_matches, searchable_document_text
+
+    if not plugin._is_allowed(sender_id):
+        plugin._invalidate_search_index(sender_id)
+        return {"results": [], "total": 0, "tampered": False, "disabled": True}
+    if not bool(plugin.config.get("local_search_enabled", True)):
+        return {"results": [], "total": 0, "tampered": False, "disabled": True}
+    requested = normalize_evidence_type(evidence_type)
+    documents, tampered_any = _collect_search_documents(
+        plugin, sender_id, scope=scope, evidence_type=requested,
+    )
+    candidates = list(dict.fromkeys(
+        normalize_search_text(term) for term in terms if str(term or "").strip()
+    ))
+    if not candidates:
+        size = min(100, max(1, int(limit or 3)))
+        results = [_result_document(doc, []) for doc in documents[:size]]
+        return {
+            "results": results,
+            "total": len(documents),
+            "tampered": tampered_any,
+            "disabled": False,
+        }
+
+    private = requested in ("self", "all")
+    searchable = [
+        normalize_search_text(searchable_document_text(doc, private=private))
+        for doc in documents
+    ]
+    frequencies = {
+        term: sum(term in text for text in searchable)
+        for term in candidates
+    }
+    ordered = sorted(
+        (
+            (df, index, term)
+            for index, (term, df) in enumerate(frequencies.items())
+            if 0 < df <= max(1, int(len(documents) * 0.6))
+        ),
+        key=lambda item: (item[0], item[1]),
+    )
+    selected = [term for _, _, term in ordered[:max(1, int(max_terms or 16))]]
+    merged = {}
+    document_count = len(documents)
+    for term in selected:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        df = frequencies[term]
+        idf = math.log1p((document_count - df + 0.5) / (df + 0.5))
+        try:
+            ranked = plugin._search_index.search(
+                sender_id, documents, term, evidence_type=requested,
+            )
+        except Exception as exc:
+            plugin._search_index.invalidate(sender_id)
+            plugin._search_index.note_fallback()
+            logger.warning(f"[memory_diary] 内存检索索引不可用，已回退线性搜索: {exc}")
+            ranked = _linear_documents(documents, [term], requested)
+        for rank, doc in enumerate(ranked[:max(1, int(limit or 3))]):
+            key = (str(doc.get("day") or ""), str(doc.get("entry") or ""))
+            score, kept = merged.get(key, (0.0, None))
+            merged[key] = (score + idf / (rank + 1), kept or (doc, term))
+    ranked_results = sorted(
+        merged.values(),
+        key=lambda pair: (-pair[0], str(pair[1][0].get("day") or "")),
+    )
+    size = min(100, max(1, int(limit or 3)))
+    results = [
+        _result_document(doc, [term])
+        for _, (doc, term) in ranked_results[:size]
+    ]
+    return {
+        "results": results,
+        "total": len(merged),
+        "tampered": tampered_any,
+        "disabled": False,
+    }
