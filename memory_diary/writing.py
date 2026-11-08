@@ -6,6 +6,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from .common import strip_prompt_scaffold
+
 
 @dataclass
 class DiaryResult:
@@ -28,6 +30,7 @@ _EXPLICIT_TRIGGER_RE = re.compile(
     r"记住|记得|别忘|不要忘记|以后注意|你记错了|"
     r"不对\s*[，,：:]?\s*是|其实不是|应该是|纠正"
 )
+_QUOTED_RE = re.compile(r"「[^」]*」|\"[^\"]*\"", re.DOTALL)
 
 
 def has_diary_anchor(text: str) -> bool:
@@ -35,8 +38,9 @@ def has_diary_anchor(text: str) -> bool:
 
 
 def is_explicit_message(text: str) -> bool:
-    """偏召回：命中常见交代或纠正表述即进入显式通道。"""
-    return bool(_EXPLICIT_TRIGGER_RE.search(str(text or "")))
+    """偏召回：只按引号外的常见交代或纠正表述进入显式通道。"""
+    unquoted = _QUOTED_RE.sub("", str(text or ""))
+    return bool(_EXPLICIT_TRIGGER_RE.search(unquoted))
 
 
 def parse_diary_result(
@@ -89,7 +93,12 @@ def parse_diary_result(
 
 def ensure_explicit_notes(result: DiaryResult, required: list[str]) -> DiaryResult:
     """模型漏包或误判“不写”时，由确定性通道补齐用户原话。"""
-    required = [str(item) for item in required if str(item)]
+    cleaned = []
+    for item in required:
+        item = strip_prompt_scaffold(str(item)).strip()
+        if item:
+            cleaned.append(item)
+    required = cleaned
     if not required:
         return result
     if result.status == "no_diary":
@@ -97,7 +106,7 @@ def ensure_explicit_notes(result: DiaryResult, required: list[str]) -> DiaryResu
     notes = list(result.explicit_notes)
     text = result.text
     for item in required:
-        if any(item in note for note in notes):
+        if any(item in note or note in item for note in notes):
             continue
         text += ("\n\n" if text else "") + "【显式交代】\n" + item
         notes.append(item)

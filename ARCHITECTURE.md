@@ -31,7 +31,7 @@ main.py                         插件注册 + 组装 + @filter.* 入口薄壳�
 └── memory_diary/               领域核心（不 import astrbot，可单独测试）
     ├── constants.py            提示词、注入模板、默认值
     ├── errors.py               DiaryKeyUnavailable / DiaryTamperedError / DiaryCorruptError
-    ├── common.py               文件名 key、图片魔数嗅探、尾部机器标记剥离等无状态工具
+    ├── common.py               文件名 key、图片魔数嗅探、提示脚手架与尾部机器标记剥离等无状态工具
     ├── log.py                  日志兼容层（有 AstrBot 用其 logger，无则静默丢弃）
     ├── storage.py              文件布局、HMAC 验签、偏好/备忘、旧格式迁移、
     │                           迁移包导入导出、Web 数据、图片入 zip（v0.6）、

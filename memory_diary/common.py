@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""共享小工具：文件名 key、不可见字符 / 尾部机器标记剥离。"""
+"""共享小工具：文件名 key、不可见字符、提示脚手架与尾部机器标记剥离。"""
 
 import hashlib
 import re
@@ -13,6 +13,46 @@ INVISIBLE_CHARS_RE = re.compile("[\u200b-\u200f\u202a-\u202e\u2060\ufeff]")
 def strip_invisible(text: str) -> str:
     """剥离零宽与方向控制字符。"""
     return INVISIBLE_CHARS_RE.sub("", text or "")
+
+
+_SCAFFOLD_HINT_RE = re.compile(
+    r"<system[_-]reminder\b|\[你上一条回复是念成语音发出去的|"
+    r"User\s+ID\s*:|Current\s+datetime\s*:",
+    re.IGNORECASE,
+)
+_SYSTEM_REMINDER_RE = re.compile(
+    r"<system[_-]reminder\b[^>]*>.*?</system[_-]reminder\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_SYSTEM_REMINDER_UNCLOSED_RE = re.compile(
+    r"<system[_-]reminder\b[^\r\n]*", re.IGNORECASE
+)
+_VOICE_RECEIPT_RE = re.compile(
+    r"\[你上一条回复是念成语音发出去的.*?\]", re.DOTALL
+)
+_VOICE_RECEIPT_UNCLOSED_RE = re.compile(
+    r"\[你上一条回复是念成语音发出去的[^\]\r\n]*"
+)
+_USER_ID_FRAGMENT_RE = re.compile(
+    r"User\s+ID\s*:\s*\d+(?:\s*,\s*Nickname\s*:[^,\r\n<]*)?",
+    re.IGNORECASE,
+)
+_CURRENT_DATETIME_FRAGMENT_RE = re.compile(
+    r"Current\s+datetime\s*:[^\r\n<]*", re.IGNORECASE
+)
+
+
+def strip_prompt_scaffold(text: str) -> str:
+    """剥离固定形状的提示脚手架，保留用户真实发言。"""
+    cur = text or ""
+    if not _SCAFFOLD_HINT_RE.search(cur):
+        return cur
+    cur = _SYSTEM_REMINDER_RE.sub("", cur)
+    cur = _SYSTEM_REMINDER_UNCLOSED_RE.sub("", cur)
+    cur = _VOICE_RECEIPT_RE.sub("", cur)
+    cur = _VOICE_RECEIPT_UNCLOSED_RE.sub("", cur)
+    cur = _USER_ID_FRAGMENT_RE.sub("", cur)
+    return _CURRENT_DATETIME_FRAGMENT_RE.sub("", cur)
 
 
 # 尾部装饰剥离：其他插件（如 astrbot_plugin_qq_tools）会往消息文本尾部追加

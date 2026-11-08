@@ -22,6 +22,7 @@ if TYPE_CHECKING:  # 仅为类型标注；运行时不依赖 AstrBot
     from astrbot.api.event import AstrMessageEvent
     from astrbot.api.provider import ProviderRequest
 
+from .common import strip_prompt_scaffold
 from .constants import (
     AUTO_DIARY_DEFAULT_TIME,
     AUTO_DIARY_GRACE_SECONDS,
@@ -163,7 +164,9 @@ class ServiceMixin:
             role = msg.get("role", "")
             if role not in ("user", "assistant"):
                 continue
-            content = self._content_to_text(msg.get("content", "")).strip()
+            content = strip_prompt_scaffold(
+                self._content_to_text(msg.get("content", ""))
+            ).strip()
             if not content:
                 continue
             speaker = "用户" if role == "user" else "我"
@@ -248,8 +251,10 @@ class ServiceMixin:
         for msg in history:
             if not isinstance(msg, dict) or msg.get("role") != "user":
                 continue
-            text = self._content_to_text(msg.get("content", ""))
-            if not text.strip() or self._is_op_command(text):
+            text = strip_prompt_scaffold(
+                self._content_to_text(msg.get("content", ""))
+            ).strip()
+            if not text or self._is_op_command(text):
                 continue
             if is_explicit_message(text) and text not in items:
                 items.append(text)
