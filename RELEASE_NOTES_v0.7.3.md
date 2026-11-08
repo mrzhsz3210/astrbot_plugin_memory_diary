@@ -1,8 +1,8 @@
-# 记忆日记 v0.7.3 发布说明（开发稿）
+# 记忆日记 v0.7.3 发布说明
 
 ## 陪伴插件外部记忆 Provider
 
-- 接入 `astrbot_plugin_private_companion` 7.0.7 起提供的 `companion.external-memory.v1`；建议联调使用 7.1.6，AstrBot 需 4.27.2+。
+- 接入 `astrbot_plugin_private_companion` 7.0.7 起提供的 `companion.external-memory.v1`，AstrBot 需 4.27.2+。注意：对方 7.1.6–7.1.7 原包存在注册表实例错位问题（第三方注册必然失败，issue #608），我们已提交修复 PR #612；对方发布修复版前，联动会安静降级、本插件全部功能不受影响。
 - 单注册 Provider ID 为 `astrbot_plugin_memory_diary.memory`，priority=10，默认回调预算 5 秒；`handles_model_memory` 保持默认 `False`。
 - `read`：仅在身份可解析、白名单允许的已授权私聊中返回最多 3 条验签日记原文片段，遵守请求的字符预算；群聊和无法识别身份的请求不返回资料。
 - `write`：接收陪伴插件已保存的日记/梦境/主动消息**存证副本**，以 `source_plugin + memory_id` 幂等更新，按 installation、Bot、角色与绑定修订隔离。
@@ -28,4 +28,4 @@
 
 - 对方注入的时序和体积不完全受本插件控制，上下文哨兵可能低估占用；本版不调整哨兵算法。
 - 回退到 v0.7.2 前，将三个陪伴兼容配置关闭；旧版不认识新增存证目录。旧版不会读取或迁移这些记录，如需彻底移除请按上文手动删除。
-- 发布前仍需在陪伴插件 7.1.6 真机上完成接口签名确认与六步联调；开发期验证全部使用 mock，不访问运行中的 AstrBot 实例。
+- 真机联调已完成（7.1.6 + 本地注册表补丁）：作者六步联调 6/6 通过，read 召回、summary 计数、write 存证（验签通过）、故障降级、宿主重载重注册均实测；回归 636 项全绿。
