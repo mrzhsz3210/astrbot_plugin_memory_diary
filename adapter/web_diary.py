@@ -239,6 +239,17 @@ class WebDiaryApiMixin:
     async def web_list_users(self):
         users = []
         owner_map = None
+        # v0.7.6（Bug C）：外部删除告警——登记在册但文件凭空消失的日记包
+        alerts = []
+        try:
+            for item in self._vanished_diary_alerts():
+                alerts.append(
+                    f"日记包 {item['file']}（归属 {item['owner'] or '未知'}）"
+                    "登记在册但已凭空消失，疑似被外部删除；"
+                    f"可用备份 {len(item['backups'])} 份"
+                )
+        except Exception as e:
+            logger.warning(f"[memory_diary] Web 外部删除告警汇总失败: {e}")
         for path in sorted(self.data_dir.glob("diary_*.zip")):
             file_key = path.stem[len("diary_"):]
             if not self._valid_file_key(file_key):
@@ -267,7 +278,19 @@ class WebDiaryApiMixin:
                 size = path.stat().st_size
             except OSError:
                 size = 0
-            users.append({
+            # v0.7.6（Bug C）：全量条目验签失败 = 疑似被外部改写/捏造
+            tampered_all = False
+            if owner:
+                try:
+                    tampered_all = self._all_entries_tampered(owner)
+                except Exception:
+                    tampered_all = False
+            if tampered_all:
+                alerts.append(
+                    f"日记包 {path.name}（归属 {owner}）全部条目验签失败，"
+                    "疑似被外部改写；已锁死读写，可用 /恢复日记 从备份恢复"
+                )
+            item = {
                 "file_key": file_key,
                 "nickname": nick or "（未知昵称）",
                 # 主人 QQ 给界面显示用（v0.6.1）：昵称可以是纯不可见字符，
@@ -279,8 +302,15 @@ class WebDiaryApiMixin:
                 "day_count": day_count,
                 "latest": latest,
                 "size": size,
-            })
-        return _web_json({"users": users})
+            }
+            # v0.7.6（Bug C）：告警字段只在真的异常时才出现（保持常态响应形状不变）
+            if tampered_all:
+                item["alert"] = "tampered"
+            users.append(item)
+        resp = {"users": users}
+        if alerts:
+            resp["alerts"] = alerts
+        return _web_json(resp)
 
     async def web_list_days(self, file_key: str):
         if not self._valid_file_key(file_key):

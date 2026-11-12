@@ -1085,13 +1085,13 @@ _CONF_README_ORDER = [
     "group_history_multiplier", "write_min_ratio", "extra_instruction",
     "no_write_alert_threshold", "current_self_enabled", "current_self_rewrite_every",
     # 10.7 隐私与安全
-    "allowed_users", "show_diary_after_write",
+    "allowed_users", "show_diary_after_write", "persona_isolation",
     # 10.8 反馈风格
     "use_persona",
     # 10.9 群聊行为
     "group_require_at",
     # 10.10 限额与防护
-    "diary_op_interval",
+    "diary_op_interval", "trash_retention_days", "backup_copies",
     # 10.11 界面
     "web_diary_brand", "external_source_display",
     # 10.12 插图配置与形象档案（v0.6，顺序与 README bullet 一致）
@@ -1145,9 +1145,12 @@ _CONF_LABEL_PREFIXES = [
     ("交接信每几篇整篇重写", "current_self_rewrite_every"),
     ("允许使用插件的用户", "allowed_users"),
     ("写完后展示日记全文", "show_diary_after_write"),
+    ("人格隔离", "persona_isolation"),
     ("人设口吻", "use_persona"),
     ("群里只响应@我的指令", "group_require_at"),
     ("日记操作间隔", "diary_op_interval"),
+    ("回收站保留天数", "trash_retention_days"),
+    ("自动备份保留份数", "backup_copies"),
     ("（已废弃）启用上下文哨兵", "enable_context_watch"),
     ("日记本页面的称呼", "web_diary_brand"),
     ("外部来源显示名", "external_source_display"),

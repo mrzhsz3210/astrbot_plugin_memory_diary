@@ -31,7 +31,11 @@ class AnnotationCommandsMixin:
             yield event.plain_result("📖 批注功能未开启（管理员可在配置页开启）。")
             return
         yield event.plain_result(
-            self.annotations_view_text(event.get_sender_id())
+            self.annotations_view_text(
+                await self._diary_identity(
+                    event.unified_msg_origin, event.get_sender_id()
+                )
+            )
         )
 
     async def _handle_writeback_annotation(self, event: AstrMessageEvent):
@@ -45,8 +49,8 @@ class AnnotationCommandsMixin:
             yield event.plain_result("📖 批注功能未开启（管理员可在配置页开启）。")
             return
 
-        sender_id = event.get_sender_id()
         umo = event.unified_msg_origin
+        sender_id = await self._diary_identity(umo, event.get_sender_id())
         # 列之前先用同一个编号口径探一下有没有可写回的批注（无则直接给固定文案）
         try:
             has_any = self.annotation_by_index(sender_id, 1) is not None

@@ -371,8 +371,12 @@ class World:
         "· /写回批注 —— 私聊专用：把聊明白的批注写回日记（需确认，可悬置）\n"
     )
     _HELP_RECALL_LINE_V07 = "· /回忆 [全部|私人随笔] 关键词 —— 默认查找用户相关证据，可显式回查全部类型或 AI 私人随笔\n"
+    # v0.7.6 回收站差分豁免：帮助菜单新增的 /恢复日记 一行只存在于 refactor 侧；
+    # 删除话术里"回收站可找回"的新表述归一回 baseline 的"不可恢复"旧表述。
+    _HELP_RESTORE_LINE_V076 = "· /恢复日记 —— 私聊专用：从回收站找回最近删除的日记\n"
 
     def normalise_text(self, text: str, inst: Instance) -> str:
+        import re as _re
         replacements = [
             (str(inst.data_dir), "<DATA_DIR>"),
             (str(inst.root), "<INSTANCE_ROOT>"),
@@ -391,6 +395,15 @@ class World:
         out = out.replace(self._HELP_IMAGE_LINE_V06, "")
         out = out.replace(self._HELP_ANNOTATION_LINES_V06, "")
         out = out.replace(self._HELP_RECALL_LINE_V07, "")
+        out = out.replace(self._HELP_RESTORE_LINE_V076, "")
+        # v0.7.6 回收站：删除二次确认与成功话术里的新表述归一回 baseline 旧表述
+        out = _re.sub(
+            r"⚠️ 将删除你所有 (\d+) 天的日记。删除的内容会先放进回收站，"
+            r"\d+ 天内可发 /恢复日记 找回（逾期清理后才不可恢复）。",
+            r"⚠️ 将删除你所有 \1 天的日记，此操作不可恢复。",
+            out,
+        )
+        out = _re.sub(r"\n（\d+ 天内发 /恢复日记 还能找回。）", "", out)
         for needle, marker in replacements:
             out = out.replace(needle, marker)
             out = out.replace(needle.replace("\\", "\\\\"), marker)

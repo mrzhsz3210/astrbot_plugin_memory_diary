@@ -136,7 +136,10 @@ class ViewCommandsMixin:
             )
             return
 
-        sender_id = event.get_sender_id()
+        # v0.7.6 人格隔离：只能看到当前人格名下的日记
+        sender_id = await self._diary_identity(
+            event.unified_msg_origin, event.get_sender_id()
+        )
         # 复审 12：密钥不可用时不要显示成"被篡改"——验签根本做不了，先说明
         if self._secret_key() is None:
             yield event.plain_result(

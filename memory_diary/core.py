@@ -12,7 +12,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .annotation import AnnotationMixin
-from .common import strip_invisible
+from .backup import BackupMixin
+from .common import split_diary_identity, strip_invisible
 from .constants import PLUGIN_NAME, _STATE_CAP
 from .current_self import CurrentSelfMixin
 from .crypto import StorageCryptoMixin
@@ -23,11 +24,14 @@ from .log import logger
 from .service import ServiceMixin
 from .search_index import SearchIndexCache
 from .storage import StorageMixin
+from .trash import TrashMixin
 
 
 class MemoryDiaryCore(
     StorageCryptoMixin,
     StorageMixin,
+    TrashMixin,
+    BackupMixin,
     ServiceMixin,
     ImagingMixin,
     IllustrationMixin,
@@ -61,6 +65,7 @@ class MemoryDiaryCore(
         "回忆",
         "recall",
         "删除日记",
+        "恢复日记",
         "日记状态",
         "日记范围",
         "日记帮助",
@@ -72,6 +77,7 @@ class MemoryDiaryCore(
         "diary",
         "diary_view",
         "diary_delete",
+        "diary_restore",
         "diary_status",
         "diary_scope",
         "diary_help",
@@ -143,6 +149,8 @@ class MemoryDiaryCore(
         self._reset_pending: set = set()
         # 无效时区只警告一次
         self._tz_warned = False
+        # v0.7.6 人格隔离：每个 sender 只提示一次"既有日记仍归属默认人格"
+        self._persona_hint_logged: set = set()
         # 阈值顺序被截断只警告一次
         self._ratio_warned = False
         # 旧开关 enable_context_watch 的迁移提示只记一次
@@ -205,7 +213,9 @@ class MemoryDiaryCore(
 
         - 名单为空 → 恒 True（老用户零感知）；
         - 名单非空且 sender_id 为空/不在名单 → False（fail closed，取不到身份一律不放行）；
-        - ID 按字符串精确匹配。
+        - ID 按字符串精确匹配；
+        - v0.7.6：传入的是人格隔离身份（``<QQ>::p::<persona>``）时按原始 QQ 判定——
+          白名单是用户级门禁，不因切换人格而改变。
         """
         allowed = self._allowed_user_ids()
         if not allowed:
@@ -213,7 +223,7 @@ class MemoryDiaryCore(
         sid = str(sender_id or "").strip()
         if not sid:
             return False
-        return sid in allowed
+        return split_diary_identity(sid)[0] in allowed
 
     async def initialize(self):
         """插件被激活时调用：载入自动写日记的私聊用户表，启动后台定时任务。"""

@@ -115,3 +115,70 @@ def ensure_explicit_notes(result: DiaryResult, required: list[str]) -> DiaryResu
     if result.status in ("retry", "degraded"):
         result.status = "ok"
     return result
+
+
+# ---------------------------------------------------------------------------
+# 思维链泄漏兜底（v0.7.6，Bug A）
+#
+# 推理模型（Intern-S2 等）的产出可能把英文思维链混进 content——端点把
+# reasoning 拼进正文、或模型干脆把"思考过程"当日记写。上游（AstrBot 非
+# 流式路径）只剥 <think> 标签，挡不住无标签的拼接，插件侧必须有
+# 不依赖上游的兜底：先剥标签块，再做特征识别，命中则重写/降级。
+# ---------------------------------------------------------------------------
+
+# 闭合的 <think>/<thinking> 块；未闭合的从标签处吃到文末（模型被截断的场景）
+_REASONING_TAG_BLOCK_RE = re.compile(
+    r"<think(?:ing)?>.*?</think(?:ing)?\s*>", re.IGNORECASE | re.DOTALL
+)
+_REASONING_TAG_TAIL_RE = re.compile(
+    r"<think(?:ing)?>.*$", re.IGNORECASE | re.DOTALL
+)
+
+# 英文推理句式的行首特征（保守清单，宁可漏判不要误伤正常日记）
+_REASONING_LINE_RE = re.compile(
+    r"^\s*(?:"
+    r"Okay(?:,| so| let)|Ok(?:,| so)|Let me|Let's|I need to|I should|I will|I'll|"
+    r"I’m|I'm |The user|Wait[, ]|Hmm|Alright|Thinking|Step \d|First[, ]|"
+    r"So (?:the|I|let)|Now (?:I|the|let)|Actually[, ]|Looking at|Based on"
+    r")",
+    re.IGNORECASE,
+)
+
+_CJK_RE = re.compile(r"[一-鿿぀-ヿ가-힯]")
+
+
+def strip_reasoning_blocks(text: str) -> str:
+    """剥离 <think>/<thinking> 标签块（含未闭合尾巴）；无标签时原文返回。"""
+    cur = str(text or "")
+    if "<think" not in cur.lower():
+        return cur
+    cur = _REASONING_TAG_BLOCK_RE.sub("", cur)
+    return _REASONING_TAG_TAIL_RE.sub("", cur)
+
+
+def _cjk_ratio(text: str) -> float:
+    chars = [c for c in str(text or "") if not c.isspace()]
+    if not chars:
+        return 0.0
+    return sum(1 for c in chars if _CJK_RE.match(c)) / len(chars)
+
+
+def looks_like_reasoning_leak(text: str) -> bool:
+    """文本是否疑似混入英文思维链：推理句式行占比超阈值且达到一定行数。"""
+    lines = [ln for ln in str(text or "").splitlines() if ln.strip()]
+    if len(lines) < 3:
+        return False
+    hits = sum(1 for ln in lines if _REASONING_LINE_RE.match(ln))
+    return hits >= 3 and hits / len(lines) >= 0.25
+
+
+def language_mismatch(text: str, reference: str) -> bool:
+    """语料为中文而产出主体为英文（思维链泄漏的典型伴随特征）。
+
+    reference 为空或本身也不含中文时不判（没有可对齐的基准）；
+    产出很短时不判（简记本来就可能很短，误判代价高）。
+    """
+    text = str(text or "")
+    if len(text) < 120 or _cjk_ratio(reference) < 0.2:
+        return False
+    return _cjk_ratio(text) < 0.1

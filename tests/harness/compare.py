@@ -166,6 +166,15 @@ def snapshot(
     """
     import fnmatch
 
+    # v0.7.6 回收站差分豁免：删除在 refactor 侧改为软删除（trash/ 目录），
+    # baseline 没有回收站概念。回收站内容/格式由 test_v076_* 单独钉住，
+    # 这里统一排除 trash/ 目录，保持既有差分用例比较的是日记本体状态。
+    # v0.7.6 Bug C 同理豁免：滚动备份 backups/ 与日记登记册
+    # diary_registry.json 都是 refactor 侧新设施，由 test_v076_* 单独钉住。
+    exclude = tuple(exclude) + (
+        "trash", "trash/*", "backups", "backups/*", "diary_registry.json",
+    )
+
     result: dict = {}
     if not data_dir.exists():
         return result

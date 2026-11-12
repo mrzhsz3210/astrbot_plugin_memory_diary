@@ -306,18 +306,21 @@ class SettingsCommandsMixin:
             return
         sender_id = event.get_sender_id()
         umo = event.unified_msg_origin
+        # v0.7.6 人格隔离：状态页展示的是当前人格名下的日记本；
+        # 哨兵/注入状态键仍按原始 sender（与 hooks 的状态命名空间一致）
+        diary_id = await self._diary_identity(umo, sender_id)
         # 群聊里不展示个人日记统计与实例级校准观测（同群可见，属元数据暴露）；
         # 上下文占用/哨兵状态是群会话本身的信息，保留展示。
         in_group = bool(event.get_group_id())
 
         # 日记信息：先做全量 zip 健康检查，损坏时不能显示“0 字，校验通过”
-        corrupt = self._corrupt_notice(sender_id)
+        corrupt = self._corrupt_notice(diary_id)
         if corrupt:
             latest_content, latest_tampered, latest_name = "", False, None
             entries = []
         else:
-            latest_content, latest_tampered, latest_name = self._load_latest(sender_id)
-            entries = self._list_entries(sender_id)
+            latest_content, latest_tampered, latest_name = self._load_latest(diary_id)
+            entries = self._list_entries(diary_id)
         if corrupt:
             diary_info = (
                 "⚠️ 日记文件已损坏（CRC 校验失败或无法打开；"
@@ -421,6 +424,23 @@ class SettingsCommandsMixin:
             f"· 日记：{diary_info}",
             context_line,
         ]
+        # v0.7.6（Bug C）：外部删除/篡改告警——登记包凭空消失或全量验签失败，
+        # 明示"疑似被外部改动/删除"并给出备份与官方恢复路径（仅私聊展示）
+        if not in_group:
+            try:
+                for item in self._vanished_diary_alerts(sender_id):
+                    lines.append(
+                        f"· ⚠️ 疑似外部删除：日记包 {item['file']} 登记在册但已消失"
+                        f"（可用备份 {len(item['backups'])} 份，发 /恢复日记 查看恢复）"
+                    )
+                if self._all_entries_tampered(diary_id):
+                    backups = self.list_diary_backups(diary_id)
+                    lines.append(
+                        "· ⚠️ 疑似外部改写：当前日记包全部条目验签失败，已按防篡改规则锁死读写"
+                        f"（可用备份 {len(backups)} 份，发 /恢复日记 从备份恢复）"
+                    )
+            except Exception as e:
+                logger.warning(f"[memory_diary] 外部破坏告警汇总失败: {e}")
         if calib_line:
             lines.append(calib_line)
         evidence_total, evidence_roles = (
@@ -527,11 +547,15 @@ class SettingsCommandsMixin:
         # P2-3：直接解析原始消息，支持带空格的时间段写法
         arg = self._command_arg(event)
 
-        corrupt = self._corrupt_notice(sender_id)
+        # v0.7.6 人格隔离：可注入的篇目来自当前人格名下的日记本
+        diary_id = await self._diary_identity(
+            event.unified_msg_origin, sender_id
+        )
+        corrupt = self._corrupt_notice(diary_id)
         if corrupt:
             yield event.plain_result(corrupt)
             return
-        entries = self._list_entries(sender_id)
+        entries = self._list_entries(diary_id)
         if not entries:
             yield event.plain_result(
                 await self._say(

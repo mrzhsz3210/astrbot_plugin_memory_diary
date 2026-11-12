@@ -21,7 +21,10 @@ class MemoCommandsMixin:
         """把一件重要的事记下来，下次写日记时重点写进画像。用法：/记一下 要记住的事（``main.memo_cmd`` 的实现）"""
         if not self._should_respond(event):
             return
-        sender_id = event.get_sender_id()
+        # v0.7.6 人格隔离：备忘跟随当前人格的日记本
+        sender_id = await self._diary_identity(
+            event.unified_msg_origin, event.get_sender_id()
+        )
         raw_text = event.message_str or ""
         # P3-13：零宽/方向控制字符只用于「判定指令与内容」，备忘内容一律保存原文——
         # 对整条消息剥离会破坏 ZWJ emoji（👨\u200d👩\u200d👧 会被拆成三个独立人像）
@@ -93,7 +96,9 @@ class MemoCommandsMixin:
                 )
             )
             return
-        sender_id = event.get_sender_id()
+        sender_id = await self._diary_identity(
+            event.unified_msg_origin, event.get_sender_id()
+        )
         memos = self._load_memos(sender_id)
         if not memos:
             yield event.plain_result(
@@ -129,7 +134,9 @@ class MemoCommandsMixin:
                 )
             )
             return
-        sender_id = event.get_sender_id()
+        sender_id = await self._diary_identity(
+            event.unified_msg_origin, event.get_sender_id()
+        )
         memos = self._load_memos(sender_id)
         if not memos:
             yield event.plain_result(
@@ -210,12 +217,8 @@ class MemoCommandsMixin:
                     # 同分钟的两条备忘会被一次删掉两条却只提示删一条；cur 是刚重新
                     # 读取的列表，下标此刻有效，不存在"序号漂移"问题。
                     rest = cur[: idx - 1] + cur[idx:]
-                    data = self._load_pref_data(sender_id)
-                    if rest:
-                        data["memos"] = rest
-                    else:
-                        data.pop("memos", None)
-                    if not self._save_pref_data(sender_id, data):
+                    # v0.7.6：备忘按人格分槽存储，回写必须走存储层的分槽口径
+                    if not self._save_memos_list(sender_id, rest):
                         await ev.send(
                             ev.plain_result(
                                 "📌 保存失败（数据目录不可写或磁盘已满），备忘未改动。"

@@ -1171,12 +1171,13 @@ function visibleText(s) {
  * 昵称不可见时降级「🔒 QQ xxx（N 天）」；连主人 QQ 都未知时保持旧文案。 */
 function userLabel(u) {
   const lock = u.protected ? "🔒 " : "";
+  const warn = u.alert === "tampered" ? "⚠️ " : "";
   const nick = visibleText(u.nickname);
   const qq = String(u.owner || "").trim();
   const days = `${u.day_count} 天`;
-  if (nick && qq) return `${lock}${nick}（QQ ${qq} · ${days}）`;
-  if (qq) return `${lock}QQ ${qq}（${days}）`;
-  return `${lock}${u.nickname}（${days}）`;
+  if (nick && qq) return `${warn}${lock}${nick}（QQ ${qq} · ${days}）`;
+  if (qq) return `${warn}${lock}QQ ${qq}（${days}）`;
+  return `${warn}${lock}${u.nickname}（${days}）`;
 }
 
 /* 目录/正文读取失败（P2-18）：toast 后端 message，并把右页置成明确的
@@ -1219,6 +1220,16 @@ async function loadUsers() {
   clearSelectedDays();
   const r = await bridge.apiGet("users");
   users = r.users || [];
+  // v0.7.6：外部删除/篡改告警横幅（登记包凭空消失、全量验签失败）
+  const banner = $("alertBanner");
+  const alerts = Array.isArray(r.alerts) ? r.alerts.filter(Boolean) : [];
+  if (alerts.length) {
+    banner.hidden = false;
+    banner.textContent = `⚠️ 疑似外部改动：${alerts.join("；")}`;
+  } else {
+    banner.hidden = true;
+    banner.textContent = "";
+  }
   const sel = $("userSelect");
   sel.innerHTML = "";
   for (const u of users) {

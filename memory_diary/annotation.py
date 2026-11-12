@@ -41,6 +41,7 @@ from .constants import (
 )
 from .log import logger
 from .token_estimator import estimate_text
+from .writing import looks_like_reasoning_leak, strip_reasoning_blocks
 
 
 class AnnotationMixin:
@@ -408,9 +409,14 @@ class AnnotationMixin:
                 logger.warning(f"[memory_diary] 批注生成调用失败，本轮跳过: {e}")
                 return {**result, "reason": "llm_error"}
 
-            title, candidates = self._parse_annotation_payload(
-                getattr(resp, "completion_text", "")
+            # v0.7.6（Bug A）：批注产出同样先剥思维链；疑似泄漏按跳过处理
+            ann_output = strip_reasoning_blocks(
+                getattr(resp, "completion_text", "") or ""
             )
+            if looks_like_reasoning_leak(ann_output):
+                logger.warning("[memory_diary] 批注生成结果疑似混入思维链，本轮跳过")
+                return {**result, "reason": "reasoning_leak"}
+            title, candidates = self._parse_annotation_payload(ann_output)
             if not candidates:
                 logger.warning("[memory_diary] 批注生成结果不是合法 JSON 数组，本轮跳过")
                 return {**result, "reason": "parse_error"}
@@ -929,9 +935,14 @@ class AnnotationMixin:
             except Exception as e:
                 logger.warning(f"[memory_diary] 写回蒸馏调用失败: {e}")
                 return None
-            payload = self._extract_json_payload(
-                getattr(resp, "completion_text", "")
+            # v0.7.6（Bug A）：写回蒸馏同样剥思维链，疑似泄漏按失败处理
+            distill_output = strip_reasoning_blocks(
+                getattr(resp, "completion_text", "") or ""
             )
+            if looks_like_reasoning_leak(distill_output):
+                logger.warning("[memory_diary] 写回蒸馏结果疑似混入思维链")
+                return None
+            payload = self._extract_json_payload(distill_output)
             if not isinstance(payload, dict):
                 logger.warning("[memory_diary] 写回蒸馏结果不是合法 JSON 对象")
                 return None

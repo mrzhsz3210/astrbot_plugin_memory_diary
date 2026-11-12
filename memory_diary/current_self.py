@@ -11,6 +11,7 @@ import zipfile
 
 from .log import logger
 from .token_estimator import estimate_text
+from .writing import looks_like_reasoning_leak, strip_reasoning_blocks
 
 
 class CurrentSelfMixin:
@@ -520,7 +521,13 @@ class CurrentSelfMixin:
         except Exception as e:
             logger.warning(f"[memory_diary] 交接信模型调用失败: {e}")
             return False
-        parsed = self._parse_current_self_output(resp.completion_text)
+        # v0.7.6（Bug A）：交接信同样吃思维链泄漏兜底——先剥标签块，
+        # 疑似泄漏时按"保留上一版"处理（与 JSON 解析失败同一保护口径）
+        raw_output = strip_reasoning_blocks(resp.completion_text or "")
+        if looks_like_reasoning_leak(raw_output):
+            logger.warning("[memory_diary] 交接信输出疑似混入思维链，保留上一版")
+            return False
+        parsed = self._parse_current_self_output(raw_output)
         if parsed is None:
             logger.warning("[memory_diary] 交接信输出不是合法 JSON，保留上一版")
             return False

@@ -30,7 +30,10 @@ class DeleteCommandsMixin:
             )
             return
 
-        sender_id = event.get_sender_id()
+        # v0.7.6 人格隔离：删除只作用于当前人格名下的日记
+        sender_id, persona_name = await self._diary_identity_info(
+            event.unified_msg_origin, event.get_sender_id()
+        )
         remaining = self._op_cooldown_remaining(sender_id)
         if remaining > 0:
             canned = f"⏳ 日记操作太频繁啦，请 {remaining} 分钟后再操作。"
@@ -45,6 +48,12 @@ class DeleteCommandsMixin:
             )
             return
 
+        # v0.7.6：删除前列行清理过期回收站条目（保留期承诺的例行维护）
+        try:
+            self._purge_trash()
+        except Exception:
+            pass
+
         entries = self._list_entries(sender_id)
         if not entries:
             yield event.plain_result(
@@ -57,8 +66,10 @@ class DeleteCommandsMixin:
             return
 
         lines = [f"{i}. {self._entry_label(n)}" for i, n in enumerate(entries, 1)]
+        # v0.7.6 人格隔离：多人格用户先看清"现在删的是哪个人格的本子"
+        scope_note = f"（当前人格「{persona_name}」名下）" if persona_name else ""
         yield event.plain_result(
-            f"📖 你目前有 {len(entries)} 天的日记：\n"
+            f"📖 你目前有 {len(entries)} 天的日记{scope_note}：\n"
             + "\n".join(lines)
             + "\n\n回复「全部」删除所有日记；回复序号删除那天；回复日期（如 2026-10-23）删除那天；"
             "回复时间段（如 2026-10-20 到 2026-10-23）删除区间内所有天。"
@@ -102,6 +113,13 @@ class DeleteCommandsMixin:
                     # P3-9 修复：删除失败（权限/IO）必须明说，不能谎报"已删除"
                     if self._delete_diary(sender_id):
                         self._op_mark(sender_id)
+                        # v0.7.6 回收站：提示恢复途径（suffix 不过 _say，防转述丢失）
+                        trash_days = self._trash_retention_days()
+                        hint = (
+                            f"\n（{trash_days} 天内发 /恢复日记 还能找回。）"
+                            if trash_days > 0
+                            else ""
+                        )
                         await ev.send(
                             ev.plain_result(
                                 await self._say(
@@ -110,6 +128,7 @@ class DeleteCommandsMixin:
                                     "用户确认后，他的全部日记已经删掉了。用你自己的口吻确认这件事，"
                                     "语气体贴一点（日记是回忆），一句话即可。",
                                 )
+                                + hint
                             )
                         )
                     else:
@@ -136,10 +155,23 @@ class DeleteCommandsMixin:
             targets = None
             if low in ("全部", "all"):
                 pending_all["v"] = True
+                # v0.7.6：二次确认说清「删的是哪个人格名下的日记、删完能去哪找回」，
+                # 避免多人格用户"以为在删别人格的，结果删了自己的"
+                trash_days = self._trash_retention_days()
+                if persona_name:
+                    scope_text = f"你在人格「{persona_name}」名下的全部 {len(entries)} 天日记"
+                else:
+                    scope_text = f"你所有 {len(entries)} 天的日记"
+                if trash_days > 0:
+                    warn_text = (
+                        f"⚠️ 将删除{scope_text}。删除的内容会先放进回收站，"
+                        f"{trash_days} 天内可发 /恢复日记 找回（逾期清理后才不可恢复）。"
+                    )
+                else:
+                    warn_text = f"⚠️ 将删除{scope_text}，此操作不可恢复。"
                 await ev.send(
                     ev.plain_result(
-                        f"⚠️ 将删除你所有 {len(entries)} 天的日记，此操作不可恢复。"
-                        "回复「确认删除」执行，回复其他任何内容取消。"
+                        warn_text + "回复「确认删除」执行，回复其他任何内容取消。"
                     )
                 )
                 controller.keep(timeout=60, reset_timeout=True)
@@ -204,6 +236,13 @@ class DeleteCommandsMixin:
                 self._op_mark(sender_id)
                 labels = "、".join(self._entry_label(n) for n in targets)
                 canned = f"📖 已删除 {deleted} 天的日记：{labels}"
+                # v0.7.6 回收站：提示恢复途径（suffix 不过 _say，防转述丢失）
+                trash_days = self._trash_retention_days()
+                hint = (
+                    f"\n（{trash_days} 天内发 /恢复日记 还能找回。）"
+                    if trash_days > 0
+                    else ""
+                )
                 await ev.send(
                     ev.plain_result(
                         await self._say(
@@ -213,6 +252,7 @@ class DeleteCommandsMixin:
                             f"请用你自己的口吻确认删除完成（必须原样保留日记日期：{labels}），"
                             "语气体贴一点（日记是回忆），一两句话即可。",
                         )
+                        + hint
                     )
                 )
             else:

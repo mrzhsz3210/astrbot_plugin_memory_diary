@@ -31,7 +31,7 @@ from .memory_diary.log import logger
     "astrbot_plugin_memory_diary",
     "mrzhsz3210",
     "指令/定时自动触发写日记（用户画像 / 对用户的评价 / 给未来自己的叮嘱），新上下文自动读取日记，上下文将满时自动提醒，支持每天定时自动写完整日记。",
-    "v0.7.5",
+    "v0.7.6",
 )
 class MemoryDiaryPlugin(CompanionBridgeMixin, CompanionEvidenceMixin, *AdapterMixins, MemoryDiaryCore, Star):
     """AstrBot 插件入口：只保留注册与 handler 薄壳，实现见 adapter/ 与 memory_diary/。"""
@@ -156,6 +156,15 @@ class MemoryDiaryPlugin(CompanionBridgeMixin, CompanionEvidenceMixin, *AdapterMi
     async def delete_diary(self, event: AstrMessageEvent):
         """删除日记（仅本人、仅私聊）：可选全部 / 某天 / 时间段。"""
         async for result in self._handle_delete_diary(event):
+            yield result
+
+    # ------------------------- 指令：恢复日记（回收站） -------------------------
+    # 实现：adapter/cmd_restore.py
+
+    @filter.command("恢复日记", alias={"diary_restore"})
+    async def restore_diary(self, event: AstrMessageEvent):
+        """恢复日记（仅本人、仅私聊）：从回收站找回最近删除的日记。"""
+        async for result in self._handle_restore_diary(event):
             yield result
 
     # ------------------------- 指令：导出 / 导入日记（迁移包） -------------------------

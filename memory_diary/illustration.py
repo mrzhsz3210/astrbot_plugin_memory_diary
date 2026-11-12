@@ -39,6 +39,7 @@ from .constants import (
     PERSONA_IMAGE_DESC_PROMPT,
 )
 from .log import logger
+from .writing import strip_reasoning_blocks
 
 
 class IllustrationMixin:
@@ -978,7 +979,10 @@ class IllustrationMixin:
                 ),
                 timeout=self._PERSONA_DESC_LLM_TIMEOUT,
             )
-            text = str(getattr(resp, "completion_text", "") or "")
+            # v0.7.6（Bug A）：形象描述是单行中文，思维链泄漏必须挡在门外
+            text = strip_reasoning_blocks(
+                str(getattr(resp, "completion_text", "") or "")
+            )
         except asyncio.TimeoutError:
             logger.warning(
                 f"[memory_diary] 提炼形象描述超时"

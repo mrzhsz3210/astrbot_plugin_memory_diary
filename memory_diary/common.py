@@ -81,6 +81,48 @@ def safe_key(raw: str) -> str:
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
 
 
+# ---- 日记身份（v0.7.6 人格隔离）----
+# 存储维度的「身份」= 原始 sender_id，或在人格隔离生效时为
+# ``<sender_id>::p::<persona_id>``。身份字符串贯穿文件 key、派生签名钥匙与
+# 条目签名域，因此同一人格的数据天然聚在同一本日记里、不同人格互不可见。
+# 默认人格与取不到人格的兜底都映射回原始 sender_id（即 v0.7.5 的旧文件），
+# 老用户升级零迁移、签名不炸。
+PERSONA_ID_SEP = "::p::"
+# 默认人格的稳定标识：不进入身份字符串（默认人格直接用原始 sender_id），
+# 只作为「这是默认人格」的语义标记在解析结果里传递。
+DEFAULT_PERSONA_ID = "__default__"
+
+# persona_id 只来自 AstrBot 会话/人格库，但仍按"要进 README 单行与日志"的
+# 口径消毒：去掉空白与控制字符（防 README 的「用户ID：」行被换行撑破）、
+# 限长 64。人格改名在 AstrBot 里等于新人格（v3 按名字解析），与这里的
+# 身份口径一致——改名后旧人格的日记留在旧身份名下，不会串数据。
+_PERSONA_ID_STRIP_RE = re.compile(r"[\s\x00-\x1f\x7f]+")
+
+
+def sanitize_persona_id(raw) -> str:
+    """把 AstrBot 的 persona_id/人格名消毒成可进身份字符串的形态；空串表示不可用。"""
+    text = _PERSONA_ID_STRIP_RE.sub("", str(raw or ""))
+    return text[:64]
+
+
+def make_diary_identity(sender_id, persona_id) -> str:
+    """合成存储身份；persona_id 为空（含默认人格）时就是原始 sender_id。"""
+    base = str(sender_id or "")
+    pid = sanitize_persona_id(persona_id)
+    if not base or not pid or pid == DEFAULT_PERSONA_ID:
+        return base
+    return f"{base}{PERSONA_ID_SEP}{pid}"
+
+
+def split_diary_identity(identity) -> tuple:
+    """拆存储身份 → (原始 sender_id, persona_id)；无人格维度时 persona_id 为 ''。"""
+    text = str(identity or "")
+    base, sep, pid = text.partition(PERSONA_ID_SEP)
+    if not sep:
+        return text, ""
+    return base, pid
+
+
 # ---- 图片字节嗅探（纯函数，storage / imaging 共用，避免两套判断口径）----
 # 只看魔数，不信扩展名与 Content-Type：生图服务返回的格式经常与请求的不一致。
 _IMAGE_SIGNATURES = (

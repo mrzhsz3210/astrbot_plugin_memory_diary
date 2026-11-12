@@ -22,7 +22,11 @@ if TYPE_CHECKING:  # 仅为类型标注；运行时不依赖 AstrBot
     from astrbot.api.event import AstrMessageEvent
     from astrbot.api.provider import ProviderRequest
 
-from .common import strip_prompt_scaffold
+from .common import (
+    make_diary_identity,
+    sanitize_persona_id,
+    strip_prompt_scaffold,
+)
 from .constants import (
     AUTO_DIARY_DEFAULT_TIME,
     AUTO_DIARY_GRACE_SECONDS,
@@ -51,7 +55,10 @@ from .scope import parse_scope, scope_from_event
 from .writing import (
     ensure_explicit_notes,
     is_explicit_message,
+    language_mismatch,
+    looks_like_reasoning_leak,
     parse_diary_result,
+    strip_reasoning_blocks,
 )
 
 
@@ -96,11 +103,22 @@ class ServiceMixin:
             return await value
         return value
 
-    async def _get_persona_prompt(self, umo: str) -> str:
-        """获取当前会话使用的人设 system_prompt；取不到时返回空串。"""
+    async def _resolve_persona(self, umo: str) -> dict:
+        """解析当前会话使用的人格，返回 {"id", "name", "prompt", "is_default"}。
+
+        探测链与 v0.7.5 的 _get_persona_prompt 完全一致（会话 persona_id →
+        v3 人格库 → 旧接口 → 默认人格），只是把"只取 prompt"扩成"连身份一起取"：
+        写作 prompt 继续用 prompt 字段，存储身份用 id 字段（v0.7.6 人格隔离）。
+        取不到任何人格外貌时返回 is_default=True 的空结果，调用方按默认人格处理。
+
+        注意 AstrBot v3 人格库的"id"就是人格名（get_persona_v3_by_id 按 name
+        匹配）：人格改名在 AstrBot 侧等价于换了一个人格（旧会话的 persona_id
+        同样悬空），因此这里沿用该口径，改名后旧人格日记留在旧身份名下。
+        """
+        result = {"id": "", "name": "", "prompt": "", "is_default": True}
         pm = getattr(self.context, "persona_manager", None)
         if pm is None:
-            return ""
+            return result
         try:
             # 1) 会话上指定了 persona_id 时优先用它（/persona 切换的人设）。
             #    优先走 v3 人格库接口（不同版本方法名不同，逐个探测），再回退旧接口。
@@ -117,18 +135,43 @@ class ServiceMixin:
                         persona = await self._maybe_await(getter(persona_id))
                     except Exception:
                         continue
+                    if persona is None:
+                        continue
                     if isinstance(persona, dict):
                         prompt = (
                             persona.get("system_prompt") or persona.get("prompt") or ""
                         )
+                        pid = (
+                            persona.get("persona_id")
+                            or persona.get("name")
+                            or persona_id
+                        )
+                        name = persona.get("name") or str(pid)
                     else:
                         prompt = (
                             getattr(persona, "system_prompt", "")
                             or getattr(persona, "prompt", "")
                             or ""
                         )
-                    if prompt.strip():
-                        return prompt.strip()
+                        pid = (
+                            getattr(persona, "persona_id", "")
+                            or getattr(persona, "name", "")
+                            or persona_id
+                        )
+                        name = getattr(persona, "name", "") or str(pid)
+                    prompt = prompt.strip()
+                    if not prompt:
+                        # 人格存在但没写 prompt：身份仍然有效，口吻回退默认人格
+                        # （与旧 _get_persona_prompt 的回退顺序一致）
+                        prompt = await self._default_persona_prompt(pm, umo)
+                    return {
+                        "id": str(pid),
+                        "name": str(name),
+                        "prompt": prompt,
+                        "is_default": await self._is_default_persona(
+                            pm, umo, str(pid)
+                        ),
+                    }
             # 2) 回退到默认人格（同样按版本探测接口名）
             for getter_name in ("get_default_persona_v3", "get_default_persona"):
                 getter = getattr(pm, getter_name, None)
@@ -138,16 +181,139 @@ class ServiceMixin:
                     personality = await self._maybe_await(getter(umo))
                 except Exception:
                     continue
+                if personality is None:
+                    continue
                 if isinstance(personality, dict):
                     prompt = personality.get("prompt", "") or ""
+                    name = (
+                        personality.get("name")
+                        or personality.get("persona_id")
+                        or ""
+                    )
                 else:
                     prompt = getattr(personality, "prompt", "") or ""
-                if prompt.strip():
-                    return prompt.strip()
-            return ""
+                    name = (
+                        getattr(personality, "name", "")
+                        or getattr(personality, "persona_id", "")
+                        or ""
+                    )
+                return {
+                    "id": str(name) if name else "",
+                    "name": str(name),
+                    "prompt": prompt.strip(),
+                    "is_default": True,
+                }
+            return result
         except Exception as e:
             logger.warning(f"[memory_diary] 获取人设失败: {e}")
-            return ""
+            return result
+
+    async def _default_persona_prompt(self, pm, umo: str) -> str:
+        """默认人格的 prompt（探测链与 _resolve_persona 的回退分支一致）。"""
+        for getter_name in ("get_default_persona_v3", "get_default_persona"):
+            getter = getattr(pm, getter_name, None)
+            if getter is None:
+                continue
+            try:
+                personality = await self._maybe_await(getter(umo))
+            except Exception:
+                continue
+            if personality is None:
+                continue
+            if isinstance(personality, dict):
+                prompt = personality.get("prompt", "") or ""
+            else:
+                prompt = getattr(personality, "prompt", "") or ""
+            if prompt.strip():
+                return prompt.strip()
+        return ""
+
+    async def _is_default_persona(self, pm, umo: str, persona_id: str) -> bool:
+        """persona_id 是否就是当前默认人格（决定日记是否落到 legacy 命名空间）。"""
+        pid = str(persona_id or "")
+        if not pid:
+            return True
+        # AstrBot 系统默认人格的固定 id（persona_mgr.SYSTEM_DEFAULT_PERSONA_ID）
+        if pid == "default":
+            return True
+        try:
+            for getter_name in ("get_default_persona_v3", "get_default_persona"):
+                getter = getattr(pm, getter_name, None)
+                if getter is None:
+                    continue
+                personality = await self._maybe_await(getter(umo))
+                if personality is None:
+                    continue
+                if isinstance(personality, dict):
+                    name = (
+                        personality.get("name")
+                        or personality.get("persona_id")
+                        or ""
+                    )
+                else:
+                    name = (
+                        getattr(personality, "name", "")
+                        or getattr(personality, "persona_id", "")
+                        or ""
+                    )
+                if name:
+                    return pid == str(name)
+        except Exception:
+            pass
+        return False
+
+    async def _get_persona_prompt(self, umo: str) -> str:
+        """获取当前会话使用的人设 system_prompt；取不到时返回空串。"""
+        return str((await self._resolve_persona(umo)).get("prompt") or "")
+
+    async def _diary_identity_info(self, umo: str, sender_id) -> tuple:
+        """存储身份解析：返回 (identity, persona_name)。
+
+        - persona_isolation 关闭 / 默认人格 / 解析失败 → (原始 sender_id, "")，
+          与 v0.7.5 行为逐字节一致（旧文件归属默认人格，零迁移）；
+        - 非默认人格 → ("<sender>::p::<persona_id>", 人格名)，读写删都在
+          该人格自己的日记文件里。
+
+        旧文件归属提示：隔离生效且旧版（sender 维度）日记文件还存在时，
+        每个 sender 记一次日志，说明旧日记仍归属默认人格（任务单坑 3）。
+        """
+        base = str(sender_id or "")
+        if not base:
+            return base, ""
+        try:
+            if not bool(self.config.get("persona_isolation", True)):
+                return base, ""
+        except Exception:
+            return base, ""
+        try:
+            info = await self._resolve_persona(umo)
+        except Exception as e:
+            logger.warning(f"[memory_diary] 人格解析失败，本次按未隔离处理: {e}")
+            return base, ""
+        if info.get("is_default", True):
+            return base, ""
+        pid = sanitize_persona_id(info.get("id"))
+        if not pid:
+            return base, ""
+        try:
+            hinted = getattr(self, "_persona_hint_logged", None)
+            if hinted is None:
+                hinted = self._persona_hint_logged = set()
+            if base not in hinted and self._diary_path(base).exists():
+                hinted.add(base)
+                logger.info(
+                    f"[memory_diary] 人格隔离已生效：用户 {base} 的既有日记仍归属"
+                    f"默认人格（{info.get('name') or pid} 等其它人格另起新日记本），"
+                    "如需把旧日记并到某人格名下，请导出后在对应人格会话里导入"
+                )
+        except Exception:
+            pass
+        return make_diary_identity(base, pid), str(info.get("name") or pid)
+
+    async def _diary_identity(self, umo: str, sender_id) -> str:
+        """只要身份字符串的便捷封装（见 _diary_identity_info）。"""
+        identity, _ = await self._diary_identity_info(umo, sender_id)
+        return identity
 
     @staticmethod
     def _content_to_text(content) -> str:
@@ -184,6 +350,7 @@ class ServiceMixin:
         "写日记",
         "查看日记",
         "删除日记",
+        "恢复日记",
         "日记状态",
         "日记范围",
         "日记帮助",
@@ -195,6 +362,7 @@ class ServiceMixin:
         "diary",
         "diary_view",
         "diary_delete",
+        "diary_restore",
         "diary_status",
         "diary_scope",
         "diary_help",
@@ -506,6 +674,18 @@ class ServiceMixin:
 
         now_str = self._now().strftime("%Y-%m-%d %H:%M:%S")
         extra_instruction = str(self.config.get("extra_instruction", "") or "").strip()
+        if "{persona_name}" in extra_instruction:
+            # v0.7.6：附加要求支持 {persona_name} 占位符——渲染成当前会话人格名
+            # （取不到时用中性兜底词），满足"以某人格的视角写日记"的诉求。
+            try:
+                persona_name = str(
+                    (await self._resolve_persona(umo)).get("name") or ""
+                )
+            except Exception:
+                persona_name = ""
+            extra_instruction = extra_instruction.replace(
+                "{persona_name}", persona_name or "当前人格"
+            )
         explicit_required = []
 
         prompt_parts = [f"当前时间：{now_str}"]
@@ -674,12 +854,38 @@ class ServiceMixin:
                     prompt=current_prompt,
                     system_prompt=system_prompt,
                 )
-                raw_content = (resp.completion_text or "").strip()
+                # v0.7.6（Bug A）：推理模型思维链泄漏兜底——上游只剥 <think>
+                # 标签，挡不住端点把推理拼进 content 或模型把思考当正文写。
+                raw_content = strip_reasoning_blocks(
+                    resp.completion_text or ""
+                ).strip()
             except Exception as e:
                 logger.error(f"[memory_diary] 调用 LLM 写日记失败: {e}")
                 return None, f"调用 LLM 写日记失败：{e}"
             if not raw_content:
                 return None, "模型没有返回日记内容"
+            leak_reason = ""
+            if looks_like_reasoning_leak(raw_content):
+                leak_reason = "混入思维链（英文推理句式）"
+            elif language_mismatch(raw_content, convo_text):
+                leak_reason = "语言不一致（语料为中文、产出主体为英文）"
+            if leak_reason:
+                if attempt == 1:
+                    logger.warning(
+                        f"[memory_diary] 日记产出疑似{leak_reason}，重写一次"
+                    )
+                    current_prompt = (
+                        prompt
+                        + "\n\n上次输出混入了思考过程或异常语言内容。"
+                        "请只输出给用户看的中文日记正文本身，"
+                        "不要输出任何分析、思考过程或英文推理。"
+                    )
+                    continue
+                logger.warning(
+                    f"[memory_diary] 日记产出重写后仍疑似{leak_reason}，"
+                    "本次降级为简记落盘"
+                )
+                mode = "brief"
             raw_content, material_decisions = self.parse_material_decisions(raw_content)
             result = parse_diary_result(
                 raw_content,
@@ -1374,10 +1580,9 @@ class ServiceMixin:
         pct = int(ratio * 100)
 
         if auto_ratio > 0 and ratio >= auto_ratio and not state["auto_written"]:
-            sender_id = event.get_sender_id()
-            # 互斥锁的粒度是 sender_id，不是会话 umo：写的是 diary_<sender_id>.zip。
-            # 同一群里不同用户各写各的日记，不能互相阻塞；同一用户的私聊/群聊写
-            # 同一个 zip，必须互斥（手动、哨兵、每天定时共用这把锁）。
+            # v0.7.6：写入目标按当前会话人格取存储身份——写的是 diary_<身份>.zip，
+            # 互斥锁的粒度也跟着身份走（同一用户不同人格各写各的本子）。
+            sender_id = await self._diary_identity(umo, event.get_sender_id())
             if sender_id in self._writing or self._terminated:
                 return
             self._writing.add(sender_id)
@@ -1401,7 +1606,8 @@ class ServiceMixin:
                     )
                 )
                 self._diary_tasks.add(task)
-                self._diary_task_owners[task] = sender_id
+                # owner 记录原始 sender：on_any_message 的白名单除名取消按原始 QQ 比对
+                self._diary_task_owners[task] = str(event.get_sender_id())
 
                 def _finish_diary_task(done_task):
                     self._diary_tasks.discard(done_task)
@@ -1852,13 +2058,16 @@ class ServiceMixin:
                 skipped += 1
                 self._mark_auto_diary_done(state, sender_id)
                 continue
-            if sender_id in self._writing:
+            # v0.7.6：写入目标按该用户私聊会话的当前人格取存储身份；
+            # 完成登记仍按原始 sender（每用户每天只尝试一次，与人格无关）
+            diary_id = await self._diary_identity(umo, sender_id)
+            if diary_id in self._writing:
                 # 同一用户已有写日记流程（手动/哨兵/定时）在进行，避免并发重写 zip
                 skipped += 1
                 self._mark_auto_diary_done(state, sender_id)
                 continue
             try:
-                if self._has_full_diary_today(sender_id, day):
+                if self._has_full_diary_today(diary_id, day):
                     skipped += 1
                     self._mark_auto_diary_done(state, sender_id)
                     continue
@@ -1885,12 +2094,12 @@ class ServiceMixin:
                     state = latest_state
                 self._mark_auto_diary_done(state, sender_id)
                 claimed = True
-            self._writing.add(sender_id)
+            self._writing.add(diary_id)
             diary, err = None, None
             try:
                 diary, err = await self._write_diary(
                     umo,
-                    sender_id,
+                    diary_id,
                     str(rec.get("name") or sender_id),
                     is_group=False,
                     allow_life=False,
@@ -1913,7 +2122,7 @@ class ServiceMixin:
             except Exception as e:
                 err = f"自动写日记异常：{e}"
             finally:
-                self._writing.discard(sender_id)
+                self._writing.discard(diary_id)
             if diary:
                 wrote += 1
                 await self._notify_auto_diary_success(umo, diary)

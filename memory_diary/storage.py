@@ -18,7 +18,12 @@ import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .common import safe_key, sniff_image_ext, strip_invisible
+from .common import (
+    safe_key,
+    sniff_image_ext,
+    split_diary_identity,
+    strip_invisible,
+)
 from .constants import IMAGE_MAX_BYTES, TOKEN_CALIBRATION_FILE
 from .errors import (
     DiaryCorruptError,
@@ -1799,13 +1804,21 @@ class StorageMixin:
         return items, status
 
     def _readme_text(self, sender_id: str, sender_name: str) -> str:
+        # v0.7.6：人格隔离身份（<QQ>::p::<persona>）整串写进「用户ID」行——
+        # Web 侧验签/读日记都靠它回推出存储身份；另补两行可读的归属信息。
+        # 无人格维度时不加这两行（与旧版逐字节一致）。
+        base, pid = split_diary_identity(sender_id)
+        persona_lines = (
+            f"主人QQ：{base}\n所属人格：{pid}\n" if pid else ""
+        )
         return (
             "记忆日记\n"
             "========\n\n"
             f"用户昵称：{sender_name or '（未知）'}\n"
-            # Web 日记本页面验签需要主人 QQ（文件名是 HMAC 派生、反推不出）；
-            # 日记 zip 本就只发给本人，写入本人 QQ 不构成额外泄露
+            # Web 日记本页面验签需要主人身份（文件名是 HMAC 派生、反推不出）；
+            # 日记 zip 本就只发给本人，写入本人身份不构成额外泄露
             f"用户ID：{sender_id}\n"
+            f"{persona_lines}"
             f"说明生成时间：{self._now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             "【这是什么】\n"
             '这个 zip 保存着一位 AI 写给"下一个自己"的日记。日记按天归档：\n'
@@ -1973,7 +1986,10 @@ class StorageMixin:
     # ------------------------- 注入范围偏好 -------------------------
 
     def _pref_path(self, sender_id: str) -> Path:
-        return self.data_dir / f"pref_{safe_key(sender_id)}.json"
+        # v0.7.6：偏好（查看密码/注入范围/素材游标/备忘）是用户级数据，
+        # 人格隔离身份一律按原始 QQ 落同一份 pref 文件；
+        # 备忘的"按人格分开"在文件内部按人格分槽（见 _memos_of/_set_memos）。
+        return self.data_dir / f"pref_{safe_key(split_diary_identity(sender_id)[0])}.json"
 
     def _pref_corrupt_files(self) -> set:
         """进程内记录已告警/已备份的损坏偏好文件（避免每次读取刷日志）。"""
@@ -2147,11 +2163,58 @@ class StorageMixin:
             return parse_scope(scope).value
         return "group:legacy-unknown" if cls._memo_scene(memo) == "group" else "private"
 
+    # ---- 备忘的人格分槽（v0.7.6）----
+    # 备忘跟随日记的人格维度：默认人格/未隔离沿用 pref 文件里的 "memos" 槽
+    # （与旧版逐字节一致），非默认人格写到 "memos_by_persona"[<persona_id>]。
+    # 密码、注入范围、素材游标等其他偏好仍是用户级，不分槽。
+
+    @staticmethod
+    def _memos_of(sender_id: str, data: dict) -> list:
+        pid = split_diary_identity(sender_id)[1]
+        if pid:
+            by = data.get("memos_by_persona")
+            if isinstance(by, dict):
+                memos = by.get(pid)
+                if isinstance(memos, list):
+                    return memos
+            return []
+        memos = data.get("memos")
+        return memos if isinstance(memos, list) else []
+
+    @staticmethod
+    def _set_memos(sender_id: str, data: dict, memos: list) -> None:
+        pid = split_diary_identity(sender_id)[1]
+        if pid:
+            by = data.get("memos_by_persona")
+            if not isinstance(by, dict):
+                by = {}
+            if memos:
+                by[pid] = memos
+            else:
+                by.pop(pid, None)
+            if by:
+                data["memos_by_persona"] = by
+            else:
+                data.pop("memos_by_persona", None)
+            return
+        if memos:
+            data["memos"] = memos
+        else:
+            data.pop("memos", None)
+
+    def _save_memos_list(self, sender_id: str, memos: list) -> bool:
+        """整表覆盖某人格槽的备忘列表（交互删除后回写用）；返回是否保存成功。"""
+        if not self._is_allowed(sender_id):
+            return False
+        data = self._load_pref_data(sender_id)
+        self._set_memos(sender_id, data, memos)
+        return self._save_pref_data(sender_id, data)
+
     def _load_memos(self, sender_id: str, scene: str = "", scope: str = "") -> list:
         """读取备忘；具体群只返回本群，旧群备忘不会自动进入任何群。"""
         if not self._is_allowed(sender_id):
             return []
-        memos = self._load_pref_data(sender_id).get("memos")
+        memos = self._memos_of(sender_id, self._load_pref_data(sender_id))
         if not isinstance(memos, list):
             return []
         memos = [m for m in memos if isinstance(m, dict) and m.get("text")]
@@ -2191,7 +2254,7 @@ class StorageMixin:
             capped += [m for m in memos if self._memo_scope(m) == item_scope][
                 -self._MEMO_LIMIT:
             ]
-        data["memos"] = capped
+        self._set_memos(sender_id, data, capped)
         ok = self._save_pref_data(sender_id, data)
         total = len([m for m in capped if self._memo_scope(m) == current])
         return total, ok
@@ -2209,10 +2272,7 @@ class StorageMixin:
             kept = [m for m in memos if self._memo_scope(m) not in wanted]
         else:
             kept = [m for m in memos if self._memo_scene(m) not in scenes]
-        if kept:
-            data["memos"] = kept
-        else:
-            data.pop("memos", None)
+        self._set_memos(sender_id, data, kept)
         return self._save_pref_data(sender_id, data)
 
     def _select_entries(self, entries: list, scope: str) -> list:
@@ -2763,8 +2823,11 @@ class StorageMixin:
         out[self.README_ZIP_ENTRY] = self._readme_text(sender_id, sender_name).encode(
             "utf-8"
         )
+        # v0.7.6（Bug C）：覆盖前先把当前 zip 滚一份进 backups/（防外部删除后无档可救）
+        self._roll_backup(sender_id, path)
         self._write_zip_atomic(path, out)
         self._invalidate_search_index(sender_id)
+        self._registry_mark(sender_id)
         return entry_name
 
     def _migrate_legacy(self, sender_id: str):
@@ -2954,8 +3017,44 @@ class StorageMixin:
                 }
                 for item in materials["items"]
             ])
+        # v0.7.6 回收站：整包软删除——正文/签名/插图/批注/来源整体移入 trash/，
+        # 保留期内可 /恢复日记 原样找回（签名随行，恢复时重新验签）。
+        # 回收站写入失败时中止删除（宁可不删，也不让用户的数据不可恢复）；
+        # zip 本身已损坏读不出时退化为硬删除（本来也无法通过验签恢复）。
+        path = self._diary_path(sender_id)
+        if path.exists() and self._trash_retention_days() > 0:
+            try:
+                with self._diary_zip(path) as z:
+                    all_data = {n: z.read(n) for n in z.namelist()}
+            except Exception as e:
+                all_data = None
+                logger.warning(
+                    f"[memory_diary] 删除前读取日记 zip 失败，本次不进入回收站: {e}"
+                )
+            if all_data is not None:
+                payload = {
+                    n: b
+                    for n, b in all_data.items()
+                    if self.ENTRY_NAME_RE.match(n)
+                    or n.startswith("sigs/")
+                    or self.IMAGE_NAME_RE.match(n)
+                }
+                annotations_slice, prov_slice = self._trash_slices(
+                    sender_id, all_data, None
+                )
+                if (
+                    self._trash_write(
+                        sender_id,
+                        kind="all",
+                        payload=payload,
+                        annotations_slice=annotations_slice,
+                        provenance_slice=prov_slice,
+                    )
+                    is None
+                ):
+                    return False
         existed = False
-        for p in (self._diary_path(sender_id), *self._legacy_diary_paths(sender_id)):
+        for p in (path, *self._legacy_diary_paths(sender_id)):
             try:
                 if p.exists():
                     p.unlink()
@@ -2963,7 +3062,62 @@ class StorageMixin:
             except Exception as e:
                 logger.warning(f"[memory_diary] 删除文件失败（{p}）: {e}")
         self._invalidate_search_index(sender_id)
+        if existed:
+            # 插件内整包删除：销记（剩下的"凭空消失"才算外部删除）
+            self._registry_unmark(sender_id)
         return existed
+
+    def _trash_slices(self, sender_id: str, data: dict, days):
+        """从 zip 条目 dict 提取批注/来源切片（随删除进回收站）。
+
+        days 为 None 表示全部；否则只取 entry[:8] ∈ days 的记录。
+        验签失败/解析失败时返回空切片（fail-closed：切片只是恢复的配菜，
+        缺了不阻塞删除，也绝不替被改过的数据重签）。
+        """
+        def _in_days(name) -> bool:
+            return days is None or str(name or "")[:8] in days
+
+        annotations_slice = []
+        if self.ANNOTATIONS_ENTRY in data:
+            raw = data[self.ANNOTATIONS_ENTRY]
+            actual = (
+                data.get(self.ANNOTATIONS_SIG_ENTRY, b"")
+                .decode("utf-8", "ignore")
+                .strip()
+            )
+            if self._secret_key() is not None and self._annotations_sig_matches(
+                sender_id, raw, actual
+            ):
+                try:
+                    adata = json.loads(raw.decode("utf-8"))
+                    annotations_slice = [
+                        dict(x)
+                        for x in adata.get("annotations") or []
+                        if isinstance(x, dict) and _in_days(x.get("entry"))
+                    ]
+                except Exception:
+                    annotations_slice = []
+        prov_slice = {}
+        if self.PROVENANCE_ENTRY in data:
+            raw = data[self.PROVENANCE_ENTRY]
+            actual = (
+                data.get(self.PROVENANCE_SIG_ENTRY, b"")
+                .decode("utf-8", "ignore")
+                .strip()
+            )
+            if self._secret_key() is not None and self._provenance_sig_matches(
+                sender_id, raw, actual
+            ):
+                try:
+                    pdata = json.loads(raw.decode("utf-8"))
+                    prov_slice = {
+                        k: v
+                        for k, v in (pdata.get("entries") or {}).items()
+                        if isinstance(v, dict) and _in_days(k)
+                    }
+                except Exception:
+                    prov_slice = {}
+        return annotations_slice, prov_slice
 
     def _delete_entries(self, sender_id: str, names: list) -> int:
         """删除指定日期文件（含签名）。全删光时移除整个 zip。返回实际删除的天数。"""
@@ -2996,6 +3150,26 @@ class StorageMixin:
                     remove.add(n)
                     remove.add(self._image_sig_entry(n))
 
+        # v0.7.6 回收站：先把要删的条目连同批注/来源切片移入 trash/，
+        # 回收站写入失败时中止删除（返回 0），不做不可恢复的硬删除。
+        # 批注级联发生在 data 原地修改之前捕获切片，保证恢复时原样合并回去。
+        if self._trash_retention_days() > 0:
+            payload = {n: data[n] for n in remove if n in data}
+            annotations_slice, prov_slice = self._trash_slices(
+                sender_id, data, deleted_days
+            )
+            if (
+                self._trash_write(
+                    sender_id,
+                    kind="entries",
+                    payload=payload,
+                    annotations_slice=annotations_slice,
+                    provenance_slice=prov_slice,
+                )
+                is None
+            ):
+                return 0
+
         # 批注级联：删某天日记时一并清掉锚定该天的批注（与插图同理，不留孤儿批注）。
         # 与日记删除在同一次原子写入里完成，避免"日记删了、批注没删"的两步状态。
         if deleted_days:
@@ -3027,6 +3201,7 @@ class StorageMixin:
                         for item in materials["items"]
                     ])
                 path.unlink(missing_ok=True)  # 一天都不剩 → 整个 zip 删掉
+                self._registry_unmark(sender_id)  # v0.7.6：插件内删除，销记
             else:
                 out = {n: b for n, b in data.items() if n not in remove}
                 self._write_zip_atomic(path, out)
@@ -3407,10 +3582,15 @@ class StorageMixin:
 
         check_owner：QQ 指令侧必须为 True（装进别人账号的日记永远验不过签）；
         Web 日记本页面是管理员操作，安装后仍绑定原主人 QQ，传 False。
+        v0.7.6：人格隔离身份按**原始 QQ** 比对——同一用户在自己的人格之间
+        导出/导入/合并日记是合法路径（如把旧人格的本子并进新人格），
+        只有跨 QQ 号才拒绝。
         """
         if not self._is_allowed(owner_id):
             raise ValueError("该用户不在插件白名单内，已拒绝导入")
-        if check_owner and owner_id != sender_id:
+        if check_owner and (
+            split_diary_identity(owner_id)[0] != split_diary_identity(sender_id)[0]
+        ):
             raise ValueError(
                 "这份日记的主人 QQ 号和你不一致——签名绑定了原主人的 QQ 号，"
                 "装进你的账号也验不过，已拒绝导入。"
@@ -3474,6 +3654,7 @@ class StorageMixin:
             ).encode("utf-8")
         self._write_zip_atomic(target, out)
         self._invalidate_search_index(sender_id)
+        self._registry_mark(sender_id)  # v0.7.6：导入成功，登记册同步
         return mode
 
     def _zip_owner_info(self, path: Path):

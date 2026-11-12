@@ -151,8 +151,12 @@ class EventHooksMixin:
         if not query:
             return
         current_scope = str(scope_from_event(event))
+        # v0.7.6 人格隔离：按需回源同样只能命中当前人格名下的日记
+        identity = await self._diary_identity(
+            event.unified_msg_origin, event.get_sender_id()
+        )
         result = search_diaries(
-            self, event.get_sender_id(), query,
+            self, identity, query,
             scope="" if current_scope == "private" else current_scope,
             limit=3, evidence_type="user",
         )
@@ -255,6 +259,9 @@ class EventHooksMixin:
             current_scope = str(scope_from_event(event))
             in_group = scope_from_event(event).is_group
             umo = event.unified_msg_origin
+            # v0.7.6 人格隔离：注入的日记来自当前人格名下的日记本；
+            # 注入去重/代际状态键仍按原始 sender（与 reset/response 钩子同口径）
+            identity = await self._diary_identity(umo, sender_id)
             cid = await self._curr_cid(umo)
             # P1-4：注入去重/代际状态按 (umo, sender) 命名空间化；私聊键就是 umo
             state_key = self._inject_state_key(umo, sender_id, in_group)
@@ -274,11 +281,11 @@ class EventHooksMixin:
                 scope = pending
                 new_names = {
                     n
-                    for n in self._select_entries(self._list_entries(sender_id), scope)
+                    for n in self._select_entries(self._list_entries(identity), scope)
                 } - rec["names"]
                 if new_names:
                     extra, _, extra_names = self._assemble_inject(
-                        sender_id,
+                        identity,
                         in_group=in_group,
                         memory_scope_value=current_scope,
                         scope_override=scope,
@@ -304,7 +311,7 @@ class EventHooksMixin:
                 # 代价是每轮都消耗日记的 token。
                 # P2-12：本轮已被手动追加注入过的篇目不再重复塞进 system_prompt。
                 diary, tampered_any, names = self._assemble_inject(
-                    sender_id,
+                    identity,
                     in_group=in_group,
                     memory_scope_value=current_scope,
                     exclude_names=pending_names,
@@ -320,7 +327,7 @@ class EventHooksMixin:
                         # 期间并发第二个请求不应再触发一次生成。
                         rec["annotation_generated"] = True
                     ann_block = await self._annotation_block_for_inject(
-                        sender_id, umo, in_group, diary, names,
+                        identity, umo, in_group, diary, names,
                         is_new_generation=not seeded,
                     )
                     inject_diary = (
@@ -345,7 +352,7 @@ class EventHooksMixin:
             if self._injected_cid.get(state_key) == cid:
                 return
             diary, tampered_any, names = self._assemble_inject(
-                sender_id,
+                identity,
                 in_group=in_group,
                 memory_scope_value=current_scope,
                 exclude_names=pending_names,
@@ -372,7 +379,7 @@ class EventHooksMixin:
                 # 不应重复生成（代际状态挂在 rec 上，reset 时会重建）。
                 rec["annotation_generated"] = True
             ann_block = await self._annotation_block_for_inject(
-                sender_id, umo, in_group, diary, names,
+                identity, umo, in_group, diary, names,
                 is_new_generation=not seeded,
             )
             inject_diary = diary + ("\n\n" + ann_block if ann_block else "")

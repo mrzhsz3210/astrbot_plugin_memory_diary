@@ -46,6 +46,7 @@ class HelpPersonaCommandsMixin:
             "· /查看批注 —— 私聊专用：查看本轮读日记时留下的批注与所有未解/悬置的批注\n"
             "· /写回批注 —— 私聊专用：把聊明白的批注写回日记（需确认，可悬置）\n"
             "· /删除日记 —— 私聊专用：删除全部 / 某天 / 某时间段的日记\n"
+            "· /恢复日记 —— 私聊专用：从回收站找回最近删除的日记\n"
             "· /导出日记 —— 私聊：把自己的日记和签名钥匙打包发给你，用于换设备迁移\n"
             "· /导入日记 —— 私聊：把迁移包发给我，验签通过后自动安放日记\n"
             "· /日记状态 —— 查看上下文占用、日记篇数、哨兵状态\n"
@@ -113,7 +114,8 @@ class HelpPersonaCommandsMixin:
                 "📖 形象档案只能私聊查看和修改哦——插画里的「她」是只给你看的样子。"
             )
             return
-        sender_id = event.get_sender_id()
+        # v0.7.6 人格隔离：形象档案跟随当前人格的日记本
+        sender_id = await self._diary_identity(umo, event.get_sender_id())
         arg = self._strip_invisible(self._command_arg(event)).strip()
         parts = arg.split(None, 1)
         action = parts[0] if parts else ""

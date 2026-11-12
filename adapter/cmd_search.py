@@ -123,10 +123,14 @@ class SearchCommandsMixin:
             return candidates
 
     async def _assisted_search(self, event, query: str, **kwargs):
+        # v0.7.6 人格隔离：搜索只能命中当前人格名下的日记
+        identity = await self._diary_identity(
+            event.unified_msg_origin, event.get_sender_id()
+        )
         expansion = bool(self.config.get("search_query_expansion_enabled", False))
         rerank = bool(self.config.get("search_rerank_enabled", False))
         if not expansion and not rerank:
-            return search_diaries(self, event.get_sender_id(), query, **kwargs)
+            return search_diaries(self, identity, query, **kwargs)
         limit = kwargs.get("limit", 20)
         queries = [query]
         if expansion:
@@ -143,7 +147,7 @@ class SearchCommandsMixin:
             candidate_kwargs = dict(kwargs)
             candidate_kwargs["offset"] = 0
             candidate_kwargs["limit"] = 20 if rerank else max(20, int(limit or 20))
-            result = search_diaries(self, event.get_sender_id(), item_query, **candidate_kwargs)
+            result = search_diaries(self, identity, item_query, **candidate_kwargs)
             searches.append(result)
             if expansion:
                 logger.info(

@@ -72,7 +72,10 @@ class TransferCommandsMixin:
             )
             return
 
-        sender_id = event.get_sender_id()
+        # v0.7.6 人格隔离：导出的是当前人格名下的日记本
+        sender_id = await self._diary_identity(
+            event.unified_msg_origin, event.get_sender_id()
+        )
         if self._secret_key() is None:
             yield event.plain_result(
                 "📖 签名密钥（.diary_key）不可读，没法导出——"
@@ -257,8 +260,12 @@ class TransferCommandsMixin:
                     sender_name = ev.get_sender_name() or ""
                 except Exception:
                     pass
+                # v0.7.6 人格隔离：导入安放进当前人格名下的日记本
+                import_identity = await self._diary_identity(
+                    ev.unified_msg_origin, ev.get_sender_id()
+                )
                 mode = self._install_bundle(
-                    ev.get_sender_id(), owner_id, key, entries, sender_name,
+                    import_identity, owner_id, key, entries, sender_name,
                     images=images, annotations=annotations,
                     provenance=provenance, current_self=current_self, materials=materials,
                     anchor_archive=anchor_archive,

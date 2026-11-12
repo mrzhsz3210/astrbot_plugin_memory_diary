@@ -194,7 +194,7 @@
   "extra_instruction": {
     "description": "写日记的附加要求",
     "type": "string",
-    "hint": "会追加到写日记的提示词末尾，例如：语气更温柔一些 / 多写一点她的日常小事",
+    "hint": "会追加到写日记的提示词末尾，例如：语气更温柔一些 / 多写一点她的日常小事；支持占位符 {persona_name}（渲染为当前会话的人格名），例如：请以{persona_name}的视角写日记",
     "default": ""
   },
   "no_write_alert_threshold": {
@@ -230,6 +230,12 @@
     "hint": "默认关闭：她只用正常口吻告知日记已写好；开启后会在告知后附上日记全文（仅私聊展示，群聊不展示）",
     "default": false
   },
+  "persona_isolation": {
+    "description": "人格隔离",
+    "type": "bool",
+    "hint": "默认开启：同一 QQ 号切换 AstrBot 人格时，日记按人格分本存储——写、查看、回忆、注入、删除、备忘、批注、插图都只作用于当前人格名下的日记本；默认人格沿用升级前的旧日记本，取不到人格信息时自动退回全号共享。关闭后回到 v0.7.5 行为：一个 QQ 号一本日记，多个人格共享",
+    "default": true
+  },
   "use_persona": {
     "description": "人设口吻",
     "type": "bool",
@@ -246,6 +252,18 @@
     "description": "日记操作间隔（分钟）",
     "type": "int",
     "hint": "每个用户两次写日记/删日记之间的最小间隔；0 为不限制，最高 60 分钟",
+    "default": 5
+  },
+  "trash_retention_days": {
+    "description": "回收站保留天数",
+    "type": "int",
+    "hint": "删除的日记先移入回收站，保留 N 天（默认 30）后可发 /恢复日记 找回，逾期自动清理；填 0 关闭回收站，删除立即不可恢复（v0.7.5 旧行为）",
+    "default": 30
+  },
+  "backup_copies": {
+    "description": "自动备份保留份数",
+    "type": "int",
+    "hint": "每次写日记覆盖前，把当前日记包复制一份到 backups/ 目录，每本日记保留最近 N 份（默认 5）；日记包被外部删除/篡改时可用 /恢复日记 从备份恢复（恢复前全量验签）。填 0 关闭自动备份",
     "default": 5
   },
   "web_diary_brand": {

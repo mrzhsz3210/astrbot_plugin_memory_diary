@@ -10,6 +10,7 @@ from .cmd_annotation import AnnotationCommandsMixin
 from .cmd_delete import DeleteCommandsMixin
 from .cmd_help_persona import HelpPersonaCommandsMixin
 from .cmd_memo import MemoCommandsMixin
+from .cmd_restore import RestoreCommandsMixin
 from .cmd_search import SearchCommandsMixin
 from .cmd_settings import SettingsCommandsMixin
 from .cmd_transfer import TransferCommandsMixin
@@ -37,6 +38,7 @@ AdapterMixins = (
     ViewCommandsMixin,
     AnnotationCommandsMixin,
     DeleteCommandsMixin,
+    RestoreCommandsMixin,
     TransferCommandsMixin,
     SettingsCommandsMixin,
     EventHooksMixin,
