@@ -550,30 +550,14 @@ Provider 生效、本地搜索开启且让位开关为真时，私聊常规自�
 - 私聊不受任何限制，永远响应；
 - 注意：请把@放在指令后面，放在指令前面可能不会被识别为指令。
 
-## 官方修复工具（memory_diary_repair.py，v0.7.7 起）
+## 官方修复工具（独立仓库）
 
-仓库 `tools/memory_diary_repair.py` 是离线命令行修复工具（不进发布包），
-处理数据目录的异常状态。它直接复用插件源码验签（HMAC 口径与运行中的插件一致）：
-
-- **体检（默认，只读）**：列出全部日记本（主人、天数、健康状态）、登记册告警、
-  回收站条目与杂散文件、自动备份清单；
-- **`--fix`**：隔离假包（0 天/无主人/全量验签失败的 `diary_*.zip`，改名 `.corrupt-*`）、
-  登记册销警（文件被手动移走的条目：trash/ 里有同名文件先提议移回，否则销记）、
-  清理 trash/ 里的杂散文件；
-- **`--merge <源zip> <目标身份>`**：把一本日记合并进另一本（跨人格/跨账户搬家；
-  源包全量验签，已有的天不覆盖，全部按目标身份重签，批注随并入天合并）；
-- **`--restore-trash <条目id> <身份>`**：命令行恢复回收站条目（与 QQ 端 `/恢复日记` 同口径）。
-
-用法（用 AstrBot 实例的 Python 跑）：
-
-```powershell
-<实例>\venv\Scripts\python.exe memory_diary_repair.py `
-    --plugin-dir "<实例>\core\data\plugins\astrbot_plugin_memory_diary" `
-    --data-dir  "<实例>\core\data\plugin_data\astrbot_plugin_memory_diary" --fix
-```
-
-目标身份格式：原始 QQ（默认人格）或 `QQ::p::人格id`（与日记 zip 内
-说明.txt 的「用户ID」行一致）。先不带 `--fix` 体检一遍，确认清单再动手。
+数据目录异常（假日记包、登记册"疑似外部删除"告警、trash/ 杂散文件、
+跨人格/跨账户合并日记本）的官方修复工具维护在独立仓库：
+**[memory-diary-repair](https://github.com/mrzhsz3210/memory-diary-repair)**。
+它直接复用插件源码验签（HMAC 口径与运行中的插件一致），默认只读体检，
+`--fix` 修复、`--merge` 跨本合并、`--restore-trash` 恢复回收站条目。
+用法详见该仓库 README（用 AstrBot 实例的 Python 运行，先体检再动手）。
 
 ## 指令参考（完整版）
 
