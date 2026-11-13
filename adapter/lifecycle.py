@@ -39,7 +39,7 @@ class LifecycleMixin:
         except Exception as e:
             logger.warning(f"[memory_diary] 启动清理过期回收站失败: {e}")
         try:
-            # v0.7.6（Bug C）：外部删除/篡改扫描——登记包凭空消失或
+            # v0.7.7（Bug C）：外部删除/篡改扫描——登记包凭空消失或
             # 全量验签失败时打 ERROR 日志（/日记状态 与 WebUI 同步明示）
             self._external_damage_scan()
         except Exception as e:

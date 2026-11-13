@@ -30,7 +30,7 @@ class DeleteCommandsMixin:
             )
             return
 
-        # v0.7.6 人格隔离：删除只作用于当前人格名下的日记
+        # v0.7.7 人格隔离：删除只作用于当前人格名下的日记
         sender_id, persona_name = await self._diary_identity_info(
             event.unified_msg_origin, event.get_sender_id()
         )
@@ -48,7 +48,7 @@ class DeleteCommandsMixin:
             )
             return
 
-        # v0.7.6：删除前列行清理过期回收站条目（保留期承诺的例行维护）
+        # v0.7.7：删除前列行清理过期回收站条目（保留期承诺的例行维护）
         try:
             self._purge_trash()
         except Exception:
@@ -66,7 +66,7 @@ class DeleteCommandsMixin:
             return
 
         lines = [f"{i}. {self._entry_label(n)}" for i, n in enumerate(entries, 1)]
-        # v0.7.6 人格隔离：多人格用户先看清"现在删的是哪个人格的本子"
+        # v0.7.7 人格隔离：多人格用户先看清"现在删的是哪个人格的本子"
         scope_note = f"（当前人格「{persona_name}」名下）" if persona_name else ""
         yield event.plain_result(
             f"📖 你目前有 {len(entries)} 天的日记{scope_note}：\n"
@@ -113,7 +113,7 @@ class DeleteCommandsMixin:
                     # P3-9 修复：删除失败（权限/IO）必须明说，不能谎报"已删除"
                     if self._delete_diary(sender_id):
                         self._op_mark(sender_id)
-                        # v0.7.6 回收站：提示恢复途径（suffix 不过 _say，防转述丢失）
+                        # v0.7.7 回收站：提示恢复途径（suffix 不过 _say，防转述丢失）
                         trash_days = self._trash_retention_days()
                         hint = (
                             f"\n（{trash_days} 天内发 /恢复日记 还能找回。）"
@@ -155,7 +155,7 @@ class DeleteCommandsMixin:
             targets = None
             if low in ("全部", "all"):
                 pending_all["v"] = True
-                # v0.7.6：二次确认说清「删的是哪个人格名下的日记、删完能去哪找回」，
+                # v0.7.7：二次确认说清「删的是哪个人格名下的日记、删完能去哪找回」，
                 # 避免多人格用户"以为在删别人格的，结果删了自己的"
                 trash_days = self._trash_retention_days()
                 if persona_name:
@@ -236,7 +236,7 @@ class DeleteCommandsMixin:
                 self._op_mark(sender_id)
                 labels = "、".join(self._entry_label(n) for n in targets)
                 canned = f"📖 已删除 {deleted} 天的日记：{labels}"
-                # v0.7.6 回收站：提示恢复途径（suffix 不过 _say，防转述丢失）
+                # v0.7.7 回收站：提示恢复途径（suffix 不过 _say，防转述丢失）
                 trash_days = self._trash_retention_days()
                 hint = (
                     f"\n（{trash_days} 天内发 /恢复日记 还能找回。）"

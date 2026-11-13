@@ -239,7 +239,7 @@ class WebDiaryApiMixin:
     async def web_list_users(self):
         users = []
         owner_map = None
-        # v0.7.6（Bug C）：外部删除告警——登记在册但文件凭空消失的日记包
+        # v0.7.7（Bug C）：外部删除告警——登记在册但文件凭空消失的日记包
         alerts = []
         try:
             for item in self._vanished_diary_alerts():
@@ -278,7 +278,7 @@ class WebDiaryApiMixin:
                 size = path.stat().st_size
             except OSError:
                 size = 0
-            # v0.7.6（Bug C）：全量条目验签失败 = 疑似被外部改写/捏造
+            # v0.7.7（Bug C）：全量条目验签失败 = 疑似被外部改写/捏造
             tampered_all = False
             if owner:
                 try:
@@ -303,7 +303,7 @@ class WebDiaryApiMixin:
                 "latest": latest,
                 "size": size,
             }
-            # v0.7.6（Bug C）：告警字段只在真的异常时才出现（保持常态响应形状不变）
+            # v0.7.7（Bug C）：告警字段只在真的异常时才出现（保持常态响应形状不变）
             if tampered_all:
                 item["alert"] = "tampered"
             users.append(item)

@@ -106,10 +106,11 @@ class ServiceMixin:
     async def _resolve_persona(self, umo: str) -> dict:
         """解析当前会话使用的人格，返回 {"id", "name", "prompt", "is_default"}。
 
-        探测链与 v0.7.5 的 _get_persona_prompt 完全一致（会话 persona_id →
-        v3 人格库 → 旧接口 → 默认人格），只是把"只取 prompt"扩成"连身份一起取"：
-        写作 prompt 继续用 prompt 字段，存储身份用 id 字段（v0.7.6 人格隔离）。
-        取不到任何人格外貌时返回 is_default=True 的空结果，调用方按默认人格处理。
+        探测链与 v0.7.5 的 _get_persona_prompt 兼容，但 v0.7.7 起优先走
+        AstrBot v4.29+ 的官方解析链 ``resolve_selected_persona``
+        （**会话自定义规则 > 会话 persona_id > 默认人格**，与主聊天链路同口径，
+        避免"插件以为的人格"和"实际聊天的人格"分叉）；
+        老版本没有该接口时回退旧链（会话 persona_id → v3 人格库 → 默认人格）。
 
         注意 AstrBot v3 人格库的"id"就是人格名（get_persona_v3_by_id 按 name
         匹配）：人格改名在 AstrBot 侧等价于换了一个人格（旧会话的 persona_id
@@ -120,12 +121,64 @@ class ServiceMixin:
         if pm is None:
             return result
         try:
-            # 1) 会话上指定了 persona_id 时优先用它（/persona 切换的人设）。
-            #    优先走 v3 人格库接口（不同版本方法名不同，逐个探测），再回退旧接口。
             conv_mgr = self.context.conversation_manager
             cid = await conv_mgr.get_curr_conversation_id(umo)
             conv = await conv_mgr.get_conversation(umo, cid) if cid else None
             persona_id = getattr(conv, "persona_id", "") or ""
+
+            # 0) v4.29+ 官方解析链：自定义规则（session rule）优先——
+            #    用户按会话指定人格（如私聊固定小A）走的就是这条路，
+            #    只看 conv.persona_id 会漏掉它，把默认人格错当当前人格。
+            resolver = getattr(pm, "resolve_selected_persona", None)
+            if callable(resolver):
+                conv_pid = (
+                    persona_id if persona_id and persona_id != "[%None]" else None
+                )
+                platform = str(umo or "").split(":", 1)[0]
+                try:
+                    resolved = await self._maybe_await(
+                        resolver(
+                            umo=umo,
+                            conversation_persona_id=conv_pid,
+                            platform_name=platform,
+                            provider_settings=None,
+                        )
+                    )
+                    sel_id, persona = resolved[0], resolved[1]
+                except Exception:
+                    sel_id, persona = None, None
+                if (
+                    sel_id
+                    and sel_id not in ("[%None]", "_chatui_default_")
+                    and persona is not None
+                ):
+                    if isinstance(persona, dict):
+                        prompt = persona.get("prompt") or persona.get("system_prompt") or ""
+                        name = persona.get("name") or str(sel_id)
+                    elif persona is not None:
+                        prompt = (
+                            getattr(persona, "prompt", "")
+                            or getattr(persona, "system_prompt", "")
+                            or ""
+                        )
+                        name = getattr(persona, "name", "") or str(sel_id)
+                    else:
+                        prompt, name = "", str(sel_id)
+                    prompt = prompt.strip()
+                    if not prompt:
+                        # 人格存在但没写 prompt：口吻回退默认人格（身份仍有效）
+                        prompt = await self._default_persona_prompt(pm, umo)
+                    return {
+                        "id": str(sel_id),
+                        "name": str(name),
+                        "prompt": prompt,
+                        "is_default": await self._is_default_persona(
+                            pm, umo, str(sel_id)
+                        ),
+                    }
+
+            # 1) 旧链：会话上指定了 persona_id 时优先用它（/persona 切换的人设）。
+            #    优先走 v3 人格库接口（不同版本方法名不同，逐个探测），再回退旧接口。
             if persona_id and persona_id != "[%None]":
                 for getter_name in ("get_persona_v3_by_id", "get_persona"):
                     getter = getattr(pm, getter_name, None)
@@ -675,7 +728,7 @@ class ServiceMixin:
         now_str = self._now().strftime("%Y-%m-%d %H:%M:%S")
         extra_instruction = str(self.config.get("extra_instruction", "") or "").strip()
         if "{persona_name}" in extra_instruction:
-            # v0.7.6：附加要求支持 {persona_name} 占位符——渲染成当前会话人格名
+            # v0.7.7：附加要求支持 {persona_name} 占位符——渲染成当前会话人格名
             # （取不到时用中性兜底词），满足"以某人格的视角写日记"的诉求。
             try:
                 persona_name = str(
@@ -854,7 +907,7 @@ class ServiceMixin:
                     prompt=current_prompt,
                     system_prompt=system_prompt,
                 )
-                # v0.7.6（Bug A）：推理模型思维链泄漏兜底——上游只剥 <think>
+                # v0.7.7（Bug A）：推理模型思维链泄漏兜底——上游只剥 <think>
                 # 标签，挡不住端点把推理拼进 content 或模型把思考当正文写。
                 raw_content = strip_reasoning_blocks(
                     resp.completion_text or ""
@@ -1580,7 +1633,7 @@ class ServiceMixin:
         pct = int(ratio * 100)
 
         if auto_ratio > 0 and ratio >= auto_ratio and not state["auto_written"]:
-            # v0.7.6：写入目标按当前会话人格取存储身份——写的是 diary_<身份>.zip，
+            # v0.7.7：写入目标按当前会话人格取存储身份——写的是 diary_<身份>.zip，
             # 互斥锁的粒度也跟着身份走（同一用户不同人格各写各的本子）。
             sender_id = await self._diary_identity(umo, event.get_sender_id())
             if sender_id in self._writing or self._terminated:
@@ -2058,7 +2111,7 @@ class ServiceMixin:
                 skipped += 1
                 self._mark_auto_diary_done(state, sender_id)
                 continue
-            # v0.7.6：写入目标按该用户私聊会话的当前人格取存储身份；
+            # v0.7.7：写入目标按该用户私聊会话的当前人格取存储身份；
             # 完成登记仍按原始 sender（每用户每天只尝试一次，与人格无关）
             diary_id = await self._diary_identity(umo, sender_id)
             if diary_id in self._writing:

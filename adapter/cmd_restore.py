@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""指令实现：/恢复日记（回收站找回，v0.7.6）。
+"""指令实现：/恢复日记（回收站找回，v0.7.7）。
 
 由 ``main.MemoryDiaryPlugin`` 以 mixin 方式组合；带 ``@filter.*`` 装饰器的入口
 必须留在 main.py（AstrBot 按 ``handler.__module__`` 绑定 handler），这里只放实现。
@@ -29,13 +29,13 @@ class RestoreCommandsMixin:
             )
             return
 
-        # v0.7.6 人格隔离：只能看到并恢复当前人格名下的回收站条目
+        # v0.7.7 人格隔离：只能看到并恢复当前人格名下的回收站条目
         sender_id, persona_name = await self._diary_identity_info(
             event.unified_msg_origin, event.get_sender_id()
         )
         retention = self._trash_retention_days()
 
-        # v0.7.6（Bug C）：回收站关闭不等于"没有恢复途径"——自动备份是
+        # v0.7.7（Bug C）：回收站关闭不等于"没有恢复途径"——自动备份是
         # 独立通道（防外部删除），只要日记本异常且有备份，备份恢复仍可用
         live_path = self._diary_path(sender_id)
         live_broken = live_path.exists() and self._all_entries_tampered(sender_id)

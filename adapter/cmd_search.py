@@ -123,7 +123,7 @@ class SearchCommandsMixin:
             return candidates
 
     async def _assisted_search(self, event, query: str, **kwargs):
-        # v0.7.6 人格隔离：搜索只能命中当前人格名下的日记
+        # v0.7.7 人格隔离：搜索只能命中当前人格名下的日记
         identity = await self._diary_identity(
             event.unified_msg_origin, event.get_sender_id()
         )

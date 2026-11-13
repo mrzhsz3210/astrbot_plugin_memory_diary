@@ -32,7 +32,7 @@ class WriteCommandsMixin:
         if not self._should_respond(event):
             return
         umo = event.unified_msg_origin
-        # v0.7.6 人格隔离：写/读/冷却/互斥都按当前人格的存储身份走
+        # v0.7.7 人格隔离：写/读/冷却/互斥都按当前人格的存储身份走
         sender_id = await self._diary_identity(umo, event.get_sender_id())
         sender_name = event.get_sender_name() or event.get_sender_id()
 

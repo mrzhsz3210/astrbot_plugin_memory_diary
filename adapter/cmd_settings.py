@@ -306,7 +306,7 @@ class SettingsCommandsMixin:
             return
         sender_id = event.get_sender_id()
         umo = event.unified_msg_origin
-        # v0.7.6 人格隔离：状态页展示的是当前人格名下的日记本；
+        # v0.7.7 人格隔离：状态页展示的是当前人格名下的日记本；
         # 哨兵/注入状态键仍按原始 sender（与 hooks 的状态命名空间一致）
         diary_id = await self._diary_identity(umo, sender_id)
         # 群聊里不展示个人日记统计与实例级校准观测（同群可见，属元数据暴露）；
@@ -424,7 +424,7 @@ class SettingsCommandsMixin:
             f"· 日记：{diary_info}",
             context_line,
         ]
-        # v0.7.6（Bug C）：外部删除/篡改告警——登记包凭空消失或全量验签失败，
+        # v0.7.7（Bug C）：外部删除/篡改告警——登记包凭空消失或全量验签失败，
         # 明示"疑似被外部改动/删除"并给出备份与官方恢复路径（仅私聊展示）
         if not in_group:
             try:
@@ -547,7 +547,7 @@ class SettingsCommandsMixin:
         # P2-3：直接解析原始消息，支持带空格的时间段写法
         arg = self._command_arg(event)
 
-        # v0.7.6 人格隔离：可注入的篇目来自当前人格名下的日记本
+        # v0.7.7 人格隔离：可注入的篇目来自当前人格名下的日记本
         diary_id = await self._diary_identity(
             event.unified_msg_origin, sender_id
         )

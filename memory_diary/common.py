@@ -81,7 +81,7 @@ def safe_key(raw: str) -> str:
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
 
 
-# ---- 日记身份（v0.7.6 人格隔离）----
+# ---- 日记身份（v0.7.7 人格隔离）----
 # 存储维度的「身份」= 原始 sender_id，或在人格隔离生效时为
 # ``<sender_id>::p::<persona_id>``。身份字符串贯穿文件 key、派生签名钥匙与
 # 条目签名域，因此同一人格的数据天然聚在同一本日记里、不同人格互不可见。

@@ -1220,7 +1220,7 @@ async function loadUsers() {
   clearSelectedDays();
   const r = await bridge.apiGet("users");
   users = r.users || [];
-  // v0.7.6：外部删除/篡改告警横幅（登记包凭空消失、全量验签失败）
+  // v0.7.7：外部删除/篡改告警横幅（登记包凭空消失、全量验签失败）
   const banner = $("alertBanner");
   const alerts = Array.isArray(r.alerts) ? r.alerts.filter(Boolean) : [];
   if (alerts.length) {

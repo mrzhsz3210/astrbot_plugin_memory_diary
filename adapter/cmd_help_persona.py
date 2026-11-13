@@ -114,7 +114,7 @@ class HelpPersonaCommandsMixin:
                 "📖 形象档案只能私聊查看和修改哦——插画里的「她」是只给你看的样子。"
             )
             return
-        # v0.7.6 人格隔离：形象档案跟随当前人格的日记本
+        # v0.7.7 人格隔离：形象档案跟随当前人格的日记本
         sender_id = await self._diary_identity(umo, event.get_sender_id())
         arg = self._strip_invisible(self._command_arg(event)).strip()
         parts = arg.split(None, 1)

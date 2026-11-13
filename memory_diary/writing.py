@@ -118,7 +118,7 @@ def ensure_explicit_notes(result: DiaryResult, required: list[str]) -> DiaryResu
 
 
 # ---------------------------------------------------------------------------
-# 思维链泄漏兜底（v0.7.6，Bug A）
+# 思维链泄漏兜底（v0.7.7，Bug A）
 #
 # 推理模型（Intern-S2 等）的产出可能把英文思维链混进 content——端点把
 # reasoning 拼进正文、或模型干脆把"思考过程"当日记写。上游（AstrBot 非

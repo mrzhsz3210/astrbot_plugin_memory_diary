@@ -409,7 +409,7 @@ class AnnotationMixin:
                 logger.warning(f"[memory_diary] 批注生成调用失败，本轮跳过: {e}")
                 return {**result, "reason": "llm_error"}
 
-            # v0.7.6（Bug A）：批注产出同样先剥思维链；疑似泄漏按跳过处理
+            # v0.7.7（Bug A）：批注产出同样先剥思维链；疑似泄漏按跳过处理
             ann_output = strip_reasoning_blocks(
                 getattr(resp, "completion_text", "") or ""
             )
@@ -935,7 +935,7 @@ class AnnotationMixin:
             except Exception as e:
                 logger.warning(f"[memory_diary] 写回蒸馏调用失败: {e}")
                 return None
-            # v0.7.6（Bug A）：写回蒸馏同样剥思维链，疑似泄漏按失败处理
+            # v0.7.7（Bug A）：写回蒸馏同样剥思维链，疑似泄漏按失败处理
             distill_output = strip_reasoning_blocks(
                 getattr(resp, "completion_text", "") or ""
             )

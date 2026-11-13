@@ -1804,7 +1804,7 @@ class StorageMixin:
         return items, status
 
     def _readme_text(self, sender_id: str, sender_name: str) -> str:
-        # v0.7.6：人格隔离身份（<QQ>::p::<persona>）整串写进「用户ID」行——
+        # v0.7.7：人格隔离身份（<QQ>::p::<persona>）整串写进「用户ID」行——
         # Web 侧验签/读日记都靠它回推出存储身份；另补两行可读的归属信息。
         # 无人格维度时不加这两行（与旧版逐字节一致）。
         base, pid = split_diary_identity(sender_id)
@@ -1986,7 +1986,7 @@ class StorageMixin:
     # ------------------------- 注入范围偏好 -------------------------
 
     def _pref_path(self, sender_id: str) -> Path:
-        # v0.7.6：偏好（查看密码/注入范围/素材游标/备忘）是用户级数据，
+        # v0.7.7：偏好（查看密码/注入范围/素材游标/备忘）是用户级数据，
         # 人格隔离身份一律按原始 QQ 落同一份 pref 文件；
         # 备忘的"按人格分开"在文件内部按人格分槽（见 _memos_of/_set_memos）。
         return self.data_dir / f"pref_{safe_key(split_diary_identity(sender_id)[0])}.json"
@@ -2163,7 +2163,7 @@ class StorageMixin:
             return parse_scope(scope).value
         return "group:legacy-unknown" if cls._memo_scene(memo) == "group" else "private"
 
-    # ---- 备忘的人格分槽（v0.7.6）----
+    # ---- 备忘的人格分槽（v0.7.7）----
     # 备忘跟随日记的人格维度：默认人格/未隔离沿用 pref 文件里的 "memos" 槽
     # （与旧版逐字节一致），非默认人格写到 "memos_by_persona"[<persona_id>]。
     # 密码、注入范围、素材游标等其他偏好仍是用户级，不分槽。
@@ -2823,7 +2823,7 @@ class StorageMixin:
         out[self.README_ZIP_ENTRY] = self._readme_text(sender_id, sender_name).encode(
             "utf-8"
         )
-        # v0.7.6（Bug C）：覆盖前先把当前 zip 滚一份进 backups/（防外部删除后无档可救）
+        # v0.7.7（Bug C）：覆盖前先把当前 zip 滚一份进 backups/（防外部删除后无档可救）
         self._roll_backup(sender_id, path)
         self._write_zip_atomic(path, out)
         self._invalidate_search_index(sender_id)
@@ -3017,7 +3017,7 @@ class StorageMixin:
                 }
                 for item in materials["items"]
             ])
-        # v0.7.6 回收站：整包软删除——正文/签名/插图/批注/来源整体移入 trash/，
+        # v0.7.7 回收站：整包软删除——正文/签名/插图/批注/来源整体移入 trash/，
         # 保留期内可 /恢复日记 原样找回（签名随行，恢复时重新验签）。
         # 回收站写入失败时中止删除（宁可不删，也不让用户的数据不可恢复）；
         # zip 本身已损坏读不出时退化为硬删除（本来也无法通过验签恢复）。
@@ -3150,7 +3150,7 @@ class StorageMixin:
                     remove.add(n)
                     remove.add(self._image_sig_entry(n))
 
-        # v0.7.6 回收站：先把要删的条目连同批注/来源切片移入 trash/，
+        # v0.7.7 回收站：先把要删的条目连同批注/来源切片移入 trash/，
         # 回收站写入失败时中止删除（返回 0），不做不可恢复的硬删除。
         # 批注级联发生在 data 原地修改之前捕获切片，保证恢复时原样合并回去。
         if self._trash_retention_days() > 0:
@@ -3201,7 +3201,7 @@ class StorageMixin:
                         for item in materials["items"]
                     ])
                 path.unlink(missing_ok=True)  # 一天都不剩 → 整个 zip 删掉
-                self._registry_unmark(sender_id)  # v0.7.6：插件内删除，销记
+                self._registry_unmark(sender_id)  # v0.7.7：插件内删除，销记
             else:
                 out = {n: b for n, b in data.items() if n not in remove}
                 self._write_zip_atomic(path, out)
@@ -3582,7 +3582,7 @@ class StorageMixin:
 
         check_owner：QQ 指令侧必须为 True（装进别人账号的日记永远验不过签）；
         Web 日记本页面是管理员操作，安装后仍绑定原主人 QQ，传 False。
-        v0.7.6：人格隔离身份按**原始 QQ** 比对——同一用户在自己的人格之间
+        v0.7.7：人格隔离身份按**原始 QQ** 比对——同一用户在自己的人格之间
         导出/导入/合并日记是合法路径（如把旧人格的本子并进新人格），
         只有跨 QQ 号才拒绝。
         """
@@ -3654,7 +3654,7 @@ class StorageMixin:
             ).encode("utf-8")
         self._write_zip_atomic(target, out)
         self._invalidate_search_index(sender_id)
-        self._registry_mark(sender_id)  # v0.7.6：导入成功，登记册同步
+        self._registry_mark(sender_id)  # v0.7.7：导入成功，登记册同步
         return mode
 
     def _zip_owner_info(self, path: Path):

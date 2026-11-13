@@ -149,7 +149,7 @@ class MemoryDiaryCore(
         self._reset_pending: set = set()
         # 无效时区只警告一次
         self._tz_warned = False
-        # v0.7.6 人格隔离：每个 sender 只提示一次"既有日记仍归属默认人格"
+        # v0.7.7 人格隔离：每个 sender 只提示一次"既有日记仍归属默认人格"
         self._persona_hint_logged: set = set()
         # 阈值顺序被截断只警告一次
         self._ratio_warned = False
@@ -214,7 +214,7 @@ class MemoryDiaryCore(
         - 名单为空 → 恒 True（老用户零感知）；
         - 名单非空且 sender_id 为空/不在名单 → False（fail closed，取不到身份一律不放行）；
         - ID 按字符串精确匹配；
-        - v0.7.6：传入的是人格隔离身份（``<QQ>::p::<persona>``）时按原始 QQ 判定——
+        - v0.7.7：传入的是人格隔离身份（``<QQ>::p::<persona>``）时按原始 QQ 判定——
           白名单是用户级门禁，不因切换人格而改变。
         """
         allowed = self._allowed_user_ids()

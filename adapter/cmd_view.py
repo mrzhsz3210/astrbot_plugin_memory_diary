@@ -136,7 +136,7 @@ class ViewCommandsMixin:
             )
             return
 
-        # v0.7.6 人格隔离：只能看到当前人格名下的日记
+        # v0.7.7 人格隔离：只能看到当前人格名下的日记
         sender_id = await self._diary_identity(
             event.unified_msg_origin, event.get_sender_id()
         )

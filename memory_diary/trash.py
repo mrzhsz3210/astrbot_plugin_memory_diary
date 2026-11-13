@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""删除回收站（v0.7.6）：软删除、限期保留、验签恢复。
+"""删除回收站（v0.7.7）：软删除、限期保留、验签恢复。
 
 /删除日记 不再物理抹掉数据：被删的条目（正文 + 签名 + 插图 + 批注/来源切片）
 整体移进数据目录下 ``trash/`` 的回收站 zip，保留 ``trash_retention_days``
@@ -339,7 +339,7 @@ class TrashMixin:
         except Exception as e:
             return [], [], f"写回日记文件失败（{e}），恢复未进行"
         self._invalidate_search_index(sender_id)
-        self._registry_mark(sender_id)  # v0.7.6：恢复成功，登记册同步
+        self._registry_mark(sender_id)  # v0.7.7：恢复成功，登记册同步
         try:
             path.unlink(missing_ok=True)
         except Exception as e:

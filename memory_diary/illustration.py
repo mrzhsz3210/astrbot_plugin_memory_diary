@@ -979,7 +979,7 @@ class IllustrationMixin:
                 ),
                 timeout=self._PERSONA_DESC_LLM_TIMEOUT,
             )
-            # v0.7.6（Bug A）：形象描述是单行中文，思维链泄漏必须挡在门外
+            # v0.7.7（Bug A）：形象描述是单行中文，思维链泄漏必须挡在门外
             text = strip_reasoning_blocks(
                 str(getattr(resp, "completion_text", "") or "")
             )

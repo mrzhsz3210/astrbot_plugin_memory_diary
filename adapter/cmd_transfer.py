@@ -72,7 +72,7 @@ class TransferCommandsMixin:
             )
             return
 
-        # v0.7.6 人格隔离：导出的是当前人格名下的日记本
+        # v0.7.7 人格隔离：导出的是当前人格名下的日记本
         sender_id = await self._diary_identity(
             event.unified_msg_origin, event.get_sender_id()
         )
@@ -260,7 +260,7 @@ class TransferCommandsMixin:
                     sender_name = ev.get_sender_name() or ""
                 except Exception:
                     pass
-                # v0.7.6 人格隔离：导入安放进当前人格名下的日记本
+                # v0.7.7 人格隔离：导入安放进当前人格名下的日记本
                 import_identity = await self._diary_identity(
                     ev.unified_msg_origin, ev.get_sender_id()
                 )

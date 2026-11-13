@@ -151,7 +151,7 @@ class EventHooksMixin:
         if not query:
             return
         current_scope = str(scope_from_event(event))
-        # v0.7.6 人格隔离：按需回源同样只能命中当前人格名下的日记
+        # v0.7.7 人格隔离：按需回源同样只能命中当前人格名下的日记
         identity = await self._diary_identity(
             event.unified_msg_origin, event.get_sender_id()
         )
@@ -259,7 +259,7 @@ class EventHooksMixin:
             current_scope = str(scope_from_event(event))
             in_group = scope_from_event(event).is_group
             umo = event.unified_msg_origin
-            # v0.7.6 人格隔离：注入的日记来自当前人格名下的日记本；
+            # v0.7.7 人格隔离：注入的日记来自当前人格名下的日记本；
             # 注入去重/代际状态键仍按原始 sender（与 reset/response 钩子同口径）
             identity = await self._diary_identity(umo, sender_id)
             cid = await self._curr_cid(umo)

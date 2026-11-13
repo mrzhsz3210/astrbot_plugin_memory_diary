@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""v0.7.6：人格隔离存储 + 删除回收站 + 旧数据归属迁移。
+"""v0.7.7：人格隔离存储 + 删除回收站 + 旧数据归属迁移。
 
 三类验收（任务单 §7）：
 1. 同 QQ 号双人格：A 写的日记 B 看不到、删不到；B 的操作不伤 A。
@@ -231,6 +231,64 @@ async def test_legacy_diaries_stay_with_default_persona():
         # 文件名 key 没有因为升级而变化（没有改名迁移）
         assert legacy_path.name == f"diary_{plugin._diary_file_key(SENDER)}.zip"
         assert legacy_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# 一补、会话自定义规则（AstrBot v4.29+ resolve_selected_persona）
+# ---------------------------------------------------------------------------
+
+
+async def test_session_rule_persona_overrides_default():
+    """用户反馈场景（v0.7.7 修复）：默认人格=小B（群聊用），私聊按自定义规则
+    固定小A——插件的人格解析必须与主聊天链路同口径（规则 > 会话 > 默认），
+    否则私聊会被错认成默认人格，日记写进旧本子、提示口吻也是错的。"""
+    async with World(persona_prompt="默认人格") as world:
+        inst = world.refactor
+        plugin = inst.plugin
+        world.persona_manager.by_id[PERSONA_A] = "人格A"
+
+        async def _resolver(umo=None, conversation_persona_id=None,
+                            platform_name=None, provider_settings=None):
+            # 私聊自定义规则 → personaA（会话本身没指定人格）
+            return (PERSONA_A, {"name": PERSONA_A, "prompt": "人格A"}, PERSONA_A, False)
+
+        world.persona_manager.resolve_selected_persona = _resolver
+        umo = inst.default_umo()
+        inst.set_history([message("user", "在吗")], persona_id="")
+        identity, name = await plugin._diary_identity_info(umo, SENDER)
+        assert identity == IDENTITY_A and name == PERSONA_A
+
+
+async def test_session_rule_default_persona_stays_legacy():
+    """规则/默认解析落到默认人格时，仍沿用旧日记本（不加人格后缀）。"""
+    async with World(persona_prompt="默认人格") as world:
+        inst = world.refactor
+        plugin = inst.plugin
+
+        async def _resolver(umo=None, conversation_persona_id=None,
+                            platform_name=None, provider_settings=None):
+            return ("default", {"name": "default", "prompt": "系统默认"}, None, False)
+
+        world.persona_manager.resolve_selected_persona = _resolver
+        inst.set_history([message("user", "在吗")], persona_id="")
+        identity, _ = await plugin._diary_identity_info(inst.default_umo(), SENDER)
+        assert identity == SENDER
+
+
+async def test_session_rule_resolver_failure_falls_back_to_old_chain():
+    """老版本/签名不兼容时 resolver 抛错 → 回退旧探测链（会话 persona_id）。"""
+    async with World(persona_prompt="默认人格") as world:
+        inst = world.refactor
+        plugin = inst.plugin
+        world.persona_manager.by_id[PERSONA_A] = "人格A"
+
+        async def _bad_resolver(**kwargs):
+            raise TypeError("unexpected keyword arguments")
+
+        world.persona_manager.resolve_selected_persona = _bad_resolver
+        inst.set_history([message("user", "在吗")], persona_id=PERSONA_A)
+        identity, _ = await plugin._diary_identity_info(inst.default_umo(), SENDER)
+        assert identity == IDENTITY_A
 
 
 # ---------------------------------------------------------------------------

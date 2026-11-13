@@ -521,7 +521,7 @@ class CurrentSelfMixin:
         except Exception as e:
             logger.warning(f"[memory_diary] 交接信模型调用失败: {e}")
             return False
-        # v0.7.6（Bug A）：交接信同样吃思维链泄漏兜底——先剥标签块，
+        # v0.7.7（Bug A）：交接信同样吃思维链泄漏兜底——先剥标签块，
         # 疑似泄漏时按"保留上一版"处理（与 JSON 解析失败同一保护口径）
         raw_output = strip_reasoning_blocks(resp.completion_text or "")
         if looks_like_reasoning_leak(raw_output):
